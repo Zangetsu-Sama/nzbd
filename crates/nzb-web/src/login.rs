@@ -14,6 +14,9 @@
 //! bucket of the store's `_v2` verdicts. A throttled attempt has already paid for the same
 //! Argon2 verification (or the dummy one) and gets the response of a wrong password.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use askama::Template;
 use axum::Router;
 use axum::body::Bytes;
@@ -23,7 +26,8 @@ use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use nzb_store::prelude::*;
-use nzb_store::{SessionStage, username_is_valid};
+use nzb_store::{LoginUser, SessionStage, StoreError, username_is_valid};
+use tokio::sync::Semaphore;
 
 use crate::assets::Layout;
 use crate::auth::{AuthError, AuthState, ClientMeta, MAX_VERIFY_WAITERS};
@@ -130,6 +134,45 @@ fn is_urlencoded_form(headers: &HeaderMap) -> bool {
         })
 }
 
+/// Removes an admitted waiter even if its request is cancelled before a slot is available.
+struct PasswordWaiter<'a>(&'a AtomicUsize);
+
+impl Drop for PasswordWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Runs password work with a bounded, cancellation-safe queue. The blocking task owns the
+/// permit: dropping its request cannot release capacity while Argon2 is still using memory.
+pub(crate) async fn password_work<T, F>(
+    slots: &Arc<Semaphore>,
+    waiting: &AtomicUsize,
+    max_waiters: usize,
+    work: F,
+) -> Result<T, AuthError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if waiting.fetch_add(1, Ordering::AcqRel) >= max_waiters {
+        waiting.fetch_sub(1, Ordering::AcqRel);
+        return Err(AuthError::Busy);
+    }
+    let waiter = PasswordWaiter(waiting);
+    let permit = Arc::clone(slots)
+        .acquire_owned()
+        .await
+        .map_err(|_| AuthError::Task)?;
+    drop(waiter);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| AuthError::Task)
+}
+
 /// One Argon2id verification on the blocking pool, bounded by `verify_concurrency` (each run
 /// needs 64 MiB). The wait queue is bounded too (L3): when it is full the request is refused
 /// with `AuthError::Busy` instead of piling up until the request timeout.
@@ -138,46 +181,36 @@ pub(crate) async fn verify_blocking(
     pw: String,
     hash: String,
 ) -> Result<bool, AuthError> {
-    use std::sync::atomic::Ordering;
-    let waiting = &auth.0.verify_waiting;
-    if waiting.fetch_add(1, Ordering::AcqRel) >= MAX_VERIFY_WAITERS {
-        waiting.fetch_sub(1, Ordering::AcqRel);
-        return Err(AuthError::Busy);
-    }
-    let permit = auth.0.verify_slots.acquire().await;
-    waiting.fetch_sub(1, Ordering::AcqRel);
-    let _permit = permit.map_err(|_| AuthError::Task)?;
-    let r = tokio::task::spawn_blocking(move || password::verify_password(&pw, &hash))
-        .await
-        .map_err(|_| AuthError::Task);
-    auth.0.verify_runs.fetch_add(1, Ordering::Relaxed);
-    r
+    let state = auth.clone();
+    password_work(
+        &auth.0.verify_slots,
+        &auth.0.verify_waiting,
+        MAX_VERIFY_WAITERS,
+        move || {
+            let accepted = password::verify_password(&pw, &hash);
+            state.0.verify_runs.fetch_add(1, Ordering::Relaxed);
+            accepted
+        },
+    )
+    .await
 }
 
 /// Hashes a new password on the blocking pool under the same bounded slots as verification
 /// (each Argon2id run needs 64 MiB).
 pub(crate) async fn hash_blocking(auth: &AuthState, pw: String) -> Result<String, AuthError> {
-    use std::sync::atomic::Ordering;
-    let waiting = &auth.0.verify_waiting;
-    if waiting.fetch_add(1, Ordering::AcqRel) >= MAX_VERIFY_WAITERS {
-        waiting.fetch_sub(1, Ordering::AcqRel);
-        return Err(AuthError::Busy);
-    }
-    let permit = auth.0.verify_slots.acquire().await;
-    waiting.fetch_sub(1, Ordering::AcqRel);
-    let _permit = permit.map_err(|_| AuthError::Task)?;
-    tokio::task::spawn_blocking(move || password::hash_password(&pw))
-        .await
-        .map_err(|_| AuthError::Task)?
-        .map_err(AuthError::from)
+    password_work(
+        &auth.0.verify_slots,
+        &auth.0.verify_waiting,
+        MAX_VERIFY_WAITERS,
+        move || password::hash_password(&pw),
+    )
+    .await?
+    .map_err(AuthError::from)
 }
 
 enum Outcome {
-    /// Password accepted; carries the user's id and whether TOTP is enrolled.
-    PasswordOk {
-        user_id: i64,
-        enrolled: bool,
-    },
+    /// Password accepted; preserve the observed credentials until pending-session insertion.
+    PasswordOk(LoginUser),
     Failed,
 }
 
@@ -228,10 +261,7 @@ async fn check_credentials(
         )
         .await?;
     match (accepted, user) {
-        (true, Some(u)) => Ok(Outcome::PasswordOk {
-            user_id: u.id,
-            enrolled: u.totp_enabled,
-        }),
+        (true, Some(u)) => Ok(Outcome::PasswordOk(u)),
         _ => Ok(Outcome::Failed),
     }
 }
@@ -276,19 +306,28 @@ async fn post_login(
             return internal();
         }
     };
-    let Outcome::PasswordOk { user_id, enrolled } = outcome else {
+    let Outcome::PasswordOk(seen) = outcome else {
         return render_login(&auth, Some(INVALID_CREDENTIALS), username, None);
     };
+    finish_login(&auth, &seen, username, &headers, ip).await
+}
+
+/// Keep the verified credential observation until issuance commits, including when another
+/// request changes the password after `check_credentials` returned successfully.
+async fn finish_login(
+    auth: &AuthState,
+    seen: &LoginUser,
+    username: &str,
+    headers: &HeaderMap,
+    ip: std::net::IpAddr,
+) -> Response {
     // Fixation: the presented cookie (if any) is revoked and never reused; the new id is fresh.
-    let old = auth.presented_id(&headers).map(|id| sha256(id.as_bytes()));
-    let meta = ClientMeta::from_request(&headers, Some(ip));
-    match auth
-        .start_session(user_id, SessionStage::PendingMfa, &meta, old.as_ref())
-        .await
-    {
+    let old = auth.presented_id(headers).map(|id| sha256(id.as_bytes()));
+    let meta = ClientMeta::from_request(headers, Some(ip));
+    match auth.start_login_session(seen, &meta, old.as_ref()).await {
         Ok(cookie) => {
             let mut resp = see_other(
-                if enrolled {
+                if seen.totp_enabled {
                     "/login/mfa"
                 } else {
                     "/mfa/enroll"
@@ -299,6 +338,23 @@ async fn post_login(
             resp.headers_mut()
                 .append(header::SET_COOKIE, auth.clear_login_nonce_cookie());
             resp
+        }
+        Err(AuthError::Store(StoreError::NotFound)) => {
+            // The credentials changed between the verdict and the issuance (review 55): audited like
+            // the verdict's own `credentials_changed` refusal, and like it not counted as a guess (the
+            // password was right). A failed audit write does not change the answer.
+            let ip_text = ip.to_string();
+            let entry = nzb_store::AuditEntry {
+                who: nzb_store::AuditActor::anonymous(),
+                event: "login.fail",
+                detail: Some("credentials_changed"),
+                ip: Some(&ip_text),
+                target_id: Some(seen.id),
+            };
+            if let Err(e) = auth.db().audit_entry(&entry, auth.now()).await {
+                tracing::error!(error = %e, "login audit failed");
+            }
+            render_login(auth, Some(INVALID_CREDENTIALS), username, None)
         }
         Err(e) => {
             tracing::error!(error = %e, "session creation failed");
@@ -372,4 +428,240 @@ pub(crate) fn routes(auth: &AuthState) -> Router {
         .merge(invite)
         .merge(mfa.with_state(auth.clone()))
         .layer(from_fn_with_state(auth.clone(), host_layer))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::panic, clippy::too_many_lines)] // one deterministic before/change/after lifecycle
+    async fn sec_107_password_change_after_verdict_refuses_cookie_issuance() {
+        use crate::auth::{AuthConfig, COOKIE_NAME, ManualWallClock};
+        use axum::body::to_bytes;
+        use nzb_store::test_backend::TestStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let test = TestStore::open(dir.path()).await;
+        let now = 1_700_000_000;
+        let old_password = "old password for the lifecycle fixture";
+        let new_password = "new password for the lifecycle fixture";
+        let old_hash = password::hash_password(old_password).unwrap();
+        let new_hash = password::hash_password(new_password).unwrap();
+        let uid = test
+            .store
+            .create_user("owner", &old_hash, now)
+            .await
+            .unwrap();
+        let auth = AuthState::new(
+            test.store.clone(),
+            AuthConfig::default(),
+            Arc::new(ManualWallClock::new(now)),
+        )
+        .await
+        .unwrap();
+        let ip = "192.0.2.7".parse().unwrap();
+        let headers = HeaderMap::new();
+        let meta = ClientMeta::from_request(&headers, Some(ip));
+        let owner = auth
+            .prepare_session(uid, SessionStage::Active, &meta)
+            .unwrap()
+            .0;
+        auth.db().insert_session(&owner, 5).await.unwrap();
+        let Outcome::PasswordOk(seen) = check_credentials(&auth, "owner", old_password, ip)
+            .await
+            .unwrap()
+        else {
+            panic!("the original password must pass before the change");
+        };
+        let replacement = auth
+            .prepare_session(uid, SessionStage::Active, &meta)
+            .unwrap()
+            .0;
+        auth.db()
+            .change_password(uid, &owner.id_hash, &new_hash, &replacement, None, now)
+            .await
+            .unwrap();
+        let response = finish_login(&auth, &seen, "owner", &headers, ip).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::LOCATION));
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .all(|cookie| { !cookie.to_str().unwrap().starts_with(COOKIE_NAME) })
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains(INVALID_CREDENTIALS)
+        );
+        assert!(
+            auth.db()
+                .get_session(&replacement.id_hash)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Review 55: the refusal is audited like the verdict's own `credentials_changed` refusal.
+        let fails: Vec<_> = auth
+            .db()
+            .recent_audit(50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event == "login.fail")
+            .collect();
+        assert_eq!(fails.len(), 1, "one audit row for the refused issuance");
+        let fail = fails.first().unwrap();
+        assert_eq!(fail.detail.as_deref(), Some("credentials_changed"));
+        assert_eq!(fail.ip.as_deref(), Some("192.0.2.7"));
+
+        // The same handler still sets a pending cookie when the verified hash is current.
+        let Outcome::PasswordOk(fresh) = check_credentials(&auth, "owner", new_password, ip)
+            .await
+            .unwrap()
+        else {
+            panic!("the replacement password must pass");
+        };
+        let response = finish_login(&auth, &fresh, "owner", &headers, ip).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/mfa/enroll"
+        );
+        let cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find(|value| value.to_str().unwrap().starts_with(COOKIE_NAME))
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let mut request = HeaderMap::new();
+        request.insert(header::COOKIE, cookie.parse().unwrap());
+        assert_eq!(
+            auth.peek_session(&request).await.unwrap().unwrap().stage,
+            SessionStage::PendingMfa
+        );
+    }
+
+    fn hash_work() -> bool {
+        password::hash_password("queue cancellation regression").is_ok()
+    }
+
+    fn verify_work() -> bool {
+        // Valid bounded work factors, deliberately unrelated digest: still runs full Argon2.
+        let phc = "$argon2id$v=19$m=65536,t=3,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g";
+        !password::verify_password("queue cancellation regression", phc)
+    }
+
+    async fn cancelled_waiter(work: fn() -> bool) {
+        // Both the login and the invitation queue must remain usable after cancellation.
+        for limit in [MAX_VERIFY_WAITERS, crate::auth::MAX_INVITE_WAITERS] {
+            let slots = Arc::new(Semaphore::new(1));
+            let waiting = AtomicUsize::new(0);
+            let occupied = slots.acquire().await.unwrap();
+            // Repeat beyond the capacity: the old counter leak permanently filled the queue.
+            for _ in 0..=limit {
+                let mut pending = Box::pin(password_work(&slots, &waiting, limit, work));
+                assert!(futures_util::poll!(pending.as_mut()).is_pending());
+                assert_eq!(waiting.load(Ordering::Acquire), 1);
+                drop(pending);
+                assert_eq!(waiting.load(Ordering::Acquire), 0);
+            }
+            drop(occupied);
+            assert!(password_work(&slots, &waiting, limit, work).await.unwrap());
+            assert_eq!(slots.available_permits(), 1);
+        }
+    }
+
+    async fn cancelled_running_work(work: fn() -> bool) {
+        let slots = Arc::new(Semaphore::new(1));
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let task_slots = Arc::clone(&slots);
+        let task_waiting = Arc::clone(&waiting);
+        let request = tokio::spawn(async move {
+            password_work(&task_slots, &task_waiting, MAX_VERIFY_WAITERS, move || {
+                started_tx.send(()).unwrap();
+                // The latch makes cancellation deterministic, without relying on Argon2 speed.
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let result = work();
+                let _ = finished_tx.send(result);
+                result
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(waiting.load(Ordering::Acquire), 0);
+        assert_eq!(slots.available_permits(), 0);
+        assert!(slots.try_acquire().is_err());
+        release_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), finished_rx)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        // The worker itself releases the slot when the blocking work actually finishes.
+        let permit = tokio::time::timeout(Duration::from_secs(10), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_hash_waiter_does_not_poison_queue() {
+        cancelled_waiter(hash_work).await;
+    }
+
+    #[tokio::test]
+    async fn sec_107_cancelled_verify_waiter_does_not_poison_queue() {
+        cancelled_waiter(verify_work).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_hash_request_keeps_running_work_permit() {
+        cancelled_running_work(hash_work).await;
+    }
+
+    #[tokio::test]
+    async fn sec_107_cancelled_verify_request_keeps_running_work_permit() {
+        cancelled_running_work(verify_work).await;
+    }
+
+    #[tokio::test]
+    async fn password_queue_overflow_and_closed_semaphore_restore_waiter_count() {
+        let slots = Arc::new(Semaphore::new(0));
+        let waiting = AtomicUsize::new(0);
+        let mut pending = Box::pin(password_work(&slots, &waiting, 1, || true));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        assert!(matches!(
+            password_work(&slots, &waiting, 1, || true).await,
+            Err(AuthError::Busy)
+        ));
+        assert_eq!(waiting.load(Ordering::Acquire), 1);
+        slots.close();
+        assert!(matches!(pending.await, Err(AuthError::Task)));
+        assert_eq!(waiting.load(Ordering::Acquire), 0);
+    }
 }

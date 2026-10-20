@@ -10,6 +10,24 @@ slug = "console"
 name = "Console"
 
 [[category]]
+id = 1010
+parent = 1000
+slug = "console.microsoft"
+name = "Console/Microsoft"
+
+[[category]]
+id = 1020
+parent = 1000
+slug = "console.nintendo"
+name = "Console/Nintendo"
+
+[[category]]
+id = 1030
+parent = 1000
+slug = "console.sony"
+name = "Console/Sony"
+
+[[category]]
 id = 2000
 slug = "movies"
 name = "Movies"
@@ -79,6 +97,35 @@ slug = "pc"
 name = "PC"
 
 [[category]]
+id = 4010
+parent = 4000
+slug = "pc.appz"
+name = "PC/Appz"
+
+[[category]]
+id = 4020
+parent = 4000
+slug = "pc.games"
+name = "PC/Games"
+
+[[category]]
+id = 4500
+slug = "mac"
+name = "Mac"
+
+[[category]]
+id = 4510
+parent = 4500
+slug = "mac.macappz"
+name = "Mac/MacAppz"
+
+[[category]]
+id = 4520
+parent = 4500
+slug = "mac.macgames"
+name = "Mac/MacGames"
+
+[[category]]
 id = 5000
 slug = "tv"
 name = "TV"
@@ -146,6 +193,12 @@ id = 7030
 parent = 7000
 slug = "books.comics"
 name = "Books/Comics"
+
+[[category]]
+id = 7040
+parent = 7000
+slug = "books.mangas"
+name = "Books/Mangas"
 
 [[category]]
 id = 8000

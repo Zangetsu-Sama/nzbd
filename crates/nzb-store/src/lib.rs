@@ -31,6 +31,7 @@ mod health;
 mod ingest_log;
 mod invite;
 mod mfa;
+mod nfo;
 pub mod pg;
 mod pref;
 mod profile;
@@ -105,6 +106,7 @@ pub use invite::{
     RECOVER_TTL_RANGE, Redeemed, Redemption, STAGING_TTL_SECS, StagedSwap,
 };
 pub use mfa::{FactorAttempt, MfaState, SecondFactor, SessionInfo};
+pub use nfo::{MAX_NFO_LOOKUP_IDS, MAX_NFO_STORED_BYTES, NfoAttach, ReleaseNfo};
 pub use pref::{
     FilePageSize, PREF_CHANGE_EVENT, PageSize, PrefsPatch, ReleasePageSize, Theme, UserPrefs,
 };

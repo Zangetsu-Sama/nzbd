@@ -82,7 +82,7 @@ pub(crate) fn new<'a>(a: &'a Analysis) -> NewRelease<'a> {
 
 pub(crate) async fn count(db: &PgDb, table: &str) -> i64 {
     // Table names are literals in this test file only.
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
         .fetch_one(db.web())
         .await
         .unwrap()
@@ -295,7 +295,8 @@ async fn sec_020_source_label_is_sanitized_capped_and_empty_is_null() {
 }
 
 /// Duplicate rows carry no release id, only the sha256 of the hidden release's NZB: they must be hidden
-/// with it, while unrelated rows (and failures) stay. Both legs of the exclusion (id and sha256) are
+/// with it. Unresolved digest-bearing failures are also hidden when categories are excluded.
+/// Both legs of the exclusion (id and sha256) are
 /// probed per log row, not materialised.
 #[tokio::test]
 async fn excluded_log_hides_rows_by_release_id_and_by_sha256() {
@@ -341,7 +342,7 @@ async fn excluded_log_hides_rows_by_release_id_and_by_sha256() {
         .iter()
         .map(|r| r.ts)
         .collect();
-    assert_eq!(ts, [5, 4, 3]);
+    assert_eq!(ts, [4, 3]);
 }
 
 /// Display rule `ui.show_xxx = false` on the store side of v3: totals from `category_stats`, the ingest timeline and
@@ -381,7 +382,7 @@ async fn exclude_categories_applies_to_totals_and_log() {
             source: LogSource::Watch,
             api_key_id: None,
             source_name: Some("bad.nzb"),
-            sha256: Some(sha(99)),
+            sha256: None,
             outcome: LogOutcome::Failed,
             error_code: Some("NZB_XML"),
             detail: None,

@@ -243,7 +243,9 @@ impl PgDb {
     }
 
     /// Newest-first rows that do not belong to a release whose category is in `exclude` (by `release_id` or by
-    /// `sha256`); failed rows are kept. Correlated `NOT EXISTS` probes on the primary key and the digest index.
+    /// `sha256`), including retained trash metadata. With exclusions, a former release whose category
+    /// is no longer known is omitted; failures without a release identity remain visible.
+    /// The unfiltered operator log retains every row. Probes use primary-key and digest indexes.
     ///
     /// # Errors
     /// Database errors.
@@ -261,6 +263,11 @@ impl PgDb {
             " FROM ingest_log l \
              WHERE NOT EXISTS (SELECT 1 FROM release r WHERE r.id = l.release_id AND r.category_id = ANY($1)) \
                AND NOT EXISTS (SELECT 1 FROM release r WHERE r.sha256 = l.sha256 AND r.category_id = ANY($1)) \
+               AND NOT EXISTS (SELECT 1 FROM release_trash t WHERE t.sha256 = l.sha256 AND t.category_id = ANY($1)) \
+               AND ((l.release_id IS NULL AND l.sha256 IS NULL AND l.outcome = 'failed') \
+                 OR EXISTS (SELECT 1 FROM release r WHERE r.id = l.release_id) \
+                 OR EXISTS (SELECT 1 FROM release r WHERE r.sha256 = l.sha256) \
+                 OR EXISTS (SELECT 1 FROM release_trash t WHERE t.sha256 = l.sha256)) \
              ORDER BY l.ts DESC, l.id DESC LIMIT $2"
         ))
         .bind(ids_i32(exclude))

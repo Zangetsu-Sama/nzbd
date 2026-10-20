@@ -186,6 +186,69 @@ fn second_root_is_malformed() {
 }
 
 #[test]
+fn sec_107_content_outside_the_root_is_rejected_in_every_parse_mode() {
+    let root = format!("<nzb>{}</nzb>", file("s", &seg(1, 1)));
+    let limits = Limits::default();
+    for invalid in [
+        "junk",
+        "\u{a0}",
+        "<![CDATA[ ]]>",
+        "<![CDATA[]]>",
+        "&amp;",
+        "&#32;",
+    ] {
+        for input in [format!("{invalid}{root}"), format!("{root}{invalid}")] {
+            let bytes = input.as_bytes();
+            assert!(
+                matches!(
+                    parse(bytes, &limits, &Fake::at(0)),
+                    Err(NzbError::Malformed { .. })
+                ),
+                "full: {input}"
+            );
+            assert!(
+                matches!(
+                    list_segments(bytes, &limits, &Fake::at(0), 0, 0, 10),
+                    Err(NzbError::Malformed { .. })
+                ),
+                "segments: {input}"
+            );
+            assert!(
+                matches!(
+                    extract_files(bytes, &limits, &Fake::at(0), &[0]),
+                    Err(NzbError::Malformed { .. })
+                ),
+                "subset: {input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn xml_whitespace_comments_and_instructions_outside_the_root_are_allowed() {
+    let input = format!(
+        " \t\r\n<!--before--><?before data?><nzb>{}</nzb> \t\r\n<!--after--><?after data?>",
+        file("s", &seg(1, 1))
+    );
+    let bytes = input.as_bytes();
+    let limits = Limits::default();
+    assert_eq!(parse(bytes, &limits, &Fake::at(0)).unwrap().files.len(), 1);
+    assert_eq!(
+        list_segments(bytes, &limits, &Fake::at(0), 0, 0, 10)
+            .unwrap()
+            .total,
+        1
+    );
+    assert_eq!(
+        extract_files(bytes, &limits, &Fake::at(0), &[0])
+            .unwrap()
+            .files
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn lowered_limits_trip_the_right_code() {
     let one = file("s", &seg(1, 10));
     let l = |f: fn(&mut Limits)| {
@@ -476,4 +539,134 @@ fn list_segments_sanitizes_ids_and_enforces_errors() {
         ),
         Err(NzbError::DoctypeForbidden)
     ));
+}
+
+// Small real-parser fixtures: the lowered per-file bound makes the duplicate-element
+// regression deterministic without allocating a production-sized document.
+mod segment_limit_regressions {
+    use super::*;
+
+    fn assert_limit_in_all_modes(input: &[u8], limits: &Limits, which: LimitName, why: &str) {
+        let expected = Err(NzbError::LimitExceeded { which });
+        assert_eq!(
+            parse(input, limits, &Fake::at(0)).map(|_| ()),
+            expected,
+            "{why}: full parse"
+        );
+        assert_eq!(
+            list_segments(input, limits, &Fake::at(0), 0, 0, 10).map(|_| ()),
+            expected,
+            "{why}: segment page"
+        );
+        assert_eq!(
+            extract_files(input, limits, &Fake::at(0), &[0]).map(|_| ()),
+            expected,
+            "{why}: selected file"
+        );
+    }
+
+    #[test]
+    fn sec_107_segments_per_file_counts_duplicate_and_empty_elements() {
+        let limits = Limits {
+            max_segments_per_file: 2,
+            max_total_segments: 10,
+            ..Limits::default()
+        };
+        let full = seg(1, 1);
+        let empty = "<segment bytes=\"1\" number=\"1\"/>";
+        for segments in [
+            full.repeat(3),
+            empty.repeat(3),
+            format!("{full}{empty}{full}"),
+        ] {
+            let input = doc(&file("duplicates.bin", &segments));
+            assert_limit_in_all_modes(
+                &input,
+                &limits,
+                LimitName::SegmentsPerFile,
+                "per-file segment limit must count duplicate and empty XML elements",
+            );
+        }
+    }
+
+    #[test]
+    fn per_file_boundary_resets_and_preserves_first_duplicate() {
+        let limits = Limits {
+            max_segments_per_file: 2,
+            max_total_segments: 4,
+            ..Limits::default()
+        };
+        let first = "<segment bytes=\"11\" number=\"1\">first-a@h</segment><segment bytes=\"99\" number=\"1\">second-a@h</segment>";
+        let second = "<segment bytes=\"13\" number=\"1\">first-b@h</segment><segment bytes=\"101\" number=\"1\"/>";
+        let input = doc(&format!(
+            "{}{}",
+            file("a.bin", first),
+            file("b.bin", second)
+        ));
+        let parsed = parse(&input, &limits, &Fake::at(0)).unwrap();
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.segment_count, 2);
+        assert_eq!(parsed.duplicate_segments, 2);
+        assert_eq!(parsed.total_bytes, 24);
+        for (idx, bytes, message_id) in [(0, 11, "first-a@h"), (1, 13, "first-b@h")] {
+            let f = &parsed.files[usize::try_from(idx).unwrap()];
+            assert_eq!(f.segment_count, 1);
+            assert_eq!(f.duplicate_segments, 1);
+            assert_eq!(f.bytes, bytes);
+            let page = list_segments(&input, &limits, &Fake::at(0), idx, 0, 10).unwrap();
+            assert_eq!(page.total, 1);
+            assert_eq!(
+                page.items,
+                vec![SegmentEntry {
+                    number: 1,
+                    bytes,
+                    message_id: message_id.to_owned(),
+                }]
+            );
+        }
+        let subset = extract_files(&input, &limits, &Fake::at(0), &[0, 1]).unwrap();
+        assert_eq!(subset.files.len(), 2);
+        assert_eq!(subset.files[0].segments.len(), 2);
+        assert_eq!(subset.files[1].segments.len(), 2);
+        assert_eq!(subset.files[0].segments[0].message_id, "first-a@h");
+        assert_eq!(subset.files[0].segments[1].message_id, "second-a@h");
+        assert_eq!(subset.files[0].segments[1].bytes, 99);
+        assert_eq!(subset.files[1].segments[1].message_id, "");
+        assert_eq!(subset.files[1].segments[1].bytes, 101);
+    }
+
+    #[test]
+    fn total_segment_limit_still_counts_duplicates_across_files() {
+        let two = file("duplicates.bin", &seg(1, 1).repeat(2));
+        let limits = Limits {
+            max_segments_per_file: 2,
+            max_total_segments: 1,
+            ..Limits::default()
+        };
+        assert_limit_in_all_modes(
+            &doc(&two),
+            &limits,
+            LimitName::TotalSegments,
+            "global segment limit must count duplicate XML elements",
+        );
+
+        let limits = Limits {
+            max_total_segments: 3,
+            ..limits
+        };
+        let input = doc(&two.repeat(2));
+        let expected = Err(NzbError::LimitExceeded {
+            which: LimitName::TotalSegments,
+        });
+        assert_eq!(parse(&input, &limits, &Fake::at(0)).map(|_| ()), expected);
+        assert_eq!(
+            extract_files(&input, &limits, &Fake::at(0), &[0, 1]).map(|_| ()),
+            expected
+        );
+        // Targeted parsing intentionally skips the other file's segment work. Its own
+        // two elements fit both bounds, even though a full parse exceeds the global cap.
+        let page = list_segments(&input, &limits, &Fake::at(0), 1, 0, 10).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1);
+    }
 }

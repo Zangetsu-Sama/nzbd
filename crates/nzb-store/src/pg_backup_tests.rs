@@ -26,8 +26,29 @@ async fn populate(e: &Env) -> (i64, i64) {
     e.db.create_saved_search(uploader, "Mine", r#"{"q":"show"}"#, T0)
         .await
         .unwrap();
+    let mut first = None;
     for n in 1..=5 {
-        e.release(n, &Uploader::Account(uploader)).await.unwrap();
+        let id = e.release(n, &Uploader::Account(uploader)).await.unwrap();
+        first.get_or_insert(id);
+    }
+    // The NFO of a release (T140), keyed by digest.
+    if let Some(id) = first {
+        let sha: Vec<u8> = sqlx::query_scalar("SELECT sha256 FROM release WHERE id = $1")
+            .bind(id)
+            .fetch_one(e.db.web())
+            .await
+            .unwrap();
+        let sha = nzb_core::Sha256(<[u8; 32]>::try_from(sha.as_slice()).unwrap());
+        e.db.attach_nfo_as(
+            &Uploader::Account(uploader),
+            id,
+            &sha,
+            b"\xdb\xb0 nfo",
+            T0,
+            None,
+        )
+        .await
+        .unwrap();
     }
     e.db.insert_session(&sess(uploader, 7, SessionStage::Active, T0), 5)
         .await
@@ -52,12 +73,128 @@ async fn populate(e: &Env) -> (i64, i64) {
     (admin, uploader)
 }
 
+// Callers supply count queries over literal fixture tables, never application input.
 async fn n(db: &PgDb, sql: &str) -> i64 {
-    sqlx::query_scalar(sql).fetch_one(db.web()).await.unwrap()
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+        .fetch_one(db.web())
+        .await
+        .unwrap()
 }
 
 fn key() -> BackupKey {
     BackupKey::from_slice(&[7; 32]).unwrap()
+}
+
+#[tokio::test]
+async fn overlapping_snapshot_backups_preserve_the_active_file_and_cancel_cleanly() {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::time::Duration;
+
+    let e = env().await;
+    e.admin("root").await;
+    let dir = tempfile::tempdir().unwrap();
+    // Exhaust the pool so the actual backup stops at begin().await, with its directory
+    // lock and temporary file already owned. No large database or timing race is needed.
+    let mut held = Vec::new();
+    for _ in 0..e.db.background().options().get_max_connections() {
+        held.push(e.db.background().acquire().await.unwrap());
+    }
+    let db = e.db.clone();
+    let destination = dir.path().to_path_buf();
+    let running = tokio::spawn(async move { db.snapshot_backup(&destination, T0, 3, None).await });
+    let name = crate::pg::snapshot_name(T0);
+    let active = dir.path().join(format!(".{name}.tmp"));
+    let published = dir.path().join(&name);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !active.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let before = std::fs::metadata(&active).unwrap();
+    let err = tokio::time::timeout(
+        Duration::from_secs(2),
+        e.db.snapshot_backup(dir.path(), T0, 3, None),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(err, crate::StoreError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    assert_eq!(std::fs::metadata(&active).unwrap().ino(), before.ino());
+    assert!(!published.exists());
+
+    // Unlike SQLite's detached VACUUM worker, Postgres writes this file in the cancelled
+    // future itself: cancellation must release its lock and must not publish a partial file.
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    assert!(!published.exists());
+    let probe = std::fs::File::open(dir.path()).unwrap();
+    probe.try_lock().unwrap();
+    drop(probe);
+    drop(held);
+
+    // The next real backup cleans the abandoned temporary file and remains restorable.
+    let rep = tokio::time::timeout(
+        Duration::from_secs(10),
+        e.db.snapshot_backup(dir.path(), T0, 3, None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(rep.path, published);
+    assert!(!active.exists());
+    let target = TestDb::new().await;
+    let restored = restore_snapshot(
+        target.owner_options(),
+        &rep.path,
+        dir.path(),
+        RestoreOptions::default(),
+        T0 + 1,
+    )
+    .await
+    .unwrap();
+    assert!(restored.audit_chain_ok);
+    assert_eq!(restored.tables, rep.tables);
+    assert_eq!(n(&target.db, "SELECT count(*) FROM account").await, 1);
+}
+
+#[tokio::test]
+async fn sec_094_encrypted_restore_recovers_the_actual_decryption_temporary_file() {
+    let e = env().await;
+    e.admin("root").await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = key();
+    let rep =
+        e.db.snapshot_backup(dir.path(), T0, 3, Some(&key))
+            .await
+            .unwrap();
+    // decrypt_file prefixes the output name with a dot. The restore output itself starts
+    // with a dot, so a kill during decryption leaves this double-dot temporary name.
+    let stale = dir.path().join("..nzbd-restore.plain.tmp.decrypt.tmp");
+    std::fs::write(
+        &stale,
+        b"authenticated partial plaintext from an interrupted restore",
+    )
+    .unwrap();
+    let target = TestDb::new().await;
+    let restored = restore_snapshot(
+        target.owner_options(),
+        &rep.path,
+        dir.path(),
+        RestoreOptions {
+            key: Some(&key),
+            allow_unencrypted: false,
+        },
+        T0 + 1,
+    )
+    .await
+    .unwrap();
+    assert!(restored.audit_chain_ok);
+    assert_eq!(restored.tables, rep.tables);
+    assert_eq!(n(&target.db, "SELECT count(*) FROM account").await, 1);
+    assert!(!stale.exists());
+    assert!(!dir.path().join(".nzbd-restore.plain.tmp").exists());
 }
 
 #[tokio::test]
@@ -91,6 +228,7 @@ async fn snapshot_round_trip_restores_everything_that_is_exported() {
         "SELECT count(*) FROM nzb_file",
         "SELECT count(*) FROM audit_log",
         "SELECT count(*) FROM saved_search",
+        "SELECT count(*) FROM release_nfo",
     ] {
         assert_eq!(n(t, sql).await, n(&e.db, sql).await, "{sql}");
     }
@@ -98,6 +236,18 @@ async fn snapshot_round_trip_restores_everything_that_is_exported() {
         t.saved_searches(uploader).await.unwrap(),
         e.db.saved_searches(uploader).await.unwrap()
     );
+    let nfo_digest =
+        "SELECT md5(string_agg(sha256::text || bytes::text, ',' ORDER BY sha256)) FROM release_nfo";
+    let a: Option<String> = sqlx::query_scalar(nfo_digest)
+        .fetch_one(t.web())
+        .await
+        .unwrap();
+    let b: Option<String> = sqlx::query_scalar(nfo_digest)
+        .fetch_one(e.db.web())
+        .await
+        .unwrap();
+    assert!(a.is_some());
+    assert_eq!(a, b);
     // Content equality of the library and the chain.
     let digest = "SELECT md5(string_agg(sha256::text || title || category_id::text, ',' ORDER BY id)) FROM release";
     let a: String = sqlx::query_scalar(digest)
@@ -510,4 +660,72 @@ async fn sec_044_backup_files_are_0600_and_rotated() {
             .is_err()
     );
     let _ = paths;
+}
+
+/// Plain and encrypted snapshots must retain the latest database state after a clock correction.
+pub(crate) async fn clock_rollback_retains_latest_backup(key: Option<&BackupKey>) {
+    let source = TestDb::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    for keep in [0_usize, 1, 2] {
+        let backups = dir.path().join(format!("backups-{keep}"));
+        std::fs::create_dir(&backups).unwrap();
+        let older = source
+            .db
+            .snapshot_backup(&backups, T0 + 200, keep, key)
+            .await
+            .unwrap();
+        let future = source
+            .db
+            .snapshot_backup(&backups, T0 + 300, keep, key)
+            .await
+            .unwrap();
+        let marker = format!("latest-after-clock-rollback-{keep}");
+        source
+            .db
+            .audit_event(T0, Some("cli"), "download", Some(&marker), None)
+            .await
+            .unwrap();
+        let latest = source
+            .db
+            .snapshot_backup(&backups, T0, keep, key)
+            .await
+            .unwrap();
+        assert!(
+            latest.path.is_file(),
+            "rotation deleted the just-published backup after clock rollback (keep={keep})"
+        );
+        assert_eq!(crate::looks_encrypted(&latest.path), key.is_some());
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), keep.max(1));
+        assert_eq!(latest.rotated, 1);
+        assert!(!older.path.exists());
+        assert_eq!(future.path.exists(), keep == 2);
+
+        // The returned snapshot alone contains the marker added after the future-dated files.
+        let target = TestDb::new().await;
+        let restored = restore_snapshot(
+            target.owner_options(),
+            &latest.path,
+            dir.path(),
+            RestoreOptions {
+                key,
+                allow_unencrypted: false,
+            },
+            T0 + 1,
+        )
+        .await
+        .unwrap();
+        assert!(restored.audit_chain_ok);
+        assert_eq!(restored.tables, latest.tables);
+        let detail: String =
+            sqlx::query_scalar("SELECT detail FROM audit_log ORDER BY id DESC LIMIT 1")
+                .fetch_one(target.db.web())
+                .await
+                .unwrap();
+        assert_eq!(detail, marker);
+    }
+}
+
+#[tokio::test]
+async fn sec_044_clock_rollback_keeps_latest_plain_backup() {
+    clock_rollback_retains_latest_backup(None).await;
 }

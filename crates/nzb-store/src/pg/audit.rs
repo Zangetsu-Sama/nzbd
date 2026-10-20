@@ -3,7 +3,7 @@
 //! The application never inserts into `audit_log` (it has no grant): every row goes through the SECURITY DEFINER
 //! function `nzbd.audit_append`, which picks the chain class by event name, locks the class state row `FOR UPDATE`
 //! (serial across every connection and process until the caller commits), computes the 2.x chain hash in SQL and moves
-//! the head. Callers append LAST in their transaction (lock order, ARCHITECTURE section 6).
+//! the head. Callers append LAST in their transaction (lock order, ARCHITECTURE v3 section 6).
 
 use sqlx::{PgConnection, Row};
 

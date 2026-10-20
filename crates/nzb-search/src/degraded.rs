@@ -1,4 +1,4 @@
-//! Degraded listing mode while no index generation is servable (ARCHITECTURE 3.3, review L5).
+//! Degraded listing mode while no index generation is servable (ARCHITECTURE v3 3.3, review L5).
 //!
 //! Newest-first browse by `release.id` (primary-key keyset walk in Postgres), no text search, no
 //! filter other than category, totals from `category_stats`. Bounded so a rebuild window cannot

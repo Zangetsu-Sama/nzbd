@@ -151,6 +151,16 @@ impl Taxonomy {
         self.entries.is_empty()
     }
 
+    /// Categories in the order every UI list shows them: tree (file) order, except that the XXX category and its
+    /// descendants come last (T146). The one place that rule lives; menus, dropdowns and stats all call it.
+    #[must_use]
+    pub fn display_order(&self) -> Vec<&Category> {
+        let xxx = self.subtree_ids(XXX_CATEGORY);
+        let (last, first): (Vec<&Category>, Vec<&Category>) =
+            self.entries.iter().partition(|c| xxx.contains(&c.id));
+        first.into_iter().chain(last).collect()
+    }
+
     /// Looks a category up by id.
     #[must_use]
     pub fn get(&self, id: u16) -> Option<&Category> {
@@ -268,15 +278,58 @@ name = "Other/Misc"
     }
 
     #[test]
+    fn display_order_puts_xxx_last_and_keeps_the_rest() {
+        let t = t();
+        let order: Vec<u16> = t.display_order().iter().map(|c| c.id).collect();
+        assert_eq!(order.len(), t.len());
+        assert_eq!(order.last(), Some(&XXX_CATEGORY));
+        let rest: Vec<u16> = t
+            .entries()
+            .iter()
+            .map(|c| c.id)
+            .filter(|i| *i != XXX_CATEGORY)
+            .collect();
+        assert_eq!(order.get(..rest.len()), Some(rest.as_slice()));
+    }
+
+    #[test]
+    fn new_categories_have_unique_ids_and_existing_parents() {
+        let t = t();
+        for (id, parent, slug) in [
+            (1010, 1000, "console.microsoft"),
+            (1020, 1000, "console.nintendo"),
+            (1030, 1000, "console.sony"),
+            (4010, 4000, "pc.appz"),
+            (4020, 4000, "pc.games"),
+            (7040, 7000, "books.mangas"),
+            (4510, 4500, "mac.macappz"),
+            (4520, 4500, "mac.macgames"),
+        ] {
+            let c = t.get(id).unwrap();
+            assert_eq!((c.parent, c.slug.as_str()), (Some(parent), slug));
+        }
+        for (slug, id) in [
+            ("audio.mp3", 3010),
+            ("audio.audiobook", 3030),
+            ("audio.lossless", 3040),
+        ] {
+            assert_eq!(t.resolve(slug), Some(id));
+        }
+    }
+
+    #[test]
     fn builtin_loads_and_matches_spec_table() {
         let t = t();
-        assert_eq!(t.len(), 27);
+        assert_eq!(t.len(), 36);
         for (slug, id) in [
             ("console", 1000),
             ("movies", 2000),
             ("movies.uhd", 2045),
             ("audio.lossless", 3040),
+            ("console.sony", 1030),
             ("pc", 4000),
+            ("pc.appz", 4010),
+            ("pc.games", 4020),
             ("tv.hd", 5040),
             ("tv.sport", 5060),
             ("anime", 5070),

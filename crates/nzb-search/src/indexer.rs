@@ -1,5 +1,5 @@
 //! The indexer: the single writer that applies the transactional outbox to the index, and the
-//! new-generation rebuild (ARCHITECTURE 3.2-3.3, SEC-091, SEC-092).
+//! new-generation rebuild (ARCHITECTURE v3 3.2-3.3, SEC-091, SEC-092).
 //!
 //! The source of truth is abstract ([`IndexSource`]); T112 implements it on Postgres. Ordering, per
 //! round: read outbox rows -> load the **current** rows of their ids (one snapshot) -> `delete_term` +
@@ -40,6 +40,10 @@ pub const MAX_WRITER_FAILURES: usize = 3;
 pub const WRITER_FAILURE_WINDOW_MS: u64 = 600_000;
 /// Attempts of a document that cannot be built before its release is quarantined.
 pub const MAX_DOC_ATTEMPTS: u32 = 3;
+/// Consecutive live rounds that fail on a document-source error before the next one bisects the batch
+/// with per-document loads (review 55): one release whose load always fails must not stall the outbox
+/// forever, while a short database outage still never bisects (it would only add load).
+pub const MAX_STORE_ERROR_ROUNDS: u32 = 8;
 /// Fixed quarantine error code (never a message with data).
 pub const QUARANTINE_DOC_BUILD: &str = "DOC_BUILD_FAILED";
 /// Quarantine code of a document whose add or commit breaks the Tantivy writer (review 32 L4).
@@ -261,6 +265,8 @@ pub struct Indexer<S> {
     live: Option<(u64, Arc<Engine>)>,
     doc_failures: HashMap<i64, u32>,
     writer_failures: VecDeque<u64>,
+    /// Consecutive live rounds that ended in a document-source error ([`MAX_STORE_ERROR_ROUNDS`]).
+    store_error_rounds: u32,
     rebuild_needed: bool,
     #[cfg(test)]
     faults: std::sync::Mutex<std::collections::HashSet<Fault>>,
@@ -308,6 +314,7 @@ impl<S: IndexSource> Indexer<S> {
             live: None,
             doc_failures: HashMap::new(),
             writer_failures: VecDeque::new(),
+            store_error_rounds: 0,
             rebuild_needed: false,
             #[cfg(test)]
             faults: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -423,7 +430,6 @@ impl<S: IndexSource> Indexer<S> {
     }
 
     /// Reads, loads, applies and commits one batch of outbox rows into `engine`; consumes them when
-    /// Reads, loads, applies and commits one batch of outbox rows into `engine`; consumes them when
     /// `consume`.
     ///
     /// Memory (review 32 M2): ids are loaded [`LOAD_CHUNK`] at a time and each chunk is handed to the
@@ -458,15 +464,42 @@ impl<S: IndexSource> Indexer<S> {
             Err(e) => Err(e),
         };
         match applied {
-            Ok(()) => {}
+            Ok(()) => self.store_error_rounds = 0,
             #[cfg(test)]
             Err(SearchError::Injected) => return Err(SearchError::Injected),
+            Err(err @ SearchError::Store(_))
+                if self.store_error_rounds.saturating_add(1) < MAX_STORE_ERROR_ROUNDS =>
+            {
+                // The document source failed (database down, statement timeout), not the writer:
+                // bisecting the batch would only hammer the database and a few of these rounds would
+                // degrade the index for nothing. Drop the uncommitted work and leave the outbox rows
+                // for the next round (idempotent).
+                self.store_error_rounds = self.store_error_rounds.saturating_add(1);
+                let e = Arc::clone(engine);
+                if blocking(move || e.reopen_writer()).await.is_err() {
+                    self.writer_failed(engine).await;
+                }
+                return Err(err);
+            }
             Err(err) => {
                 // The writer lost the round's uncommitted work. Before blaming the writer, look for a
-                // document that breaks it (review 32 L4).
-                let Ok((bad, failed)) = self.isolate(engine, &ids).await else {
-                    self.writer_failed(engine).await;
-                    return Err(err);
+                // document that breaks it (review 32 L4). After MAX_STORE_ERROR_ROUNDS source errors in
+                // a row (the outbox answered every time), look for a document whose load fails instead.
+                let per_doc_loads = matches!(err, SearchError::Store(_));
+                let (bad, failed) = match self.isolate(engine, &ids, per_doc_loads).await {
+                    Ok(v) => {
+                        self.store_error_rounds = 0;
+                        v
+                    }
+                    // Isolation already discarded the interrupted group's pending changes.
+                    Err(source @ SearchError::Store(_)) => {
+                        self.store_error_rounds = self.store_error_rounds.saturating_add(1);
+                        return Err(source);
+                    }
+                    Err(_) => {
+                        self.writer_failed(engine).await;
+                        return Err(err);
+                    }
                 };
                 // A quarantined release leaves the listings (its older copy too).
                 self.apply(engine, Vec::new(), bad.clone()).await?;
@@ -585,13 +618,22 @@ impl<S: IndexSource> Indexer<S> {
     /// per group) to find the documents whose add or commit breaks the writer. Returns those (to be
     /// quarantined as [`QUARANTINE_DOC_INDEX`]) and the documents that could not be built.
     ///
+    /// With `per_doc_loads` (a live round after [`MAX_STORE_ERROR_ROUNDS`] source errors in a row), a
+    /// group whose load fails is bisected too, and a single document that cannot be loaded joins the
+    /// "could not be built" list (retried, then quarantined as [`QUARANTINE_DOC_BUILD`]), so one bad
+    /// row cannot hold back the rest of the outbox.
+    ///
     /// # Errors
+    /// Source errors stop isolation and discard the interrupted group's uncommitted work (with
+    /// `per_doc_loads`: only when no group loads at all, which points at the database, not a
+    /// document; a batch of one document is that document).
     /// The writer itself is broken: it cannot commit an empty change, or no group succeeds at all
     /// (every document failing means the writer, not the documents).
     async fn isolate(
         &self,
         engine: &Arc<Engine>,
         ids: &[i64],
+        per_doc_loads: bool,
     ) -> Result<(Vec<i64>, Vec<i64>), SearchError> {
         let healthy = |e: Arc<Engine>| {
             blocking(move || {
@@ -602,6 +644,8 @@ impl<S: IndexSource> Indexer<S> {
         healthy(Arc::clone(engine)).await?;
         let mut bad = Vec::new();
         let mut build_failed = Vec::new();
+        let mut unloadable: Vec<i64> = Vec::new();
+        let mut last_source_err: Option<SearchError> = None;
         let mut any_ok = false;
         let mut stack: Vec<Vec<i64>> = vec![ids.to_vec()];
         while let Some(group) = stack.pop() {
@@ -624,10 +668,31 @@ impl<S: IndexSource> Indexer<S> {
                 blocking(move || e.commit(&e.payload())).await
             }
             .await;
-            if r.is_ok() {
-                any_ok = true;
-                build_failed.extend(failed);
-                continue;
+            match r {
+                Ok(()) => {
+                    any_ok = true;
+                    build_failed.extend(failed);
+                    continue;
+                }
+                Err(err @ SearchError::Store(_)) => {
+                    // A failed load says nothing about the documents or the writer. Drop this
+                    // group's queued work and leave every outbox event available for a retry.
+                    let e = Arc::clone(engine);
+                    blocking(move || e.reopen_writer()).await?;
+                    if !per_doc_loads {
+                        return Err(err);
+                    }
+                    if let [one] = group.as_slice() {
+                        unloadable.push(*one);
+                    } else {
+                        let (a, b) = group.split_at(group.len() / 2);
+                        stack.push(b.to_vec());
+                        stack.push(a.to_vec());
+                    }
+                    last_source_err = Some(err);
+                    continue;
+                }
+                Err(_) => {}
             }
             healthy(Arc::clone(engine)).await?;
             if let [one] = group.as_slice() {
@@ -639,8 +704,12 @@ impl<S: IndexSource> Indexer<S> {
             }
         }
         if !any_ok {
-            return Err(SearchError::WriterUnavailable);
+            let lone_unloadable = ids.len() == 1 && unloadable.len() == 1;
+            if !lone_unloadable {
+                return Err(last_source_err.unwrap_or(SearchError::WriterUnavailable));
+            }
         }
+        build_failed.extend(unloadable);
         bad.sort_unstable();
         Ok((bad, build_failed))
     }
@@ -764,7 +833,14 @@ impl<S: IndexSource> Indexer<S> {
                 Err(e) => {
                     // The writer dropped everything since the last scan commit: quarantine the
                     // document that broke it (review 32 L4), then go back to that commit.
-                    let (bad, failed) = self.isolate(new, &ids).await.map_err(|_| e)?;
+                    let (bad, failed) =
+                        self.isolate(new, &ids, false).await.map_err(|isolation| {
+                            if matches!(isolation, SearchError::Store(_)) {
+                                isolation
+                            } else {
+                                e
+                            }
+                        })?;
                     for id in &bad {
                         self.source.quarantine(*id, QUARANTINE_DOC_INDEX).await?;
                     }
@@ -816,7 +892,14 @@ impl<S: IndexSource> Indexer<S> {
                 #[cfg(test)]
                 Err(SearchError::Injected) => return Err(SearchError::Injected),
                 Err(e) => {
-                    let (bad, failed) = self.isolate(new, &ids).await.map_err(|_| e)?;
+                    let (bad, failed) =
+                        self.isolate(new, &ids, false).await.map_err(|isolation| {
+                            if matches!(isolation, SearchError::Store(_)) {
+                                isolation
+                            } else {
+                                e
+                            }
+                        })?;
                     for id in &bad {
                         self.source.quarantine(*id, QUARANTINE_DOC_INDEX).await?;
                     }

@@ -9,8 +9,80 @@
     clippy::assert_is_empty
 )]
 
-use crate::acct_testkit::{T0, env};
-use crate::{AccountError, CategorySource, MAX_BULK_IDS, StoreError, Uploader};
+use crate::acct_testkit::{T0, env, sess};
+use crate::{AccountError, CategorySource, MAX_BULK_IDS, SessionStage, StoreError, Uploader};
+
+#[tokio::test]
+async fn sec_060_bulk_metadata_requires_current_session() {
+    let e = env().await;
+    let admin = e.admin("root").await;
+    let other = e.admin("other").await;
+    let mut actor = e.actor(admin).await;
+    // Capture the actor before logout, as a request admitted before reading its body would.
+    for (owner, hash, stage) in [
+        (admin, 10, SessionStage::Active),
+        (admin, 11, SessionStage::Active),
+        (admin, 12, SessionStage::PendingMfa),
+        (other, 13, SessionStage::Active),
+    ] {
+        let mut session = sess(owner, hash, stage, T0);
+        if hash == 11 {
+            session.expires_at = T0 + 1;
+        }
+        e.db.insert_session(&session, 10).await.unwrap();
+    }
+    e.db.delete_session(&[10; 32]).await.unwrap();
+    let first = e.release(1, &Uploader::Unattributed).await.unwrap();
+    let second = e.release(2, &Uploader::Unattributed).await.unwrap();
+    let before = [
+        e.db.get_release(first).await.unwrap().unwrap(),
+        e.db.get_release(second).await.unwrap().unwrap(),
+    ];
+    let outbox = e.count("search_outbox", "1 = 1").await;
+    let audit = e.count("audit_log", "1 = 1").await;
+    for hash in [10, 11, 12, 13] {
+        actor.session = Some([hash; 32]);
+        let results = [
+            e.db.bulk_set_category_as(&actor, &[first, second], 5040, &[], None, T0 + 1)
+                .await
+                .map(|_| ()),
+            e.db.bulk_set_source_label_as(&actor, &[first, second], "changed", &[], None, T0 + 1)
+                .await
+                .map(|_| ()),
+        ];
+        for result in results {
+            assert!(
+                matches!(result, Err(StoreError::Account(AccountError::Forbidden))),
+                "session {hash}: {result:?}"
+            );
+        }
+        assert_eq!(e.db.get_release(first).await.unwrap().unwrap(), before[0]);
+        assert_eq!(e.db.get_release(second).await.unwrap().unwrap(), before[1]);
+        assert_eq!(e.count("search_outbox", "1 = 1").await, outbox);
+        assert_eq!(e.count("audit_log", "1 = 1").await, audit);
+    }
+    actor.session = Some([11; 32]);
+    assert_eq!(
+        e.db.bulk_set_category_as(&actor, &[first, second], 5040, &[], None, T0)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        e.db.bulk_set_source_label_as(&actor, &[first, second], "allowed", &[], None, T0)
+            .await
+            .unwrap()
+            .0,
+        2
+    );
+    actor.session = None;
+    assert_eq!(
+        e.db.bulk_set_category_as(&actor, &[first, second], 8010, &[], None, T0 + 1)
+            .await
+            .unwrap(),
+        2
+    );
+}
 
 const HIDDEN: [u16; 1] = [6000];
 

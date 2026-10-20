@@ -21,6 +21,6 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 cap = "0.1"
-nzb-testkit = { path = "../nzb-testkit", version = "0.5.1" }
+nzb-testkit = { path = "../nzb-testkit", version = "0.6.0" }
 proptest = "1"
 serde_json = "1"

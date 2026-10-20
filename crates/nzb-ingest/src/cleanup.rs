@@ -41,7 +41,9 @@ use nzb_core::Sha256;
 use nzb_store::{Store, StoreError, TrashPurge, TrashStore, sha8};
 use sha2::{Digest, Sha256 as Hasher};
 
-use crate::failure::{EXPIRED_DIR, FailedEntry, REASON_SUFFIX, is_failed_name, list_failed};
+use crate::failure::{
+    EXPIRED_DIR, FailedEntry, REASON_SUFFIX, is_failed_name, is_failed_nfo_name, list_failed,
+};
 use crate::fsops::{
     SourceIdent, fsync_dir, is_generated_part, move_no_clobber, remove_if_unchanged, unique_tag,
 };
@@ -237,7 +239,7 @@ pub struct PurgeReport {
 pub type PurgeGate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Items handled between two authority re-checks.
-pub const PURGE_BATCH: u64 = 50;
+pub const PURGE_BATCH: u64 = nzb_store::QuarantinePurge::BATCH_SIZE;
 
 impl PurgeReport {
     const fn new(bucket: Bucket) -> Self {
@@ -316,6 +318,7 @@ fn count_foreign(dir: &Path, top: bool) -> u64 {
             continue;
         }
         let known = is_failed_name(name)
+            || is_failed_nfo_name(name)
             || name.strip_suffix(REASON_SUFFIX).is_some_and(is_failed_name)
             || name.starts_with(LEFTOVER_PREFIX)
             || is_generated_part(name);
@@ -511,6 +514,11 @@ fn purge_failed_bucket(
                 Verdict::OtherBucket => {}
                 Verdict::Refused => rep.refused = rep.refused.saturating_add(1),
                 Verdict::Remove(ident) => {
+                    // Hashing a large file may have consumed the remaining time budget.
+                    if Instant::now() >= deadline {
+                        rep.remaining = rep.remaining.saturating_add(1);
+                        continue;
+                    }
                     match remove_if_unchanged(&dir.join(&e.name), &ident) {
                         Ok(true) => {
                             // The sidecar goes second: a crash in between leaves an orphan
@@ -519,6 +527,10 @@ fn purge_failed_bucket(
                             let sc = dir.join(format!("{}{REASON_SUFFIX}", e.name));
                             if fs::symlink_metadata(&sc).is_ok_and(|m| m.file_type().is_file()) {
                                 let _ = fs::remove_file(&sc);
+                            }
+                            // T141: the NFO that followed it into `failed/` is part of the purged item.
+                            if let Some(stem) = e.name.strip_suffix(".nzb") {
+                                let _ = crate::fsops::remove_twin(&dir, stem);
                             }
                             fsync_dir(&dir);
                             rep.removed = rep.removed.saturating_add(1);
@@ -582,6 +594,10 @@ fn purge_leftovers(
             if !redundant {
                 // Possibly the only copy of something: startup recovery restores it visibly.
                 rep.refused = rep.refused.saturating_add(1);
+                continue;
+            }
+            if Instant::now() >= deadline {
+                rep.remaining = rep.remaining.saturating_add(1);
                 continue;
             }
             match remove_if_unchanged(&path, &ident) {
@@ -668,6 +684,10 @@ async fn purge_trash(
             continue;
         }
         handled = handled.saturating_add(1);
+        if Instant::now() >= deadline {
+            rep.remaining = rep.remaining.saturating_add(1);
+            continue;
+        }
         match env.store.trash_purge(&row.sha256).await {
             Ok(TrashPurge::Removed { bytes }) => {
                 rep.bytes = rep.bytes.saturating_add(bytes);
@@ -683,28 +703,36 @@ async fn purge_trash(
                 continue;
             }
         }
-        match env.db.forget_trash(row.id).await {
+        match env.db.purge_trash_record(row.id, now).await {
             Ok(_) => rep.removed = rep.removed.saturating_add(1),
             Err(_) => rep.errors = rep.errors.saturating_add(1),
         }
     }
-    if rep.aborted || !gate_open(gate.as_ref()).await? {
-        rep.aborted = true;
-        return Ok(rep);
-    }
     // 2. The store's quarantine, minimum age enforced.
+    let quarantine_gate: Option<PurgeGate> = if rep.aborted {
+        Some(Arc::new(|| false))
+    } else {
+        gate.clone()
+    };
     let q = env
         .store
-        .quarantine_purge(now.saturating_sub(QUARANTINE_MIN_AGE_SECS))
+        .quarantine_purge_checked(
+            now.saturating_sub(QUARANTINE_MIN_AGE_SECS),
+            Some(deadline),
+            quarantine_gate,
+        )
         .await?;
     rep.removed = rep.removed.saturating_add(q.removed);
     rep.bytes = rep.bytes.saturating_add(q.bytes);
     rep.kept_recent = rep.kept_recent.saturating_add(q.kept_recent);
     rep.unmanaged = rep.unmanaged.saturating_add(q.skipped);
+    rep.remaining = rep.remaining.saturating_add(q.remaining);
+    rep.aborted = rep.aborted || q.aborted;
     // 3. Leftovers of a verified removal.
     let live = env.db.list_shas().await?;
     let dir = env.failed_dir.clone();
     let mut inner = PurgeReport::new(Bucket::Trash);
+    inner.aborted = rep.aborted;
     let leftover_gate = gate.clone();
     let inner = tokio::task::spawn_blocking(move || {
         purge_leftovers(&dir, &live, deadline, leftover_gate.as_ref(), &mut inner);
@@ -830,8 +858,75 @@ fn write_restored(watch: &Path, stem: &str, bytes: &[u8]) -> io::Result<String> 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn trash_purge_propagates_quarantine_deadlines_and_authority_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        for policy in 0..3 {
+            let root = dir.path().join(format!("store-{policy}"));
+            let store = nzb_store::FsStore::open(&root).unwrap();
+            let failed = dir.path().join(format!("failed-{policy}"));
+            fs::create_dir(&failed).unwrap();
+            let quarantine = root.join(".gc-trash");
+            fs::create_dir(&quarantine).unwrap();
+            let bytes = b"quarantined content";
+            let sha = Sha256(Hasher::digest(bytes).into());
+            let count = if policy == 2 { PURGE_BATCH + 3 } else { 1 };
+            for counter in 0..count {
+                fs::write(
+                    quarantine.join(format!("{}.1.{counter}.trash", sha.to_hex())),
+                    bytes,
+                )
+                .unwrap();
+            }
+            let env = CleanupEnv {
+                db: backend.store.clone(),
+                store: Arc::new(store),
+                failed_dir: failed,
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let gate: Option<PurgeGate> = match policy {
+                0 => None,
+                1 => Some(Arc::new(|| false)),
+                _ => Some(Arc::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst) == 0
+                })),
+            };
+            let deadline = if policy == 0 {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(60)
+            };
+            let rep = purge_gated(
+                &env,
+                Bucket::Trash,
+                QUARANTINE_MIN_AGE_SECS + 2,
+                deadline,
+                gate,
+            )
+            .await
+            .unwrap();
+            let removed = if policy == 2 { PURGE_BATCH } else { 0 };
+            assert_eq!(rep.removed, removed, "policy {policy}");
+            assert_eq!(rep.remaining, count - removed, "policy {policy}");
+            assert_eq!(rep.aborted, policy != 0, "policy {policy}");
+            assert_eq!(
+                u64::try_from(fs::read_dir(&quarantine).unwrap().count()).unwrap(),
+                count - removed
+            );
+            for entry in fs::read_dir(quarantine).unwrap() {
+                assert_eq!(fs::read(entry.unwrap().path()).unwrap(), bytes);
+            }
+        }
+    }
 
     #[test]
     fn classification_table() {

@@ -93,6 +93,29 @@ async fn sec_024_session_roundtrip_rotate_purge() {
 }
 
 #[tokio::test]
+async fn sec_024_expired_sessions_cannot_be_refreshed() {
+    let (_d, db) = open().await;
+    let uid = db.create_user("alice", "h", 1).await.unwrap();
+    db.insert_session(&sess(1, uid, SessionStage::Active, 10), 5)
+        .await
+        .unwrap();
+    // The request began while authenticated, but its body completed at/after idle expiry.
+    for now in [110, 111] {
+        db.touch_session(&[1; 32], now, now + 100).await.unwrap();
+        let row = db.get_session(&[1; 32]).await.unwrap().unwrap();
+        assert_eq!(row.expires_at, 110);
+        assert_eq!(row.last_seen_at, 10);
+    }
+    // A current session still slides normally.
+    db.insert_session(&sess(2, uid, SessionStage::Active, 200), 5)
+        .await
+        .unwrap();
+    db.touch_session(&[2; 32], 250, 350).await.unwrap();
+    let row = db.get_session(&[2; 32]).await.unwrap().unwrap();
+    assert_eq!((row.last_seen_at, row.expires_at), (250, 350));
+}
+
+#[tokio::test]
 async fn sec_024_max_sessions_per_stage_evicts_oldest_and_pending_cannot_evict_active() {
     let (_d, db) = open().await;
     let uid = db.create_user("alice", "h", 1).await.unwrap();

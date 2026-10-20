@@ -213,6 +213,27 @@ fn row_to_login(r: &sqlx::sqlite::SqliteRow) -> Result<LoginUser, StoreError> {
     })
 }
 
+/// Whether `id_hash` is still an unexpired `active` session of `account_id`. Every revocation (recovery, reset, role change,
+/// disable, explicit revoke) deletes the row, so this is how a writer learns that the session which re-authenticated
+/// the request died meanwhile.
+pub(crate) async fn session_is_live(
+    conn: &mut sqlx::SqliteConnection,
+    id_hash: &[u8; 32],
+    account_id: i64,
+    now: i64,
+) -> Result<bool, StoreError> {
+    let live: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM session WHERE id_hash = ?1 AND account_id = ?2 \
+         AND stage = 'active' AND expires_at > ?3",
+    )
+    .bind(id_hash.as_slice())
+    .bind(account_id)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(live.is_some())
+}
+
 /// Inserts `s` and applies the per-user, per-stage cap. `enroll_proven` marks a pending session that
 /// already proved possession of an out-of-band invite/recovery code (0011).
 pub(crate) async fn insert_in_tx(
@@ -255,6 +276,48 @@ pub(crate) async fn insert_in_tx(
 }
 
 impl SqliteDb {
+    /// Issues a pending login only while the account still matches the password-verdict
+    /// observation. Rechecking and replacing/inserting the session share the writer lock,
+    /// so a password change either revokes this row or prevents its creation.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] for changed or unusable credentials;
+    /// [`StoreError::OutOfRange`] for a mismatched account or non-pending session; database failure.
+    pub async fn insert_login_session(
+        &self,
+        seen: &LoginUser,
+        s: &NewSession,
+        replacing: Option<&[u8; 32]>,
+        max_per_stage: u32,
+    ) -> Result<(), StoreError> {
+        if s.user_id != seen.id || s.stage != SessionStage::PendingMfa {
+            return Err(StoreError::OutOfRange("login session"));
+        }
+        let mut tx = self.begin_immediate().await?;
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM account WHERE id = ?1 AND password_hash = ?2 AND role = ?3 \
+             AND totp_enabled = ?4 AND disabled_at IS NULL AND deleted_at IS NULL",
+        )
+        .bind(seen.id)
+        .bind(&seen.password_hash)
+        .bind(seen.role.as_str())
+        .bind(i64::from(seen.totp_enabled))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if seen.disabled || current.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        if let Some(old) = replacing {
+            sqlx::query("DELETE FROM session WHERE id_hash = ?1")
+                .bind(old.as_slice())
+                .execute(&mut *tx)
+                .await?;
+        }
+        insert_in_tx(&mut tx, s, max_per_stage, false).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Inserts a session and revokes the oldest of the same stage beyond `max_per_stage`.
     ///
     /// # Errors
@@ -308,7 +371,7 @@ impl SqliteDb {
         max_per_stage: u32,
         strict: bool,
     ) -> Result<(), StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let removed = sqlx::query("DELETE FROM session WHERE id_hash = ?1")
             .bind(old_hash.as_slice())
             .execute(&mut *tx)
@@ -360,7 +423,7 @@ impl SqliteDb {
         .transpose()
     }
 
-    /// Slides the idle deadline of an `active` session.
+    /// Slides the idle deadline of an unexpired `active` session. A late touch never revives it.
     ///
     /// # Errors
     /// Database failure.
@@ -372,7 +435,7 @@ impl SqliteDb {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE session SET last_seen_at = ?2, expires_at = ?3 \
-             WHERE id_hash = ?1 AND stage = 'active'",
+             WHERE id_hash = ?1 AND stage = 'active' AND expires_at > ?2",
         )
         .bind(id_hash.as_slice())
         .bind(now)
@@ -452,7 +515,7 @@ impl SqliteDb {
         user_id: i64,
         now: i64,
     ) -> Result<Option<i64>, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let r = bump_failure(&mut tx, user_id, now).await?;
         tx.commit().await?;
         Ok(r)
@@ -480,7 +543,7 @@ impl SqliteDb {
         ip: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let row = match user_id {
             Some(id) => {
                 sqlx::query(

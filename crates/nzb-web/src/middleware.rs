@@ -307,8 +307,9 @@ pub(crate) async fn context_layer(State(sh): St, mut req: Request, next: Next) -
         .map_or_else(|| req.uri().path(), axum::http::uri::PathAndQuery::as_str);
     // Query strings can carry tokens: never logged. Cap length against log flooding.
     let path_log: String = path_for_log(target).chars().take(200).collect();
-    let wants_html = (method == Method::GET || method == Method::HEAD)
-        && !req.uri().path().starts_with("/api/")
+    // Native form POSTs request HTML too. Their validation errors must remain navigable pages;
+    // API routes always retain JSON, and non-browser callers keep JSON unless they ask for HTML.
+    let wants_html = !req.uri().path().starts_with("/api/")
         && req
             .headers()
             .get(header::ACCEPT)
@@ -319,9 +320,13 @@ pub(crate) async fn context_layer(State(sh): St, mut req: Request, next: Next) -
     // SQLite busy) turns this request's generic 500 into the uniform `503 BUSY` with `Retry-After`.
     let (resp, busy) = nzb_store::busy::scope(next.run(req)).await;
     let resp = if busy && resp.status() == StatusCode::INTERNAL_SERVER_ERROR {
-        crate::error::ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "BUSY")
-            .retry_after(BUSY_RETRY_AFTER_SECS)
-            .into_response()
+        let mut busy_response =
+            crate::error::ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "BUSY")
+                .retry_after(BUSY_RETRY_AFTER_SECS)
+                .into_response();
+        // This replacement happens outside headers_layer, so it needs the same protections.
+        apply_security_headers(&mut busy_response, tls);
+        busy_response
     } else {
         resp
     };
@@ -356,6 +361,11 @@ pub(crate) async fn strip_allow(req: Request, next: Next) -> Response {
 pub(crate) async fn headers_layer(req: Request, next: Next) -> Response {
     let tls = req.extensions().get::<ViaTls>().is_some_and(|t| t.0);
     let mut resp = next.run(req).await;
+    apply_security_headers(&mut resp, tls);
+    resp
+}
+
+fn apply_security_headers(resp: &mut Response, tls: bool) {
     let h = resp.headers_mut();
     for (name, value) in SECURITY_HEADERS {
         h.insert(name, HeaderValue::from_static(value));
@@ -372,7 +382,6 @@ pub(crate) async fn headers_layer(req: Request, next: Next) -> Response {
             HeaderValue::from_static(HSTS),
         );
     }
-    resp
 }
 
 /// Per-IP rate limiting (SEC-029). Health checks and static assets are exempt.
@@ -498,3 +507,228 @@ pub(crate) async fn limits_layer(State(sh): St, mut req: Request, next: Next) ->
 
 /// Convenience for configs: default request timeout.
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod busy_header_tests {
+    use super::*;
+    use axum::{Router, routing::get};
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One response matrix checks negotiation, TLS trust and error replacement.
+    async fn busy_error_replacement_retains_all_security_headers() {
+        let cfg = WebConfig {
+            trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
+            ..WebConfig::default()
+        };
+        let app = crate::harden(
+            Router::new()
+                .route(
+                    "/busy",
+                    get(|| async {
+                        nzb_store::busy::note(&nzb_store::StoreError::Io(std::io::Error::from(
+                            std::io::ErrorKind::TimedOut,
+                        )));
+                        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL")
+                    }),
+                )
+                .route(
+                    "/ordinary",
+                    get(|| async { ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL") }),
+                ),
+            &cfg,
+        );
+        for busy in [true, false] {
+            for accept in ["text/html", "application/json"] {
+                for (peer, scheme, tls) in [
+                    ("127.0.0.1:12345", "https", true),
+                    ("127.0.0.1:12345", "http", false),
+                    ("198.51.100.7:12345", "https", false),
+                ] {
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(if busy { "/busy" } else { "/ordinary" })
+                                .header(header::ACCEPT, accept)
+                                .header("x-forwarded-proto", scheme)
+                                .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        if busy {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    );
+                    for (name, value) in SECURITY_HEADERS {
+                        assert_eq!(
+                            response.headers().get(name),
+                            Some(&HeaderValue::from_static(value)),
+                            "missing or changed {name}: busy={busy}, accept={accept}, peer={peer}"
+                        );
+                    }
+                    assert_eq!(
+                        response.headers().get(header::CACHE_CONTROL),
+                        Some(&HeaderValue::from_static("no-store"))
+                    );
+                    assert_eq!(
+                        response.headers().get(header::STRICT_TRANSPORT_SECURITY),
+                        tls.then(|| HeaderValue::from_static(HSTS)).as_ref()
+                    );
+                    assert_eq!(
+                        response.headers().get(header::RETRY_AFTER),
+                        busy.then(|| HeaderValue::from_static("2")).as_ref()
+                    );
+                    assert!(response.headers().contains_key("x-request-id"));
+                    assert!(
+                        response
+                            .headers()
+                            .get(header::CONTENT_TYPE)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .starts_with(accept)
+                    );
+                    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert!(text.contains(if busy { "BUSY" } else { "INTERNAL" }));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use axum::{Router, routing::post};
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one response matrix verifies negotiation and the shared security headers
+    async fn form_post_errors_are_html_but_api_and_json_clients_keep_json() {
+        let app = crate::harden(
+            Router::new()
+                .route(
+                    "/release/7/download/selected",
+                    post(|| async { ApiError::new(StatusCode::BAD_REQUEST, "NO_FILES_SELECTED") }),
+                )
+                .route(
+                    "/releases/bulk/download",
+                    post(|| async { ApiError::new(StatusCode::BAD_REQUEST, "NO_SELECTION") }),
+                )
+                .route(
+                    "/api/v1/nzb",
+                    post(|| async { ApiError::new(StatusCode::BAD_REQUEST, "BAD_REQUEST") }),
+                ),
+            &WebConfig::default(),
+        );
+        for (path, accept, htmx, html, code) in [
+            (
+                "/release/7/download/selected",
+                "text/html,application/xhtml+xml",
+                false,
+                true,
+                "NO_FILES_SELECTED",
+            ),
+            (
+                "/releases/bulk/download",
+                "text/html",
+                false,
+                true,
+                "NO_SELECTION",
+            ),
+            (
+                "/release/7/download/selected",
+                "text/html",
+                true,
+                true,
+                "NO_FILES_SELECTED",
+            ),
+            (
+                "/release/7/download/selected",
+                "application/json",
+                false,
+                false,
+                "NO_FILES_SELECTED",
+            ),
+            (
+                "/releases/bulk/download",
+                "*/*",
+                false,
+                false,
+                "NO_SELECTION",
+            ),
+            ("/api/v1/nzb", "text/html", false, false, "BAD_REQUEST"),
+        ] {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::ACCEPT, accept)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            if htmx {
+                req = req.header("hx-request", "true");
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            // HTMX must retain the error status so its normal responseError handler announces it.
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path} {accept}");
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            let request_id = resp
+                .headers()
+                .get("x-request-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let text = std::str::from_utf8(&body).unwrap();
+            if html {
+                assert!(content_type.starts_with("text/html"));
+                assert!(text.contains("Nothing selected"));
+                assert!(text.contains("Back to the index"));
+                assert!(text.contains(code) && text.contains(&request_id));
+            } else {
+                assert_eq!(content_type, "application/json");
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    json.pointer("/error/code")
+                        .and_then(serde_json::Value::as_str),
+                    Some(code)
+                );
+                assert_eq!(
+                    json.pointer("/error/request_id")
+                        .and_then(serde_json::Value::as_str),
+                    Some(request_id.as_str())
+                );
+            }
+        }
+    }
+}

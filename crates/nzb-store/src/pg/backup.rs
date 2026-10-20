@@ -1,4 +1,4 @@
-//! Snapshot backup and restore on Postgres (T112; ARCHITECTURE section 10, `SECURITY_DELTA` 2.6, SEC-044,
+//! Snapshot backup and restore on Postgres (T112; ARCHITECTURE v3 section 10, `SECURITY_DELTA` 2.6, SEC-044,
 //! SEC-052, SEC-094, review L7).
 //!
 //! This nzbd-native export is the default backup (D35 d, owner answer Q8; physical backups stay an expert option).
@@ -82,7 +82,7 @@ macro_rules! table {
 }
 
 /// Dependency order (referenced tables first).
-const TABLES: [Table; 12] = [
+const TABLES: [Table; 13] = [
     table!(
         "account",
         "id, username, password_hash, role, totp_secret_enc, totp_enabled, totp_last_step, failed_logins, \
@@ -141,6 +141,13 @@ const TABLES: [Table; 12] = [
          ingested_at, deleted_at, added_by, deleted_by",
         "release_trash",
         "id"
+    ),
+    // Keyed by digest, no foreign key (T140): restored after both release tables.
+    table!(
+        "release_nfo",
+        "sha256, bytes, added_at, added_by, trashed_at, restored_at",
+        "release_nfo",
+        "sha256"
     ),
     table!(
         "ingest_log",
@@ -245,20 +252,22 @@ fn open_new_0600(p: &Path) -> Result<File, StoreError> {
         .open(p)?)
 }
 
-fn rotate(dir: &Path, keep: usize) -> Result<usize, StoreError> {
+fn rotate(dir: &Path, keep: usize, published: &str) -> Result<usize, StoreError> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if is_snapshot_name(&name) && entry.file_type()?.is_file() {
+        if name != published && is_snapshot_name(&name) && entry.file_type()?.is_file() {
             names.push(name);
         }
     }
+    // Keep the just-published snapshot even if its timestamp precedes earlier runs after a clock
+    // rollback. The remaining slots retain the existing newest-name-first ordering.
     names.sort_unstable_by(|a, b| b.cmp(a));
     let mut removed = 0;
-    for name in names.iter().skip(keep.max(1)) {
+    for name in names.iter().skip(keep.saturating_sub(1)) {
         fs::remove_file(dir.join(name))?;
         removed += 1;
     }
@@ -305,6 +314,10 @@ impl PgDb {
         keep: usize,
         key: Option<&BackupKey>,
     ) -> Result<SnapshotReport, StoreError> {
+        // Same directory lock as the SQLite backup: a CLI backup must not remove the in-flight
+        // temporary snapshot of the server's maintenance task (or vice versa), and two exports of
+        // the same second cannot race past the `dest.exists()` check below.
+        let _lock = crate::backup::lock_backup_dir(dir)?;
         clean_stale_tmp(dir)?;
         let name = snapshot_name(now);
         let final_name = if key.is_some() {
@@ -320,7 +333,9 @@ impl PgDb {
         }
         let tmp = dir.join(format!(".{name}{TMP_SUFFIX}"));
         let enc_tmp = dir.join(format!(".{final_name}{TMP_SUFFIX}"));
-        let res = self.write_snapshot(&tmp, now).await;
+        // `create_new`: a temp file this call did not create is never removed below.
+        let file = open_new_0600(&tmp)?;
+        let res = self.write_snapshot(file, now).await;
         let tables = match res {
             Ok(t) => t,
             Err(e) => {
@@ -345,7 +360,7 @@ impl PgDb {
             let _ = fs::remove_file(&enc_tmp);
             return Err(e);
         }
-        let rotated = rotate(dir, keep)?;
+        let rotated = rotate(dir, keep, &final_name)?;
         Ok(SnapshotReport {
             path: dest,
             rotated,
@@ -353,8 +368,8 @@ impl PgDb {
         })
     }
 
-    async fn write_snapshot(&self, tmp: &Path, now: i64) -> Result<Vec<(String, u64)>, StoreError> {
-        let mut out = BufWriter::new(open_new_0600(tmp)?);
+    async fn write_snapshot(&self, file: File, now: i64) -> Result<Vec<(String, u64)>, StoreError> {
+        let mut out = BufWriter::new(file);
         out.write_all(MAGIC)?;
         let mut tx = self.background().begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
@@ -665,8 +680,13 @@ pub(crate) async fn restore_inner(
         let p = scratch.join(".nzbd-restore.plain.tmp");
         // Leftovers of a crashed restore (authenticated plaintext; `SECURITY_REVIEW` 31 I4) are removed first.
         let _ = fs::remove_file(&p);
-        let _ = fs::remove_file(scratch.join(".nzbd-restore.plain.tmp.decrypt.tmp"));
-        backup_crypto::decrypt_file(key, file, &p).map_err(crypto_err)?;
+        let _ = fs::remove_file(scratch.join("..nzbd-restore.plain.tmp.decrypt.tmp"));
+        if let Err(e) = backup_crypto::decrypt_file(key, file, &p) {
+            // A publish whose link succeeded but whose unlink failed leaves the plaintext at `p`
+            // (review 55): the scratch name is ours, so it goes on every error.
+            let _ = fs::remove_file(&p);
+            return Err(crypto_err(e));
+        }
         plain_tmp = Some(p.clone());
         p
     } else {

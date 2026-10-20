@@ -11,6 +11,7 @@ pub mod recovery;
 pub mod rules;
 pub mod runner;
 pub mod scanner;
+mod sidecar;
 mod timefmt;
 pub mod watcher;
 

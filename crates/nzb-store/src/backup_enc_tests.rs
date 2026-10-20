@@ -311,3 +311,118 @@ async fn sec_053_reseal_also_moves_the_secret_parked_in_credential_staging() {
     assert!(db.reseal_totp_secrets(501, false, toy(2, 3)).await.is_err());
     assert_eq!(blobs(&db).await, before);
 }
+
+#[tokio::test]
+async fn sec_052_clock_rollback_keeps_latest_encrypted_backup() {
+    crate::backup_tests::clock_rollback_retains_latest_backup(Some(&key(8))).await;
+}
+
+/// Capture real pre-update pages before rollback, then close the fixture cleanly. Copying them
+/// into the backup directory simulates a crash leaving its plaintext copy and rollback journal.
+async fn abandoned_rollback_files(dir: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+    use sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+    };
+
+    let path = dir.join("journal-source.sqlite");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Delete)
+                .synchronous(SqliteSynchronous::Full)
+                .pragma("secure_delete", "ON"),
+        )
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE credential (value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO credential VALUES ('CANARY-PLAINTEXT-ROLLBACK-CREDENTIAL')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM credential")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let journal_path = dir.join("journal-source.sqlite-journal");
+    let database = fs::read(&path).unwrap();
+    let journal = fs::read(&journal_path).unwrap();
+    let marker = b"CANARY-PLAINTEXT-ROLLBACK-CREDENTIAL";
+    assert!(journal.len() > 512, "SQLite did not write rollback pages");
+    assert!(journal.windows(marker.len()).any(|page| page == marker));
+    tx.rollback().await.unwrap();
+    pool.close().await;
+    assert!(!journal_path.exists());
+    (database, journal)
+}
+
+#[tokio::test]
+async fn encrypted_backup_cleans_abandoned_plaintext_rollback_journals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir).await;
+    let (database, journal) = abandoned_rollback_files(dir.path()).await;
+    let backups = dir.path().join("backups");
+    fs::create_dir(&backups).unwrap();
+    let name = crate::backup_name(50);
+    let stale = backups.join(format!(".{name}.tmp"));
+    let stale_journal = backups.join(format!(".{name}.tmp-journal"));
+    fs::write(&stale, &database).unwrap();
+    fs::write(&stale_journal, &journal).unwrap();
+    // Cleanup must also remove an orphan whose .tmp was already deleted by a previous run.
+    let orphan = backups.join(format!(".{}.tmp-journal", crate::backup_name(51)));
+    fs::write(&orphan, &journal).unwrap();
+    let foreign = [
+        ".other.tmp-journal".to_owned(),
+        format!("{name}.tmp-journal"),
+        format!(".{name}{ENC_SUFFIX}.tmp-journal"),
+        format!(".{name}.tmp-journal.bak"),
+    ];
+    for name in &foreign {
+        fs::write(backups.join(name), b"foreign").unwrap();
+    }
+    let directory = backups.join(format!(".{}.tmp-journal", crate::backup_name(52)));
+    fs::create_dir(&directory).unwrap();
+    let target = dir.path().join("foreign-journal");
+    fs::write(&target, b"foreign link target").unwrap();
+    let symlink = backups.join(format!(".{}.tmp-journal", crate::backup_name(53)));
+    std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+    // The same directory lock protects live temporary files and their journals from cleanup.
+    let lock = fs::File::open(&backups).unwrap();
+    lock.try_lock().unwrap();
+    let k = key(9);
+    let err = db
+        .backup_with(&backups, 100, 1, Some(&k))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StoreError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    assert_eq!(fs::read(&stale_journal).unwrap(), journal);
+    drop(lock);
+
+    let rep = db.backup_with(&backups, 100, 1, Some(&k)).await.unwrap();
+    assert!(looks_encrypted(&rep.path));
+    assert!(!stale.exists());
+    assert!(
+        !stale_journal.exists() && !orphan.exists(),
+        "plaintext rollback journal survived the next encrypted backup"
+    );
+    for name in &foreign {
+        assert_eq!(fs::read(backups.join(name)).unwrap(), b"foreign");
+    }
+    assert!(directory.is_dir());
+    assert!(
+        fs::symlink_metadata(&symlink)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"foreign link target");
+    assert_eq!(fs::read_dir(&backups).unwrap().count(), foreign.len() + 3);
+    db.close().await;
+}

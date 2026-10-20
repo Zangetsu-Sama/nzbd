@@ -301,3 +301,8 @@ async fn sec_053_reseal_also_moves_the_secret_parked_in_credential_staging() {
     assert!(db.reseal_totp_secrets(501, false, toy(2, 3)).await.is_err());
     assert_eq!(blobs(&db).await, before);
 }
+
+#[tokio::test]
+async fn sec_052_clock_rollback_keeps_latest_encrypted_backup() {
+    crate::pg_backup_tests::clock_rollback_retains_latest_backup(Some(&key(8))).await;
+}

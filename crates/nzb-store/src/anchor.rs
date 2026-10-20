@@ -1,5 +1,5 @@
 //! Detection of restores nzbd did not perform and of a switched library (review 30 M2 b, review 34 M2/M3;
-//! ARCHITECTURE 10 and 13.5; SEC-094, SEC-101), shared by both backends.
+//! ARCHITECTURE v3 10 and 13.5; SEC-094, SEC-101), shared by both backends.
 //!
 //! `serve` keeps `paths.state/db-anchor.json` (written tmp + fsync + rename, 0600) with the library identity (backend
 //! and `db_state.instance_id`), on Postgres the cluster's `system_identifier`, the last values of the `audit_log`,
@@ -11,7 +11,8 @@
 //! The file holds no secret: identifiers, counters and hashes only.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -205,7 +206,6 @@ pub(crate) fn heads_to_probe<'a>(
 /// # Errors
 /// Filesystem errors.
 pub fn write_anchor(path: &Path, a: &DbAnchor) -> Result<(), StoreError> {
-    use std::os::unix::fs::OpenOptionsExt as _;
     let text = json!({
         "v": 2,
         "backend": a.backend,
@@ -237,17 +237,30 @@ pub fn write_anchor(path: &Path, a: &DbAnchor) -> Result<(), StoreError> {
 /// # Errors
 /// Filesystem errors; [`StoreError::Integrity`] for a malformed file.
 pub fn read_anchor(path: &Path) -> Result<Option<DbAnchor>, StoreError> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
+    let not_small_file = || StoreError::Integrity("anchor file is not a small regular file".into());
+    // Opened `O_NOFOLLOW|O_NONBLOCK` and checked through the descriptor: a swap of the path between
+    // a check and the read cannot substitute another file, and a FIFO cannot block.
+    let f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(not_small_file()),
         Err(e) => return Err(e.into()),
     };
+    let meta = f.metadata()?;
     if !meta.is_file() || meta.len() > MAX_ANCHOR_BYTES {
-        return Err(StoreError::Integrity(
-            "anchor file is not a small regular file".into(),
-        ));
+        return Err(not_small_file());
     }
-    let v: Value = serde_json::from_slice(&fs::read(path)?)
+    let mut bytes = Vec::new();
+    f.take(MAX_ANCHOR_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_ANCHOR_BYTES {
+        return Err(not_small_file());
+    }
+    let v: Value = serde_json::from_slice(&bytes)
         .map_err(|_| StoreError::Integrity("anchor file is not valid".into()))?;
     let bad = || StoreError::Integrity("anchor file is not valid".into());
     let int = |k: &str| v.get(k).and_then(Value::as_i64).ok_or_else(bad);

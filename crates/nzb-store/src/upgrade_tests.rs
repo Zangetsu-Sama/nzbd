@@ -1,7 +1,13 @@
-//! The 3.1 -> 3.2 upgrade path on both backends (3.2 adds the first 3.x migration: Postgres `v3/0008_saved_search`,
-//! SQLite `v3-sqlite/0002_saved_search`). Fresh-database tests cannot show that a real 3.1 library opens under 3.2,
-//! so each test builds a 3.1-shaped library with the 3.1 migration set, fills it through the store API, upgrades it
-//! through the normal 3.2 open (SQLite) / setup-migrate + readiness (Postgres) path and checks that nothing was lost.
+//! A populated 3.1 library keeps its data through the saved-search/page-size migrations, then the current startup
+//! path refuses the roles migration with `FRESH_DATA_REQUIRED` (D40). Each migration commits independently: a refusal
+//! must preserve both the original library and the earlier successful migrations, including on a retry. These tests
+//! exercise that contract, not an unsupported populated-library upgrade across the roles boundary.
+//!
+//! Fixtures use admin/viewer accounts for current store API checks and a raw historical `member` account for legacy
+//! data preservation. The current role parser deliberately does not accept `member`; no production bypass is used.
+//! SQLite inspection after refusal is read-only, before its test-only historical opener exercises saved searches.
+//! Postgres app pools permit inspection, but readiness must continue refusing the database. Empty-library roles
+//! migration is covered by the T134 backend tests.
 //!
 //! The 3.1 schema is the compiled-in migrator filtered to the versions present at tag `v3.1.0` (not SQL files copied
 //! into fixtures): one source of truth for the migration text. What the filter alone could not catch, an edit of a
@@ -38,11 +44,14 @@ const PG_3_1_LAST: i64 = 7;
 const SQLITE_3_2_SAVED_SEARCH: i64 = 2;
 /// The migration 3.2 adds on Postgres.
 const PG_3_2_SAVED_SEARCH: i64 = 8;
-/// The newest migration of this build on SQLite (T133 adds `0003_page_size` after 3.3.0: fresh data, no upgrade test of its
-/// own; the 3.1 library still opens through every later migration).
-const SQLITE_NEWEST: i64 = 3;
-/// The newest migration of this build on Postgres (T133 adds `0009_page_size` after 3.3.0).
-const PG_NEWEST: i64 = 9;
+/// Last SQLite migration before the fresh-data roles boundary.
+const SQLITE_PAGE_SIZE: i64 = 3;
+/// Last Postgres migration before the fresh-data roles boundary.
+const PG_PAGE_SIZE: i64 = 9;
+const SQLITE_ROLES: i64 = 4;
+const PG_ROLES: i64 = 10;
+/// The 0.6 NFO migration on Postgres (`v3/0011_release_nfo`), pending after the roles boundary.
+const PG_RELEASE_NFO: i64 = 11;
 
 /// SHA-384 (the sqlx checksum) of each migration file at tag `v3.1.0`.
 const SQLITE_3_1_CHECKSUMS: [(i64, &str); 1] = [(
@@ -78,7 +87,7 @@ const PG_3_1_CHECKSUMS: [(i64, &str); 6] = [
 
 /// Releases of the fixture: `(n, category)`.
 const RELEASES: [(u8, u32); 3] = [(1, 2040), (2, 5040), (3, 8010)];
-/// Session id hash byte of the member's session.
+/// Session id hash byte of the viewer's session.
 const SESSION: u8 = 7;
 const LATER: i64 = T0 + 3_000;
 
@@ -115,11 +124,62 @@ fn released_3_1_migrations_are_unchanged() {
 #[derive(Debug)]
 struct Before {
     admin: i64,
-    member: i64,
+    viewer: i64,
+    legacy_member: LegacyMember,
+    role_schema: Vec<(String, String)>,
+    categories: Vec<(i64, Option<i64>, String)>,
     releases: Vec<i64>,
     audit: AuditAnchor,
     anchor: DbAnchor,
     counts: Vec<(&'static str, i64)>,
+}
+
+/// The current Role type cannot represent the historical value; preserve its stored fields without decoding it.
+type LegacyMember = (i64, String, String, String, i64, i64);
+
+async fn legacy_member(store: &Store) -> LegacyMember {
+    let sql = "SELECT id, username, password_hash, role, created_at, password_changed_at \
+               FROM account WHERE username = 'carol'";
+    match store {
+        Store::Sqlite(db) => sqlx::query_as(sql).fetch_one(db.readers()).await.unwrap(),
+        Store::Postgres(db) => sqlx::query_as(sql).fetch_one(db.web()).await.unwrap(),
+    }
+}
+
+/// Tables/constraints that the rejected roles migration would rebuild or replace.
+async fn role_schema(store: &Store) -> Vec<(String, String)> {
+    let rows: Vec<(String, String)> = match store {
+        Store::Sqlite(db) => sqlx::query_as(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'table' AND name IN ('account', 'invite', 'audit_log') ORDER BY name",
+        )
+        .fetch_all(db.readers())
+        .await
+        .unwrap(),
+        Store::Postgres(db) => sqlx::query_as(
+            "SELECT c.relname::text || '.' || k.conname::text, pg_get_constraintdef(k.oid) \
+             FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'nzbd' AND k.conname IN \
+             ('account_role_check', 'invite_role_check', 'audit_log_actor_role_check') \
+             ORDER BY c.relname, k.conname",
+        )
+        .fetch_all(db.web())
+        .await
+        .unwrap(),
+    };
+    assert_eq!(rows.len(), 3);
+    rows
+}
+
+/// Preserve taxonomy fields too: the SQLite opener's seed upsert could otherwise hide changes to them.
+async fn categories(store: &Store) -> Vec<(i64, Option<i64>, String)> {
+    let sql =
+        "SELECT CAST(id AS BIGINT), CAST(parent_id AS BIGINT), name FROM category ORDER BY id";
+    match store {
+        Store::Sqlite(db) => sqlx::query_as(sql).fetch_all(db.readers()).await.unwrap(),
+        Store::Postgres(db) => sqlx::query_as(sql).fetch_all(db.web()).await.unwrap(),
+    }
 }
 
 /// Tables whose row counts must survive the upgrade unchanged.
@@ -137,11 +197,14 @@ async fn count(store: &Store, table: &str) -> i64 {
     // Test-only: `table` is one of the literals above.
     let sql = format!("SELECT count(*) FROM {table}");
     match store {
-        Store::Sqlite(db) => sqlx::query_scalar(&sql)
+        Store::Sqlite(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .fetch_one(db.readers())
             .await
             .unwrap(),
-        Store::Postgres(db) => sqlx::query_scalar(&sql).fetch_one(db.web()).await.unwrap(),
+        Store::Postgres(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(db.web())
+            .await
+            .unwrap(),
     }
 }
 
@@ -153,8 +216,8 @@ async fn counts(store: &Store) -> Vec<(&'static str, i64)> {
     v
 }
 
-/// Fills a 3.1 library the way 3.1 would have: an admin and a member, the member's preferences, three releases in
-/// three categories (one uploaded by the member), an audit row of each class and an active session.
+/// Populate the historical schema with three accounts, three releases, preferences, both audit classes and a session.
+/// The raw legacy member models stored 3.1 data; admin/viewer roles also exist in 3.1 and remain usable by today's API.
 async fn fill_3_1(store: &Store) -> Before {
     let admin = store
         .create_account_operator(
@@ -168,37 +231,78 @@ async fn fill_3_1(store: &Store) -> Before {
         )
         .await
         .unwrap();
-    let member = store
+    let viewer = store
         .create_account_operator(
             &NewAccount {
                 username: "bob",
                 password_hash: PHC,
-                role: Some(Role::Uploader),
+                role: Some(Role::Viewer),
             },
             POLICY,
             T0 + 1,
         )
         .await
         .unwrap();
+    match store {
+        Store::Sqlite(db) => {
+            sqlx::query(
+                "INSERT INTO account (username, password_hash, role, created_at, password_changed_at) \
+                 VALUES ('carol', ?1, 'member', ?2, ?2)",
+            )
+            .bind(PHC)
+            .bind(T0 + 2)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        }
+        Store::Postgres(db) => {
+            sqlx::query(
+                "INSERT INTO account (username, password_hash, role, created_at, password_changed_at) \
+                 VALUES ('carol', $1, 'member', $2, $2)",
+            )
+            .bind(PHC)
+            .bind(T0 + 2)
+            .execute(db.web())
+            .await
+            .unwrap();
+        }
+    }
+    let legacy_member = legacy_member(store).await;
+    assert_eq!(
+        (
+            &*legacy_member.1,
+            &*legacy_member.2,
+            &*legacy_member.3,
+            legacy_member.4,
+            legacy_member.5
+        ),
+        ("carol", PHC, "member", T0 + 2, T0 + 2)
+    );
     // The 3.1-shaped preference row, written as 3.1 stored it: this binary's `set_user_prefs` also writes the T133 page
     // size columns (T133), which a 3.1 schema does not have yet.
     let sql = format!(
-        "INSERT INTO user_pref (account_id, hide_xxx, theme, updated_at) VALUES ({member}, true, 'dark', {})",
+        "INSERT INTO user_pref (account_id, hide_xxx, theme, updated_at) VALUES ({viewer}, true, 'dark', {})",
         T0 + 2
     );
     match store {
         Store::Sqlite(db) => {
-            sqlx::query(&sql).execute(db.writer()).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(db.writer())
+                .await
+                .unwrap();
         }
         Store::Postgres(db) => {
-            sqlx::query(&sql).execute(db.web()).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(db.web())
+                .await
+                .unwrap();
         }
     }
     let mut releases = Vec::new();
     for (n, category) in RELEASES {
         let a = analysis(n);
         let uploader = if n == 1 {
-            Uploader::Account(member)
+            Uploader::Account(admin)
         } else {
             Uploader::Unattributed
         };
@@ -233,7 +337,7 @@ async fn fill_3_1(store: &Store) -> Before {
         .await
         .unwrap();
     store
-        .insert_session(&sess(member, SESSION, SessionStage::Active, T0 + 20), 5)
+        .insert_session(&sess(viewer, SESSION, SessionStage::Active, T0 + 20), 5)
         .await
         .unwrap();
 
@@ -241,11 +345,14 @@ async fn fill_3_1(store: &Store) -> Before {
     let report = store.audit_walk(None, &mut |_| {}).await.unwrap();
     assert!(report.is_ok(), "{report:?}");
     let audit = store.audit_anchor().await.unwrap();
-    // Two account creations and the two audit rows above (the raw 3.1 preference row writes none).
+    // API account creation and the library event cover both audit classes. Raw historical rows write no audit entry.
     assert!(audit.rows >= 3, "{audit:?}");
     Before {
         admin,
-        member,
+        viewer,
+        legacy_member,
+        role_schema: role_schema(store).await,
+        categories: categories(store).await,
         releases,
         audit,
         // What a 3.1 `serve` wrote to paths.state/db-anchor.json.
@@ -254,20 +361,22 @@ async fn fill_3_1(store: &Store) -> Before {
     }
 }
 
-/// Everything of [`fill_3_1`] is still there after the upgrade, the identity and restore checks pass, and saved
-/// searches work.
-async fn verify_3_2(store: &Store, before: &Before, state_dir: &std::path::Path) {
+/// Historical migration/refusal preserves all original data, the identity and restore checks.
+async fn verify_preserved(store: &Store, before: &Before, state_dir: &std::path::Path) {
     // Row counts and field values.
     assert_eq!(counts(store).await, before.counts);
+    assert_eq!(legacy_member(store).await, before.legacy_member);
+    assert_eq!(role_schema(store).await, before.role_schema);
+    assert_eq!(categories(store).await, before.categories);
     let admin = store.get_account(before.admin).await.unwrap().unwrap();
     assert_eq!(
         (admin.username.as_str(), admin.role),
         ("alice", Role::Admin)
     );
-    let member = store.get_account(before.member).await.unwrap().unwrap();
+    let viewer = store.get_account(before.viewer).await.unwrap().unwrap();
     assert_eq!(
-        (member.username.as_str(), member.role, member.created_at),
-        ("bob", Role::Uploader, T0 + 1)
+        (viewer.username.as_str(), viewer.role, viewer.created_at),
+        ("bob", Role::Viewer, T0 + 1)
     );
     for (id, (n, category)) in before.releases.iter().zip(RELEASES) {
         let r = store.get_release(*id).await.unwrap().unwrap();
@@ -280,14 +389,15 @@ async fn verify_3_2(store: &Store, before: &Before, state_dir: &std::path::Path)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first.added_by, Some(before.member));
-    // The session still signs the member in, with the stored preferences.
+    assert_eq!(first.added_by, Some(before.admin));
+    // The stored session/preferences still decode; this inspection does not bypass the production readiness gate.
     let actor = store
         .session_actor(&[SESSION; 32], T0 + 30)
         .await
         .unwrap()
-        .expect("the 3.1 session survives the upgrade");
-    assert_eq!(actor.user_id, before.member);
+        .expect("the 3.1 session survives migration refusal");
+    assert_eq!(actor.user_id, before.viewer);
+    assert_eq!(actor.role, Role::Viewer);
     assert_eq!(
         actor.prefs,
         UserPrefs {
@@ -325,14 +435,16 @@ async fn verify_3_2(store: &Store, before: &Before, state_dir: &std::path::Path)
     assert!(!store.library_is_empty().await.unwrap());
     let dry = store.restore_finish(LATER, true).await.unwrap();
     assert_eq!(dry.sessions, 1);
+}
 
+async fn exercise_saved_search(store: &Store, before: &Before) -> i64 {
     // Saved searches on the upgraded library: create, list, open; private to the account.
     let filters = r#"{"q":"release","cat":"2040"}"#;
     let id = store
-        .create_saved_search(before.member, "Movies", filters, LATER)
+        .create_saved_search(before.viewer, "Movies", filters, LATER)
         .await
         .unwrap();
-    let listed = store.saved_searches(before.member).await.unwrap();
+    let listed = store.saved_searches(before.viewer).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(
         (
@@ -343,13 +455,13 @@ async fn verify_3_2(store: &Store, before: &Before, state_dir: &std::path::Path)
         (id, "Movies", filters)
     );
     let opened = store
-        .open_saved_search(before.member, id, LATER + 60)
+        .open_saved_search(before.viewer, id, LATER + 60)
         .await
         .unwrap()
         .unwrap();
     assert_eq!((opened.id, opened.last_seen_at), (id, LATER));
     assert_eq!(
-        store.saved_searches(before.member).await.unwrap()[0].last_seen_at,
+        store.saved_searches(before.viewer).await.unwrap()[0].last_seen_at,
         LATER + 60
     );
     assert_eq!(store.saved_searches(before.admin).await.unwrap(), []);
@@ -363,8 +475,32 @@ async fn verify_3_2(store: &Store, before: &Before, state_dir: &std::path::Path)
     // Not audited (private display state): the chain is unchanged and still consistent.
     assert_eq!(store.audit_anchor().await.unwrap(), before.audit);
     assert_eq!(
-        store.check_anchor(&anchored).await.unwrap(),
+        store.check_anchor(&before.anchor).await.unwrap(),
         AnchorVerdict::Consistent
+    );
+    id
+}
+
+/// A retry must not recreate or lose the table populated after the first refusal.
+async fn verify_saved_search(store: &Store, before: &Before, id: i64) {
+    let listed = store.saved_searches(before.viewer).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (
+            listed[0].id,
+            listed[0].name.as_str(),
+            listed[0].filters.as_str(),
+            listed[0].last_seen_at
+        ),
+        (id, "Movies", r#"{"q":"release","cat":"2040"}"#, LATER + 60)
+    );
+    assert_eq!(store.saved_searches(before.admin).await.unwrap(), []);
+    assert!(
+        store
+            .open_saved_search(before.admin, id, LATER)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -386,17 +522,26 @@ async fn sqlite_has_table(db: &SqliteDb, name: &str) -> bool {
     n > 0
 }
 
-/// SQLite: a 3.1 library (`0001` only) opened by the 3.2 `SqliteDb::open_with` path gets `0002_saved_search` once,
-/// after the full startup check, and keeps every row, the audit chain and its identity.
+/// A failed fresh-data guard must not rewrite a successful ledger entry or leave a dirty roles entry.
+type Ledger = Vec<(i64, bool, Vec<u8>, String, i64)>;
+
+async fn sqlite_ledger_snapshot(db: &SqliteDb) -> Ledger {
+    sqlx::query_as(
+        "SELECT version, success, checksum, CAST(installed_on AS TEXT), execution_time \
+         FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(db.readers())
+    .await
+    .unwrap()
+}
+
+/// The normal opener applies saved-search/page-size once, refuses roles, and preserves the populated library.
 #[tokio::test]
-#[ignore = "T134 (D40): fresh data, no upgrade past 3.4 (no uploader role in 3.1; owner decides on this file)"]
-async fn upgrade_3_1_to_3_2_keeps_data_and_adds_saved_search() {
+async fn sqlite_3_1_data_survives_historical_migrations_and_roles_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = DbConfig {
         path: dir.path().join("nzbd.sqlite"),
     };
-
-    // 3.1: the library as the 3.1 binary created and used it.
     let old = SqliteDb::open_at_version(&cfg, SQLITE_3_1_LAST)
         .await
         .unwrap();
@@ -407,63 +552,121 @@ async fn upgrade_3_1_to_3_2_keeps_data_and_adds_saved_search() {
     let before = fill_3_1(&store).await;
     store.close().await;
 
-    // 3.2: the normal open (what `serve` and every CLI command run).
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&events);
-    let db = SqliteDb::open_with(&cfg, StartupCheck::Fast, &move |e| {
-        sink.lock().unwrap().push(e);
-    })
-    .await
-    .unwrap();
-    {
-        let events = events.lock().unwrap();
-        // Pending migrations force the full check before anything is migrated.
-        assert!(
-            matches!(
-                events.first(),
-                Some(OpenEvent::CheckStarted {
-                    mode: StartupCheck::Full,
-                    escalated: true
+    let mut first_ledger = None;
+    let mut saved_search = None;
+    for attempt in 0..2 {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let error = SqliteDb::open_with(&cfg, StartupCheck::Fast, &move |e| {
+            sink.lock().unwrap().push(e);
+        })
+        .await
+        .expect_err("a populated historical library must not cross the roles boundary");
+        assert!(error.to_string().contains("FRESH_DATA_REQUIRED"), "{error}");
+        {
+            let events = events.lock().unwrap();
+            assert!(
+                matches!(
+                    events.first(),
+                    Some(OpenEvent::CheckStarted {
+                        mode: StartupCheck::Full,
+                        escalated: true
+                    })
+                ),
+                "{events:?}"
+            );
+            let pending: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    OpenEvent::MigrationsPending { total, first, last } => {
+                        Some((*total, *first, *last))
+                    }
+                    _ => None,
                 })
-            ),
-            "{events:?}"
-        );
-        let pending: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                OpenEvent::MigrationsPending { total, first, last } => {
-                    Some((*total, *first, *last))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(pending, [(2, SQLITE_3_2_SAVED_SEARCH, SQLITE_NEWEST)]);
-    }
-    assert_eq!(sqlite_ledger(&db, SQLITE_3_1_LAST).await, 1);
-    assert_eq!(sqlite_ledger(&db, SQLITE_3_2_SAVED_SEARCH).await, 1);
-    let store = Store::Sqlite(db);
-    let schema = store.schema_info().await.unwrap();
-    assert_eq!((schema.latest_applied, schema.applied), (SQLITE_NEWEST, 3));
-    verify_3_2(&store, &before, dir.path()).await;
-    store.close().await;
+                .collect();
+            let started: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    OpenEvent::MigrationStarted { version, .. } => Some(*version),
+                    _ => None,
+                })
+                .collect();
+            let finished: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    OpenEvent::MigrationFinished { version, .. } => Some(*version),
+                    _ => None,
+                })
+                .collect();
+            if attempt == 0 {
+                // Versions 5 (release NFO) and 6 (failed-ingest SHA index) are also pending, but refusal at
+                // roles must stop before them.
+                assert_eq!(pending, [(5, SQLITE_3_2_SAVED_SEARCH, 6)]);
+                assert_eq!(
+                    started,
+                    [SQLITE_3_2_SAVED_SEARCH, SQLITE_PAGE_SIZE, SQLITE_ROLES]
+                );
+                assert_eq!(finished, [SQLITE_3_2_SAVED_SEARCH, SQLITE_PAGE_SIZE]);
+            } else {
+                assert_eq!(pending, [(3, SQLITE_ROLES, 6)]);
+                assert_eq!(started, [SQLITE_ROLES]);
+                assert!(
+                    finished.is_empty(),
+                    "successful migrations must not run again"
+                );
+            }
+        }
 
-    // A second start applies nothing (the migration ran exactly once) and still validates the ledger checksums.
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&events);
-    let db = SqliteDb::open_with(&cfg, StartupCheck::Fast, &move |e| {
-        sink.lock().unwrap().push(e);
-    })
-    .await
-    .unwrap();
-    assert!(
-        !events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, OpenEvent::MigrationStarted { .. })),
-    );
-    assert_eq!(sqlite_ledger(&db, SQLITE_3_2_SAVED_SEARCH).await, 1);
-    db.close().await;
+        // Inspect before any opener can migrate or reseed the database and conceal damage from the refusal.
+        // Repeat this neutral inspection on retry, before validating checksums through the historical opener.
+        let db = SqliteDb::open_read_only(&cfg.path).await.unwrap();
+        let ledger = sqlite_ledger_snapshot(&db).await;
+        assert_eq!(
+            ledger
+                .iter()
+                .map(|(v, ok, ..)| (*v, *ok))
+                .collect::<Vec<_>>(),
+            [
+                (SQLITE_3_1_LAST, true),
+                (SQLITE_3_2_SAVED_SEARCH, true),
+                (SQLITE_PAGE_SIZE, true)
+            ]
+        );
+        if let Some(first) = &first_ledger {
+            assert_eq!(&ledger, first, "retry must preserve the committed ledger");
+        } else {
+            first_ledger = Some(ledger);
+        }
+        assert!(sqlite_has_table(&db, "saved_search").await);
+        for name in ["account_t134", "invite_t134", "audit_log_t134"] {
+            assert!(
+                !sqlite_has_table(&db, name).await,
+                "failed rebuild left {name}"
+            );
+        }
+        let store = Store::Sqlite(db);
+        let schema = store.schema_info().await.unwrap();
+        assert_eq!(
+            (schema.latest_applied, schema.applied),
+            (SQLITE_PAGE_SIZE, 3)
+        );
+        verify_preserved(&store, &before, dir.path()).await;
+        store.close().await;
+
+        // The historical opener validates applied checksums and permits the saved-search write exercise;
+        // production still refuses this populated library above.
+        let store = Store::Sqlite(
+            SqliteDb::open_at_version(&cfg, SQLITE_PAGE_SIZE)
+                .await
+                .unwrap(),
+        );
+        if let Some(id) = saved_search {
+            verify_saved_search(&store, &before, id).await;
+        } else {
+            saved_search = Some(exercise_saved_search(&store, &before).await);
+        }
+        store.close().await;
+    }
 }
 
 async fn pg_ledger(t: &TestDb, version: i64) -> i64 {
@@ -479,47 +682,82 @@ async fn pg_ledger(t: &TestDb, version: i64) -> i64 {
     n
 }
 
-/// Postgres: a 3.1 database (`0002`..`0007`) is refused by the 3.2 `serve` gate until `nzbd db migrate` (the
-/// owner-only setup path) applies `0008_saved_search` once; then it is ready and keeps every row, the audit chain and
-/// its identity, and the app role may use the new table (grants).
+async fn pg_ledger_snapshot(t: &TestDb) -> Ledger {
+    let mut su = t.superuser_conn().await;
+    let rows = sqlx::query_as(
+        "SELECT version, success, checksum, CAST(installed_on AS TEXT), execution_time \
+         FROM nzbd._sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&mut su)
+    .await
+    .unwrap();
+    sqlx::Connection::close(su).await.unwrap();
+    rows
+}
+
+/// Owner migration commits the historical changes, refuses roles, and leaves readiness closed even after a retry.
 #[tokio::test]
-#[ignore = "T134 (D40): fresh data, no upgrade past 3.4 (no uploader role in 3.1; owner decides on this file)"]
-async fn pg_upgrade_3_1_to_3_2_keeps_data_and_adds_saved_search() {
+async fn pg_3_1_data_survives_historical_migrations_and_roles_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let t = TestDb::new_upto(PG_3_1_LAST).await;
     assert_eq!(pg_ledger(&t, PG_3_1_LAST).await, 1);
     assert_eq!(pg_ledger(&t, PG_3_2_SAVED_SEARCH).await, 0);
     let store = Store::Postgres(t.db.clone());
     let before = fill_3_1(&store).await;
-
-    // 3.2 `serve` refuses the 3.1 schema until the setup service migrates.
+    drop(store);
     assert_eq!(
         t.db.readiness().await.unwrap(),
-        Readiness::MigrationsPending(vec![PG_3_2_SAVED_SEARCH, PG_NEWEST])
+        Readiness::MigrationsPending(vec![
+            PG_3_2_SAVED_SEARCH,
+            PG_PAGE_SIZE,
+            PG_ROLES,
+            PG_RELEASE_NFO
+        ])
     );
-    let migrated = crate::pg::migrate_as_owner(t.owner_options())
-        .await
-        .unwrap();
-    assert_eq!(migrated, [PG_3_2_SAVED_SEARCH, PG_NEWEST]);
-    assert_eq!(t.db.readiness().await.unwrap(), Readiness::Ready);
-    assert_eq!(pg_ledger(&t, PG_3_2_SAVED_SEARCH).await, 1);
 
-    // A restarted process (new app-role pools) sees the upgraded library.
-    let store = Store::Postgres(
-        crate::pg::PgDb::connect(&t.settings(), crate::pg::testing::TEST_APP_PASSWORD)
+    let mut first_ledger = None;
+    let mut saved_search = None;
+    for _ in 0..2 {
+        let error = crate::pg::migrate_as_owner(t.owner_options())
             .await
-            .unwrap(),
-    );
-    let schema = store.schema_info().await.unwrap();
-    assert_eq!(schema.latest_applied, PG_NEWEST);
-    verify_3_2(&store, &before, dir.path()).await;
+            .expect_err("a populated historical library must not cross the roles boundary");
+        assert!(error.to_string().contains("FRESH_DATA_REQUIRED"), "{error}");
+        assert_eq!(
+            t.db.readiness().await.unwrap(),
+            Readiness::MigrationsPending(vec![PG_ROLES, PG_RELEASE_NFO])
+        );
+        let ledger = pg_ledger_snapshot(&t).await;
+        assert_eq!(
+            ledger
+                .iter()
+                .map(|(v, ok, ..)| (*v, *ok))
+                .collect::<Vec<_>>(),
+            (2..=PG_PAGE_SIZE).map(|v| (v, true)).collect::<Vec<_>>()
+        );
+        if let Some(first) = &first_ledger {
+            assert_eq!(&ledger, first, "retry must preserve the committed ledger");
+        } else {
+            first_ledger = Some(ledger);
+        }
 
-    // Migrating again applies nothing: the migration ran exactly once.
-    let again = crate::pg::migrate_as_owner(t.owner_options())
-        .await
-        .unwrap();
-    assert!(again.is_empty(), "{again:?}");
-    assert_eq!(pg_ledger(&t, PG_3_2_SAVED_SEARCH).await, 1);
-    assert_eq!(t.db.readiness().await.unwrap(), Readiness::Ready);
-    store.close().await;
+        // New app-role pools see the preserved rows and grants, but their readiness gate still refuses serving.
+        let db = crate::pg::PgDb::connect(&t.settings(), crate::pg::testing::TEST_APP_PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.readiness().await.unwrap(),
+            Readiness::MigrationsPending(vec![PG_ROLES, PG_RELEASE_NFO])
+        );
+        let store = Store::Postgres(db);
+        let schema = store.schema_info().await.unwrap();
+        assert_eq!((schema.latest_applied, schema.applied), (PG_PAGE_SIZE, 8));
+        verify_preserved(&store, &before, dir.path()).await;
+        if let Some(id) = saved_search {
+            verify_saved_search(&store, &before, id).await;
+        } else {
+            saved_search = Some(exercise_saved_search(&store, &before).await);
+        }
+        store.close().await;
+    }
+    t.db.close().await;
 }

@@ -157,6 +157,125 @@ async fn stale_tmp_of_crashed_run_is_cleaned() {
 }
 
 #[tokio::test]
+async fn overlapping_backups_refuse_before_removing_an_in_flight_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir).await;
+    let b = dir.path().join("backups");
+    fs::create_dir(&b).unwrap();
+    let active = b.join(format!(".{}.tmp", backup_name(100)));
+    let lock = fs::File::open(&b).unwrap();
+    lock.try_lock().unwrap();
+    fs::write(&active, b"snapshot in progress").unwrap();
+    // Independent opens are the same locking contract as maintenance and a separate CLI process.
+    let live = db.backup(&b, 101, 14).await.unwrap_err();
+    assert!(matches!(live, crate::StoreError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    let offline = backup_file(&dir.path().join("nzbd.sqlite"), &b, 102, 14)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(offline, crate::StoreError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(fs::read(&active).unwrap(), b"snapshot in progress");
+    assert_eq!(fs::read_dir(&b).unwrap().count(), 1);
+    drop(lock);
+    // A crashed process releases the OS lock, so the next run can clean its partial snapshot.
+    let rep = db.backup(&b, 103, 14).await.unwrap();
+    assert!(!active.exists());
+    assert!(rep.path.is_file());
+}
+
+#[tokio::test]
+async fn cancelling_a_backup_caller_keeps_the_snapshot_locked_until_the_worker_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir).await;
+    let b = dir.path().join("backups");
+    fs::create_dir(&b).unwrap();
+    // Hold the worker's private connection so it really waits at VACUUM INTO.await, after its
+    // temporary snapshot and directory lock exist. Backups no longer borrow request readers.
+    let worker_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(db.readers().connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let held = worker_pool.acquire().await.unwrap();
+    let running_pool = worker_pool.clone();
+    let running_dir = b.clone();
+    let caller = tokio::spawn(async move {
+        crate::backup::backup_with_pool_for_test(running_pool, running_dir, 200, 14).await
+    });
+    let active = b.join(format!(".{}.tmp", backup_name(200)));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !active.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let contender = tokio::time::timeout(std::time::Duration::from_secs(2), db.backup(&b, 201, 14))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(contender, crate::StoreError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let offline = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        backup_file(&dir.path().join("nzbd.sqlite"), &b, 202, 14),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        matches!(offline, crate::StoreError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert!(
+        active.exists(),
+        "neither contender removed the active snapshot"
+    );
+    drop(held);
+    let published = b.join(backup_name(200));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let probe = fs::File::open(&b).unwrap();
+            if published.exists()
+                && probe.try_lock().is_ok()
+                && worker_pool.is_closed()
+                && worker_pool.size() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        worker_pool.is_closed(),
+        "the detached worker closes its pool"
+    );
+    assert_eq!(worker_pool.size(), 0, "the private connection is released");
+    assert!(!active.exists());
+    let restored = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&published)
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+    let check: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&restored)
+        .await
+        .unwrap();
+    assert_eq!(check, "ok");
+    restored.close().await;
+    assert!(db.backup(&b, 203, 14).await.unwrap().path.is_file());
+}
+
+#[tokio::test]
 async fn failed_backup_leaves_no_file() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir).await;
@@ -377,10 +496,11 @@ async fn sec_094_backup_omits_sessions_and_throttle_state() {
             "account_throttle",
             "user_known_ip",
         ] {
-            let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let n: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(n, 0, "{table}");
         }
         // Only the closed invitation is carried; the open one (a usable code) is not.
@@ -396,4 +516,61 @@ async fn sec_094_backup_omits_sessions_and_throttle_state() {
         assert_eq!(pending, 1);
         pool.close().await;
     }
+}
+
+/// Plain and encrypted backups must retain the latest database state after a clock correction.
+pub(crate) async fn clock_rollback_retains_latest_backup(key: Option<&crate::BackupKey>) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir).await;
+    let now = 1_700_000_000;
+    for keep in [0_usize, 1, 2] {
+        let backups = dir.path().join(format!("backups-{keep}"));
+        fs::create_dir(&backups).unwrap();
+        let older = db
+            .backup_with(&backups, now + 200, keep, key)
+            .await
+            .unwrap();
+        let future = db
+            .backup_with(&backups, now + 300, keep, key)
+            .await
+            .unwrap();
+        let marker = format!("latest-after-clock-rollback-{keep}");
+        db.audit_event(now, Some("cli"), "download", Some(&marker), None)
+            .await
+            .unwrap();
+        let latest = db.backup_with(&backups, now, keep, key).await.unwrap();
+        assert!(
+            latest.path.is_file(),
+            "rotation deleted the just-published backup after clock rollback (keep={keep})"
+        );
+        assert_eq!(crate::looks_encrypted(&latest.path), key.is_some());
+        assert_eq!(fs::read_dir(&backups).unwrap().count(), keep.max(1));
+        assert_eq!(latest.rotated, 1);
+        assert!(!older.path.exists());
+        assert_eq!(future.path.exists(), keep == 2);
+
+        // Restore the returned path, not an earlier surviving filename: only this snapshot has
+        // the marker written after the future-dated backups.
+        let restored = dir.path().join(format!("restored-{keep}.sqlite"));
+        if let Some(key) = key {
+            crate::decrypt_file(key, &latest.path, &restored).unwrap();
+        } else {
+            fs::copy(&latest.path, &restored).unwrap();
+        }
+        let restored = SqliteDb::open(&DbConfig { path: restored }).await.unwrap();
+        restored.integrity_check().await.unwrap();
+        let detail: String =
+            sqlx::query_scalar("SELECT detail FROM audit_log ORDER BY id DESC LIMIT 1")
+                .fetch_one(restored.readers())
+                .await
+                .unwrap();
+        assert_eq!(detail, marker);
+        restored.close().await;
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn sec_044_clock_rollback_keeps_latest_plain_backup() {
+    clock_rollback_retains_latest_backup(None).await;
 }

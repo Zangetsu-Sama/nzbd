@@ -1,4 +1,4 @@
-//! `[search]` settings (ARCHITECTURE section 7) with their hard maxima: configuration may only
+//! `[search]` settings (ARCHITECTURE v3 section 7) with their hard maxima: configuration may only
 //! lower a bound, never raise it past the constants here.
 //!
 //! Owner questions Q1, Q2 and Q5 (TASKS T111) were answered by D35 (2026-10-15): "more than n" past
@@ -120,11 +120,35 @@ impl SearchConfig {
         self.semaphore_wait_ms = self.semaphore_wait_ms.min(10_000);
         self.query_deadline_ms = self.query_deadline_ms.clamp(1, MAX_QUERY_DEADLINE_MS);
         self.count_budget_ms = self.count_budget_ms.min(self.query_deadline_ms);
+        // Offset pages retain offset + page-size winners. Never let configuration turn a
+        // hostile offset into a multi-gigabyte allocation before the query deadline is checked.
+        self.max_offset = self.max_offset.min(DEFAULT_MAX_OFFSET);
         self.expansion_postings_budget = self.expansion_postings_budget.min(MAX_EXPANSION_POSTINGS);
         self.expansion_terms_max = self.expansion_terms_max.clamp(1, MAX_EXPANSION_TERMS);
         self.expansion_dict_entries = self
             .expansion_dict_entries
             .clamp(1, MAX_DICT_ENTRIES_PER_SEGMENT);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offset_window_remains_bounded_even_with_extreme_configuration() {
+        for requested in [0, 1, DEFAULT_MAX_OFFSET, DEFAULT_MAX_OFFSET + 1, u32::MAX] {
+            let cfg = SearchConfig {
+                max_offset: requested,
+                ..SearchConfig::default()
+            }
+            .clamped();
+            assert!(cfg.max_offset <= DEFAULT_MAX_OFFSET);
+            assert!(cfg.max_offset <= requested);
+            if requested <= DEFAULT_MAX_OFFSET {
+                assert_eq!(cfg.max_offset, requested);
+            }
+        }
     }
 }

@@ -50,7 +50,7 @@ fn run(
 #[test]
 fn builtin_rules_load() {
     let r = rules();
-    assert_eq!(r.taxonomy.len(), 27);
+    assert_eq!(r.taxonomy.len(), 36);
 }
 
 #[test]

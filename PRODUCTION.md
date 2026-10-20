@@ -1,4 +1,4 @@
-# nzbd 0.5.1 - production bundle
+# nzbd 0.6.0 - production bundle
 
 Only what a production install needs: the sources of the two images (app and proxy), the compose stack,
 the interactive installer, default configuration and the operator documentation. Nothing for demo,

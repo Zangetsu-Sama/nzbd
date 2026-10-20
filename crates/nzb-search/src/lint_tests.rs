@@ -56,7 +56,19 @@ fn sec_089_query_parser_and_regex_are_not_reachable() {
             rust_files(&src, &mut files);
         }
     }
-    rust_files(&root.join("fuzz").join("fuzz_targets"), &mut files);
+    // A source bundle without the separate fuzz project (the public export) sets
+    // NZBD_SOURCE_BUNDLE=1 to run this test; anywhere else a missing fuzz/ must fail, so the scan
+    // can never be skipped silently (review 55).
+    let fuzz_targets = root.join("fuzz").join("fuzz_targets");
+    if fuzz_targets.is_dir() {
+        rust_files(&fuzz_targets, &mut files);
+    } else {
+        assert_eq!(
+            std::env::var("NZBD_SOURCE_BUNDLE").as_deref(),
+            Ok("1"),
+            "fuzz/fuzz_targets is missing; set NZBD_SOURCE_BUNDLE=1 only in a source bundle without fuzz/"
+        );
+    }
     assert!(files.len() > 100, "{}", files.len());
     let needles = [
         "disallowed_types",

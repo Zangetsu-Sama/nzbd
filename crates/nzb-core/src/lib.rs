@@ -8,6 +8,7 @@ mod analyzer;
 mod categorize;
 mod error;
 mod limits;
+mod nfo;
 mod parser;
 mod sanitize;
 mod scene;
@@ -24,6 +25,7 @@ pub use categorize::{
 };
 pub use error::{LimitName, NzbError};
 pub use limits::{DEADLINE_CHECK_INTERVAL, Limits, LimitsError};
+pub use nfo::{MAX_NFO_BYTES, NfoEncoding, NfoText, decode_nfo, detect_nfo_encoding};
 pub use parser::{
     Clock, MAX_MISSING_RANGES, MAX_PAGE_LIMIT, MetaEntry, NzbSubset, ParsedFile, ParsedNzb,
     SegmentEntry, SegmentPage, SubsetFile, SystemClock, extract_files, list_segments, parse,

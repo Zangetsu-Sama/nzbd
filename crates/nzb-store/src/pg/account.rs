@@ -1,7 +1,7 @@
 //! Accounts, roles, display names and audit attribution on Postgres (T112; 2.x `account.rs`, SEC-060..SEC-068).
 //!
 //! Same rules and the same public API as the 2.x module; the 2.x single writer (`BEGIN IMMEDIATE`) becomes the
-//! account-domain advisory lock taken first in every mutating transaction ([`PgDb::begin_account`], ARCHITECTURE
+//! account-domain advisory lock taken first in every mutating transaction ([`PgDb::begin_account`], ARCHITECTURE v3
 //! section 6), and the last-admin trigger takes the same lock itself. Audit rows are appended last
 //! ([`crate::pg::audit::append`]), so the audit class lock is the last lock of every transaction.
 
@@ -62,6 +62,23 @@ pub(crate) async fn require_actor(
         Some(s) if !s.disabled && s.role >= min => Ok(s),
         _ => Err(AccountError::Forbidden.into()),
     }
+}
+
+/// [`require_actor`] for an actor built from a session: that session must also still exist (a recovery, reset,
+/// revocation or role change deletes it), so a re-authenticated write never outlives the session that proved it.
+pub(crate) async fn require_session_actor(
+    conn: &mut PgConnection,
+    actor: &AccountActor,
+    min: Role,
+    now: i64,
+) -> Result<Subject, StoreError> {
+    let s = require_actor(conn, actor.user_id, min).await?;
+    if let Some(h) = &actor.session
+        && !crate::pg::auth::session_is_live(conn, h, actor.user_id, now).await?
+    {
+        return Err(AccountError::Forbidden.into());
+    }
+    Ok(s)
 }
 
 /// Appends an audit row on `conn` (same transaction as the change it describes).
@@ -469,14 +486,18 @@ struct Resolved {
     actor_id: Option<i64>,
 }
 
-async fn resolve(conn: &mut PgConnection, init: Initiator<'_>) -> Result<Resolved, StoreError> {
+async fn resolve(
+    conn: &mut PgConnection,
+    init: Initiator<'_>,
+    now: i64,
+) -> Result<Resolved, StoreError> {
     match init {
         Initiator::Operator => Ok(Resolved {
             who: AuditActor::cli(),
             actor_id: None,
         }),
         Initiator::Account(a) => {
-            let s = require_actor(conn, a.user_id, Role::Admin).await?;
+            let s = require_session_actor(conn, a, Role::Admin, now).await?;
             Ok(Resolved {
                 who: AuditActor::account(s.id, s.role, &s.username),
                 actor_id: Some(s.id),
@@ -532,6 +553,7 @@ impl PgDb {
                 _ => return Err(StoreError::OutOfRange("session stage")),
             };
             Ok(AccountActor {
+                session: Some(*id_hash),
                 user_id: id,
                 role: role_from(&r.try_get::<String, _>("role")?)?,
                 username: r.try_get("username")?,
@@ -943,7 +965,7 @@ impl PgDb {
         now: i64,
     ) -> Result<u64, StoreError> {
         let mut tx = self.begin_account().await?;
-        let res = resolve(&mut tx, init).await?;
+        let res = resolve(&mut tx, init, now).await?;
         let target = load_live(&mut tx, target_id)
             .await?
             .ok_or(AccountError::TargetNotFound)?;
@@ -1156,7 +1178,7 @@ impl PgDb {
             return Err(AccountError::InvalidDisplayName.into());
         }
         let mut tx = self.begin_account().await?;
-        let res = resolve(&mut tx, init).await?;
+        let res = resolve(&mut tx, init, now).await?;
         let target = load_live(&mut tx, target_id)
             .await?
             .ok_or(AccountError::TargetNotFound)?;

@@ -1,4 +1,4 @@
-//! The one adapter between the storage seam and the search engine (ARCHITECTURE 13.1, review 34 L4): the
+//! The one adapter between the storage seam and the search engine (ARCHITECTURE v3 13.1, review 34 L4): the
 //! configured [`Store`] (SQLite or Postgres) is the indexer's [`IndexSource`], the [`Hydrator`] of
 //! [`crate::TantivyIndex`] and the [`DegradedSource`] of the degraded browse. Error mapping happens here once; both
 //! backends keep the `IndexSource` contract themselves (file text cut in SQL and per streamed row at

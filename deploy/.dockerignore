@@ -1,0 +1,6 @@
+# Allow-list: the build context of Dockerfile.proxy is deploy/, which also holds the storage folder
+# (keys, CA, databases, NZBs), .env and the generated config. Only the proxy sources may enter it.
+*
+!proxy/go.mod
+!proxy/go.sum
+!proxy/main.go

@@ -1,4 +1,4 @@
-//! `nzbd import <dir>` (T115, `docs/MIGRATION.md` section 1): re-ingests a directory of NZB files (a 2.x
+//! `nzbd import <dir>` (T115, `docs/v3/MIGRATION.md` section 1): re-ingests a directory of NZB files (a 2.x
 //! `data/store/`, an original `.nzb` collection) through the same pipeline, parser and limits as the watch folder.
 //!
 //! The source is **read only**: files are copied into the store by the pipeline, never moved, renamed or deleted,

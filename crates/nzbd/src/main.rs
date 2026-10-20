@@ -429,7 +429,6 @@ fn load_totp_key(cfg: &Config) -> Result<nzb_web::totp::TotpKey, String> {
 #[allow(clippy::too_many_lines)]
 fn serve(cfg: &Config) -> Result<(), String> {
     use nzb_ingest as ing;
-    use std::future::IntoFuture;
     use std::sync::Arc;
 
     for w in cfg.validate().map_err(|e| e.to_string())? {
@@ -468,13 +467,10 @@ fn serve(cfg: &Config) -> Result<(), String> {
             ..nzb_web::WebConfig::default()
         };
         let gate = nzb_web::starting::StartGate::new(&early);
-        let mut http_task = tokio::spawn(
-            axum::serve(
-                early.limit_listener(listener),
-                gate.router()
-                    .into_make_service_with_connect_info::<nzb_web::listener::PeerAddr>(),
-            )
-            .with_graceful_shutdown({
+        let mut http_task = tokio::spawn(nzb_web::listener::serve(
+            early.limit_listener(listener),
+            gate.router(),
+            {
                 let (tx, mut rx) = (Arc::clone(&stop_tx), stop_rx.clone());
                 async move {
                     tokio::select! {
@@ -483,9 +479,8 @@ fn serve(cfg: &Config) -> Result<(), String> {
                     }
                     let _ = tx.send(true);
                 }
-            })
-            .into_future(),
-        );
+            },
+        ));
         // SIGTERM/SIGINT while checking or migrating stops now (a migration is one transaction,
         // so an interrupted one is rolled back and re-run on the next start); a server that dies
         // here is an error, not a shutdown (T088 L2).
@@ -725,11 +720,7 @@ async fn spawn_metrics(
     let limited = nzb_web::WebConfig::default().limit_listener(listener);
     tracing::info!(listen = %addr, "metrics listener (internal only)");
     tokio::spawn(async move {
-        let served = axum::serve(
-            limited,
-            app.into_make_service_with_connect_info::<nzb_web::listener::PeerAddr>(),
-        )
-        .with_graceful_shutdown(async move {
+        let served = nzb_web::listener::serve(limited, app, async move {
             let _ = stop.wait_for(|s| *s).await;
         })
         .await;

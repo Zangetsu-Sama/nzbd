@@ -96,7 +96,7 @@ async fn total_rows(db: &PgDb) -> i64 {
         "user_known_ip",
         "credential_staging",
     ] {
-        let c: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {t}"))
+        let c: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {t}")))
             .fetch_one(db.web())
             .await
             .unwrap();

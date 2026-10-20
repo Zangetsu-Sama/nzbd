@@ -513,15 +513,27 @@ pub(crate) fn check_group(items: &[GroupItem<'_>]) -> Result<(), StoreError> {
 
 /// Uploader verdicts of one group transaction (a group holds few distinct uploaders; a linear scan is enough).
 #[derive(Default)]
-pub(crate) struct UploaderCache(Vec<(Uploader, Result<Option<i64>, crate::AccountError>)>);
+pub(crate) struct UploaderCache(Vec<(Uploader, i64, Result<Option<i64>, crate::AccountError>)>);
 
 impl UploaderCache {
-    pub(crate) fn get(&self, u: &Uploader) -> Option<Result<Option<i64>, crate::AccountError>> {
-        self.0.iter().find(|(k, _)| k == u).map(|(_, v)| *v)
+    pub(crate) fn get(
+        &self,
+        u: &Uploader,
+        now: i64,
+    ) -> Option<Result<Option<i64>, crate::AccountError>> {
+        self.0
+            .iter()
+            .find(|(k, at, _)| k == u && *at == now)
+            .map(|(_, _, v)| *v)
     }
 
-    pub(crate) fn put(&mut self, u: Uploader, v: Result<Option<i64>, crate::AccountError>) {
-        self.0.push((u, v));
+    pub(crate) fn put(
+        &mut self,
+        u: Uploader,
+        now: i64,
+        v: Result<Option<i64>, crate::AccountError>,
+    ) {
+        self.0.push((u, now, v));
     }
 }
 
@@ -639,7 +651,7 @@ impl SqliteDb {
     ) -> Result<i64, StoreError> {
         // BEGIN IMMEDIATE: the uploader re-check and the insert are one atomic decision (N9).
         let mut tx = self.begin_immediate().await?;
-        let added_by = resolve_uploader(&mut tx, uploader).await?;
+        let added_by = resolve_uploader(&mut tx, uploader, new.ingested_at).await?;
         let id = insert_release_row(&mut tx, new, log, added_by)
             .await?
             .ok_or(StoreError::Duplicate)?;
@@ -648,7 +660,7 @@ impl SqliteDb {
         Ok(id)
     }
 
-    /// One ingest **commit group** (ARCHITECTURE 5, T114): the jobs of `items` in one writer transaction, each
+    /// One ingest **commit group** (ARCHITECTURE v3 5, T114): the jobs of `items` in one writer transaction, each
     /// job inside its own savepoint so a job that fails (refused uploader, unknown category, value out of range)
     /// leaves the others intact. The uploader of every job is re-validated inside the transaction (N9).
     ///
@@ -681,15 +693,15 @@ impl SqliteDb {
                 out.push(GroupOutcome::Deferred);
                 continue;
             }
-            let added_by = if let Some(r) = uploaders.get(&it.uploader) {
+            let added_by = if let Some(r) = uploaders.get(&it.uploader, it.new.ingested_at) {
                 r
             } else {
-                let r = match resolve_uploader(&mut tx, &it.uploader).await {
+                let r = match resolve_uploader(&mut tx, &it.uploader, it.new.ingested_at).await {
                     Ok(v) => Ok(v),
                     Err(StoreError::Account(a)) => Err(a),
                     Err(e) => return Err(e),
                 };
-                uploaders.put(it.uploader, r);
+                uploaders.put(it.uploader, it.new.ingested_at, r);
                 r
             };
             let added_by = match added_by {
@@ -760,14 +772,17 @@ impl SqliteDb {
         row.as_ref().map(release_from_row).transpose()
     }
 
-    /// `ingested_at` of the newest release row (`None` for an empty database).
+    /// `ingested_at` of the newest release row (`None` for an empty database): the highest id, like
+    /// Postgres (same seam answer whatever the clock did; the GC consumer errs on the safe side).
     ///
     /// # Errors
     /// Database errors.
     pub async fn newest_ingested_at(&self) -> Result<Option<i64>, StoreError> {
-        Ok(sqlx::query_scalar("SELECT MAX(ingested_at) FROM release")
-            .fetch_one(self.readers())
-            .await?)
+        Ok(
+            sqlx::query_scalar("SELECT ingested_at FROM release ORDER BY id DESC LIMIT 1")
+                .fetch_optional(self.readers())
+                .await?,
+        )
     }
 
     /// SHA-256 of every release row: the referenced set for `FsStore::gc`. Read it as late as
@@ -872,7 +887,7 @@ impl SqliteDb {
     pub async fn set_category(&self, id: i64, category_id: u32) -> Result<(), StoreError> {
         let res = sqlx::query(
             "UPDATE release SET category_id = ?, category_overridden = 1, \
-             category_source = 'manual' WHERE id = ?",
+             category_source = 'manual', flags = flags & ~512 WHERE id = ?",
         )
         .bind(i64::from(category_id))
         .bind(id)
@@ -899,6 +914,13 @@ impl SqliteDb {
     /// [`StoreError::NotFound`] if the release does not exist.
     pub async fn delete_release(&self, id: i64) -> Result<(), StoreError> {
         let mut tx = self.writer().begin().await?;
+        // A hard delete (operator/test path) takes the NFO with it (T140).
+        sqlx::query(
+            "DELETE FROM release_nfo WHERE sha256 = (SELECT sha256 FROM release WHERE id = ?)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let res = sqlx::query("DELETE FROM release WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)

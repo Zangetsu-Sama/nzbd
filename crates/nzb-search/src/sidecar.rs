@@ -1,4 +1,4 @@
-//! Sorted-walk sidecars (`docs/DATA_MODEL.md` 5.5, review L6 b): per segment and sort family, the
+//! Sorted-walk sidecars (`docs/v3/DATA_MODEL.md` 5.5, review L6 b): per segment and sort family, the
 //! permutation of the segment's doc ids ordered by `(key, id)`, so a browse page is a binary search
 //! plus a walk of about `k / selectivity` documents instead of a pass over every live document.
 //!

@@ -38,6 +38,26 @@ fn row_to_login(r: &sqlx::postgres::PgRow) -> Result<LoginUser, StoreError> {
     })
 }
 
+/// Whether `id_hash` is still an unexpired `active` session of `account_id` (see the SQLite twin). The row is locked
+/// (`FOR SHARE`) so it cannot be deleted before the calling transaction ends.
+pub(crate) async fn session_is_live(
+    conn: &mut sqlx::PgConnection,
+    id_hash: &[u8; 32],
+    account_id: i64,
+    now: i64,
+) -> Result<bool, StoreError> {
+    let live: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM session WHERE id_hash = $1 AND account_id = $2 \
+         AND stage = 'active' AND expires_at > $3 FOR SHARE",
+    )
+    .bind(id_hash.as_slice())
+    .bind(account_id)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(live.is_some())
+}
+
 /// Inserts `s` and applies the per-user, per-stage cap. `enroll_proven` marks a pending session that
 /// already proved possession of an out-of-band invite/recovery code (0011).
 pub(crate) async fn insert_in_tx(
@@ -80,6 +100,48 @@ pub(crate) async fn insert_in_tx(
 }
 
 impl PgDb {
+    /// Issues a pending login only while the account still matches the password-verdict
+    /// observation. Rechecking and replacing/inserting the session share the account-domain
+    /// lock, so a password change either revokes this row or prevents its creation.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] for changed or unusable credentials;
+    /// [`StoreError::OutOfRange`] for a mismatched account or non-pending session; database failure.
+    pub async fn insert_login_session(
+        &self,
+        seen: &LoginUser,
+        s: &NewSession,
+        replacing: Option<&[u8; 32]>,
+        max_per_stage: u32,
+    ) -> Result<(), StoreError> {
+        if s.user_id != seen.id || s.stage != SessionStage::PendingMfa {
+            return Err(StoreError::OutOfRange("login session"));
+        }
+        let mut tx = self.begin_account().await?;
+        let current: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM account WHERE id = $1 AND password_hash = $2 AND role = $3 \
+             AND totp_enabled = $4 AND disabled_at IS NULL AND deleted_at IS NULL",
+        )
+        .bind(seen.id)
+        .bind(&seen.password_hash)
+        .bind(seen.role.as_str())
+        .bind(seen.totp_enabled)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if seen.disabled || current.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        if let Some(old) = replacing {
+            sqlx::query("DELETE FROM session WHERE id_hash = $1")
+                .bind(old.as_slice())
+                .execute(&mut *tx)
+                .await?;
+        }
+        insert_in_tx(&mut tx, s, max_per_stage, false).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Inserts a session and revokes the oldest of the same stage beyond `max_per_stage`.
     ///
     /// # Errors
@@ -89,7 +151,7 @@ impl PgDb {
         s: &NewSession,
         max_per_stage: u32,
     ) -> Result<(), StoreError> {
-        // The per-user cap is an account-domain rule (ARCHITECTURE section 6, SEC-024).
+        // The per-user cap is an account-domain rule (ARCHITECTURE v3 section 6, SEC-024).
         let mut tx = self.begin_account().await?;
         insert_in_tx(&mut tx, s, max_per_stage, false).await?;
         tx.commit().await?;
@@ -177,7 +239,7 @@ impl PgDb {
         .transpose()
     }
 
-    /// Slides the idle deadline of an `active` session.
+    /// Slides the idle deadline of an unexpired `active` session. A late touch never revives it.
     ///
     /// # Errors
     /// Database failure.
@@ -189,7 +251,7 @@ impl PgDb {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE session SET last_seen_at = $2, expires_at = $3 \
-             WHERE id_hash = $1 AND stage = 'active'",
+             WHERE id_hash = $1 AND stage = 'active' AND expires_at > $2",
         )
         .bind(id_hash.as_slice())
         .bind(now)

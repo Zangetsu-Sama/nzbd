@@ -182,6 +182,8 @@ details.menu a .cnt { float: none; margin-left: auto; }
 .side a[aria-current="page"] .cnt, details.menu a[aria-current="page"] .cnt { color: var(--on-teal); }
 /* Saved searches (T127): long names wrap; the "N new" badge uses the full nav text colour (not colour alone: it says "new"). */
 .side a.saved, details.menu a.saved { overflow-wrap: anywhere; }
+/* Sub-categories under the selected Browse entry (T146): indented, smaller. */
+.side a.sub, details.menu a.sub { font-size: 0.9rem; margin-left: calc(var(--sp-2) + var(--sp-4)); }
 .side a .cnt.new, details.menu a .cnt.new { color: var(--nav-fg); font-weight: 700; }
 form.savesearch { margin: 0 0 var(--sp-3); }
 .content { min-width: 0; display: flex; flex-direction: column; }
@@ -243,19 +245,20 @@ button, a.button {
   border: var(--bw) solid var(--line); border-radius: var(--radius);
   background: var(--bg); color: var(--fg); cursor: pointer; text-decoration: none;
 }
-button:hover { background: var(--hover); }
+button:hover:not(:disabled) { background: var(--hover); }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
 button[type="submit"] { font-weight: 600; }
 a.button { background: var(--accent); border-color: var(--accent); color: var(--on-accent); padding: var(--sp-2) var(--sp-4); font-weight: 700; }
 a.button:hover { text-decoration: underline; }
 /* Destructive actions: danger fill plus the text label (colour is never the only cue). */
 button.danger, a.button.danger { background: var(--bad); border-color: var(--bad); color: var(--bg); font-weight: 700; }
 button.danger:hover, a.button.danger:hover { background: var(--bad); text-decoration: underline; }
-input[type="text"], input[type="password"], input[type="search"], input[type="date"], select {
+input[type="text"], input[type="email"], input[type="password"], input[type="search"], input[type="date"], select {
   font: inherit; max-width: 100%; padding: var(--sp-1) var(--sp-2);
   border: var(--bw) solid var(--line); border-radius: var(--radius);
   background: var(--bg); color: var(--fg);
 }
-input[type="text"], input[type="password"] { width: 100%; }
+input[type="text"], input[type="email"], input[type="password"] { width: 100%; }
 label { font-weight: 600; font-size: 0.92rem; }
 .checks label { font-weight: 400; }
 input[type="checkbox"], input[type="radio"] { width: 1rem; height: 1rem; accent-color: var(--accent); }
@@ -346,6 +349,8 @@ table.results td.cat .badge { white-space: nowrap; }
 table.results td.src .ell { display: block; max-width: 11rem; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 table.results td.num .meter { width: 100%; min-width: 4rem; height: 0.35rem; margin-top: 2px; }
 table.results th, table.results td { padding-top: var(--sp-1); padding-bottom: var(--sp-1); }
+table.results th[aria-sort="ascending"] a::after { content: " \2191"; }
+table.results th[aria-sort="descending"] a::after { content: " \2193"; }
 table.results .tags { display: flex; flex-wrap: wrap; gap: 2px var(--sp-1); margin-top: 2px; }
 table.results .tags .badge { font-size: 0.78rem; line-height: 1.35; padding: 0 var(--sp-1); font-weight: 400; }
 /* Other tables: id/number/time columns hug their content, text columns take the rest. */
@@ -414,7 +419,14 @@ ol.codes code { font-size: 1.05rem; word-break: normal; }
    fixed data-label attributes in templates/index.html. */
 @media (max-width: 48rem) {
   table.results, table.results tbody, table.results tr, table.results th, table.results td { display: block; width: 100%; }
-  table.results thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  /* Sorting and select-all remain visible and operable when rows turn into cards. */
+  table.results thead { display: block; }
+  table.results thead tr { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-2); }
+  table.results thead th { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  table.results thead th:is(.c-sel, .c-title, .c-posted, .c-size) { position: static; width: auto; height: auto; overflow: visible; clip-path: none; padding: 0; border: 0; background: transparent; }
+  table.results thead a { display: inline-flex; align-items: center; min-height: 2.5rem; padding: 0 var(--sp-2); }
+  table.results .select-all-control:not([hidden]) { display: inline-flex; align-items: center; gap: var(--sp-2); min-height: 2.5rem; }
+  table.results .select-all-text { position: static; width: auto; height: auto; overflow: visible; clip-path: none; white-space: normal; }
   table.results tr { padding: var(--sp-2) 0; border-bottom: var(--bw) solid var(--line); }
   table.results tbody tr:last-child { border-bottom: 0; }
   table.results th.title { min-width: 0; border-bottom: 0; }
@@ -496,6 +508,7 @@ table.results a.dl:hover { background: var(--hover); text-decoration: underline;
   table.results a.dl { padding: 0 var(--sp-1); }
 }
 @media (max-width: 48rem) {
+  table.results td.num, table.results td.c-sel, table.results td.c-dl { width: 100%; }
   table.results td.c-sel::before, table.results td.c-dl::before { content: none; }
   table.results a.dl { min-height: 2.25rem; display: inline-flex; align-items: center; padding: 0 var(--sp-3); }
 }
@@ -538,3 +551,17 @@ table.users td code { overflow-wrap: anywhere; }
   table.users td[data-label]::before { content: attr(data-label) ": "; font-weight: 700; }
   table.users td.act { min-width: 0; }
 }
+
+/* NFO viewer (T140): CP437 art needs every cell the same width and lines touching (line-height 1), so block and
+   box-drawing characters join. The classic light-on-black look in both themes; the system monospace stack only
+   (no font file is shipped or fetched). */
+.nfowrap { overflow: auto; max-height: 70vh; background: #0b0f14; border: var(--bw) solid var(--line); border-radius: var(--radius); padding: var(--sp-3); }
+/* NFO hidden by default (T144): a native <details> whose summary is a button; the label swaps with [open]. */
+details.nfo-toggle { margin-top: var(--sp-2); }
+details.nfo-toggle > summary { display: inline-block; cursor: pointer; list-style: none; font: inherit; font-weight: 600; padding: var(--sp-1) var(--sp-3); border: var(--bw) solid var(--line); border-radius: var(--radius); background: var(--bg); color: var(--fg); margin-bottom: var(--sp-2); }
+details.nfo-toggle > summary::-webkit-details-marker { display: none; }
+details.nfo-toggle > summary:hover { background: var(--hover); }
+details.nfo-toggle .when-open, details.nfo-toggle[open] .when-closed { display: none; }
+details.nfo-toggle[open] .when-open { display: inline; }
+.nfowrap.full { max-height: none; }
+pre.nfo { margin: 0; color: #c9d1d9; background: transparent; font-family: "DejaVu Sans Mono", "Cascadia Mono", Consolas, Menlo, "Liberation Mono", "Noto Sans Mono", monospace; font-size: 14px; line-height: 1; letter-spacing: 0; font-variant-ligatures: none; font-kerning: none; white-space: pre; tab-size: 8; }

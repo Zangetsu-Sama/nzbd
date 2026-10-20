@@ -193,19 +193,23 @@ pub async fn issue_for(
     ip: Option<&str>,
     now: i64,
 ) -> Result<(i64, GeneratedKey), IssueError> {
-    issue_for_rate(db, label, owner, None, who, ip, now).await
+    issue_for_rate(db, label, owner, None, None, who, ip, now).await
 }
 
 /// [`issue_for`] with an optional per-key budget in uploads per minute (`1..=30`; the effective
-/// budget is the lower of this and `limits.upload_per_key_per_min`).
+/// budget is the lower of this and `limits.upload_per_key_per_min`). From the web, `session` is the
+/// session that re-authenticated: the key is only created while it is still live.
 ///
 /// # Errors
-/// See [`IssueError`]; a rate outside `1..=30` is [`IssueError::InvalidRate`].
+/// See [`IssueError`]; a rate outside `1..=30` is [`IssueError::InvalidRate`]; a `session` that is
+/// gone is `Store(NotFound)`.
+#[allow(clippy::too_many_arguments)] // CLI and web entry point; each value is a distinct input
 pub async fn issue_for_rate(
     db: &Store,
     label: &str,
     owner: i64,
     rate_per_min: Option<u32>,
+    session: Option<&[u8; 32]>,
     who: &nzb_store::AuditActor,
     ip: Option<&str>,
     now: i64,
@@ -223,10 +227,17 @@ pub async fn issue_for_rate(
         key_hash: &key.hash,
         rate_per_min,
     };
-    match db
-        .create_api_key_for(new, owner, MAX_ACTIVE_KEYS, now, who, ip)
-        .await
-    {
+    let created = match session {
+        Some(h) => {
+            db.create_api_key_for_session(new, owner, h, MAX_ACTIVE_KEYS, now, who, ip)
+                .await
+        }
+        None => {
+            db.create_api_key_for(new, owner, MAX_ACTIVE_KEYS, now, who, ip)
+                .await
+        }
+    };
+    match created {
         Ok(CreateKey::Created(id)) => Ok((id, key)),
         Ok(CreateKey::LimitReached) => Err(IssueError::LimitReached),
         Ok(CreateKey::InstanceLimitReached) => Err(IssueError::InstanceLimitReached),

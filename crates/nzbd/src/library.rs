@@ -1,4 +1,4 @@
-//! One `serve` per library, the library identity and restore detection at start (ARCHITECTURE 10 and 13.5;
+//! One `serve` per library, the library identity and restore detection at start (ARCHITECTURE v3 10 and 13.5;
 //! SEC-094, SEC-101, SEC-102). Both backends.
 //!
 //! * `paths.state/serve.lock`: an exclusive lock held for the life of `serve` (std's safe `File::try_lock`); a second

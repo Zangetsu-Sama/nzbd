@@ -5,7 +5,7 @@
 //!
 //! Why a port: the original is crate-private test code of `nzb-store`, which T112 is rewriting for
 //! Postgres in parallel. The only change is a `settle` hook after the 2.x write path's
-//! writes: 2.x indexes in the release transaction, v3 after one indexer cycle (ARCHITECTURE 3.5
+//! writes: 2.x indexes in the release transaction, v3 after one indexer cycle (ARCHITECTURE v3 3.5
 //! item 1); for FTS5 `settle` does nothing. When T112 lands, both copies should move into one shared
 //! `conformance` feature of `nzb-store`.
 #![allow(

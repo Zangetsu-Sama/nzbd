@@ -1,4 +1,4 @@
-//! The storage seam (ARCHITECTURE 13.1, T122): four domain traits implemented by both backends
+//! The storage seam (ARCHITECTURE v3 13.1, T122): four domain traits implemented by both backends
 //! ([`SqliteDb`], [`PgDb`]) and by the [`Store`] enum that production code holds. The indexer's contract is
 //! the merged `nzb_search::IndexSource` (review 34 L4), implemented on [`Store`] in `nzb-search`; it is not
 //! redefined here.
@@ -30,11 +30,12 @@ use crate::{
     DegradedPage, EnrollConfirm, FactorAttempt, FactorVerdict, FailureEffect, FailureKind,
     GrantableRole, GroupItem, GroupOutcome, IndexRow, IngestLogEntry, IngestLogRow, InviteRow,
     LogCounts, LoginUser, MfaState, NewAccount, NewApiKey, NewInvite, NewRecovery, NewRelease,
-    NewSession, OutboxEntry, OutboxLag, PurgeReport, Redeemed, Redemption, RegistrationProfile,
-    ReleaseAttribution, ReleaseFile, ReleaseRow, ReleaseTotals, Reseal, ResealReport,
-    ReservedLoginAccount, RestoreFinishReport, RestoredAccount, RetentionPolicy, Role, SavedSearch,
-    SchemaInfo, SearchSourceState, SecurityFacts, SessionInfo, SessionRow, SqliteDb, StagedSwap,
-    StoreError, ThrottleState, TrashRow, Uploader, UserPrefs, UserRow,
+    NewSession, NfoAttach, OutboxEntry, OutboxLag, PurgeReport, Redeemed, Redemption,
+    RegistrationProfile, ReleaseAttribution, ReleaseFile, ReleaseNfo, ReleaseRow, ReleaseTotals,
+    Reseal, ResealReport, ReservedLoginAccount, RestoreFinishReport, RestoredAccount,
+    RetentionPolicy, Role, SavedSearch, SchemaInfo, SearchSourceState, SecurityFacts, SessionInfo,
+    SessionRow, SqliteDb, StagedSwap, StoreError, ThrottleState, TrashRow, Uploader, UserPrefs,
+    UserRow,
 };
 use crate::{AnchorVerdict, DbAnchor};
 
@@ -120,12 +121,15 @@ repo! {
             ip: Option<&str>,
             now: i64,
         ) -> Result<(), StoreError>;
-        /// Replaces the password hash after an authenticated, re-verified change and revokes EVERY
-        /// session of the user (the caller then mints a fresh one).
+        /// Replaces the password hash after an authenticated, re-verified change, revokes EVERY
+        /// session of the user and inserts `new_session`; `NotFound` (nothing written) when
+        /// `session_hash`, the session that re-authenticated, is gone.
         fn change_password(
             &self,
             user_id: i64,
+            session_hash: &[u8; 32],
             password_hash: &str,
+            new_session: &NewSession,
             ip: Option<&str>,
             now: i64,
         ) -> Result<(), StoreError>;
@@ -194,6 +198,18 @@ repo! {
             who: &AuditActor,
             ip: Option<&str>,
         ) -> Result<CreateKey, StoreError>;
+        /// Like [`Self::create_api_key_for`], bound to the web session that re-authenticated:
+        /// `NotFound` (nothing written) when `session_hash` is no longer a live session of the owner.
+        fn create_api_key_for_session(
+            &self,
+            key: NewApiKey<'_>,
+            owner_id: i64,
+            session_hash: &[u8; 32],
+            max_active: u32,
+            now: i64,
+            who: &AuditActor,
+            ip: Option<&str>,
+        ) -> Result<CreateKey, StoreError>;
         /// Issues an invitation (admin session; the caller re-authenticated).
         fn create_invite(
             &self,
@@ -219,6 +235,14 @@ repo! {
             filters: &str,
             now: i64,
         ) -> Result<i64, StoreError>;
+        /// Session-bound write: active, unexpired, owner-matching session rechecked inside the transaction.
+        fn create_saved_search_as(
+            &self,
+            actor: &AccountActor,
+            name: &str,
+            filters: &str,
+            now: i64,
+        ) -> Result<i64, StoreError>;
         /// Tombstones a DISABLED uploader/viewer (admin session, re-authenticated by the caller).
         fn delete_account(
             &self,
@@ -231,6 +255,8 @@ repo! {
         fn delete_account_operator(&self, target_id: i64, now: i64) -> Result<(), StoreError>;
         /// Deletes one of the caller's own saved searches (T127); anybody else's id is `NotFound`, like an unknown one.
         fn delete_saved_search(&self, account_id: i64, id: i64) -> Result<(), StoreError>;
+        /// Session-bound write: active, unexpired, owner-matching session rechecked inside the transaction.
+        fn delete_saved_search_as(&self, actor: &AccountActor, id: i64, now: i64) -> Result<(), StoreError>;
         /// Revokes one session.
         fn delete_session(&self, id_hash: &[u8; 32]) -> Result<bool, StoreError>;
         /// Disables a uploader/viewer (admin session).
@@ -276,6 +302,15 @@ repo! {
         fn get_user_by_username(&self, username: &str) -> Result<Option<UserRow>, StoreError>;
         /// Inserts a session and revokes the oldest of the same stage beyond `max_per_stage`.
         fn insert_session(&self, s: &NewSession, max_per_stage: u32) -> Result<(), StoreError>;
+        /// Issues a pending login only if the observed credentials still match, atomically with
+        /// optional cookie replacement and the per-stage cap. Stale state returns `NotFound`.
+        fn insert_login_session(
+            &self,
+            seen: &LoginUser,
+            s: &NewSession,
+            replacing: Option<&[u8; 32]>,
+            max_per_stage: u32,
+        ) -> Result<(), StoreError>;
         /// Issues a single-use recovery code for a uploader/viewer (admin session, re-authenticated by
         /// the caller).
         fn issue_recovery(
@@ -322,6 +357,13 @@ repo! {
         fn open_saved_search(
             &self,
             account_id: i64,
+            id: i64,
+            now: i64,
+        ) -> Result<Option<SavedSearch>, StoreError>;
+        /// Session-bound write: active, unexpired, owner-matching session rechecked inside the transaction.
+        fn open_saved_search_as(
+            &self,
+            actor: &AccountActor,
             id: i64,
             now: i64,
         ) -> Result<Option<SavedSearch>, StoreError>;
@@ -373,10 +415,14 @@ repo! {
         /// Renames one of the caller's own saved searches (T127); anybody else's id is `NotFound`, a name the
         /// account already uses is `SavedSearch(Duplicate)`.
         fn rename_saved_search(&self, account_id: i64, id: i64, name: &str) -> Result<(), StoreError>;
-        /// Replaces all recovery codes (old ones, used or not, stop working).
+        /// Session-bound write: active, unexpired, owner-matching session rechecked inside the transaction.
+        fn rename_saved_search_as(&self, actor: &AccountActor, id: i64, name: &str, now: i64) -> Result<(), StoreError>;
+        /// Replaces all recovery codes (old ones, used or not, stop working); `NotFound` when
+        /// `session_hash`, the session that re-authenticated, is gone.
         fn replace_recovery_codes(
             &self,
             user_id: i64,
+            session_hash: &[u8; 32],
             hashes: &[[u8; 32]],
             ip: Option<&str>,
             now: i64,
@@ -417,7 +463,7 @@ repo! {
         /// Revokes one active key on behalf of a signed-in account (T103).
         fn revoke_api_key_by(
             &self,
-            actor_id: i64,
+            actor: &AccountActor,
             id: i64,
             ip: Option<&str>,
             now: i64,
@@ -448,7 +494,7 @@ repo! {
             now: i64,
             reason: &'static str,
         ) -> Result<u64, StoreError>;
-        /// Revokes every session of the user except `keep`.
+        /// Revokes every session of the user except the still-active calling session `keep`.
         fn revoke_other_sessions(
             &self,
             user_id: i64,
@@ -456,10 +502,11 @@ repo! {
             ip: Option<&str>,
             now: i64,
         ) -> Result<u64, StoreError>;
-        /// Revokes one session, but only if it belongs to `user_id`.
+        /// Revokes one session owned by `user_id`, while the calling session is still active.
         fn revoke_user_session(
             &self,
             user_id: i64,
+            session_hash: &[u8; 32],
             id_hash: &[u8; 32],
             ip: Option<&str>,
             now: i64,
@@ -546,10 +593,26 @@ repo! {
             ip: Option<&str>,
             now: i64,
         ) -> Result<bool, StoreError>;
+        /// Session-bound write: active, unexpired, owner-matching session rechecked inside the transaction.
+        fn patch_user_prefs_as(
+            &self,
+            actor: &AccountActor,
+            patch: PrefsPatch,
+            ip: Option<&str>,
+            now: i64,
+        ) -> Result<bool, StoreError>;
         /// Stores one page size of the caller's own preferences, writing only that column (T133).
         fn set_page_size(
             &self,
             actor_id: i64,
+            size: PageSize,
+            ip: Option<&str>,
+            now: i64,
+        ) -> Result<bool, StoreError>;
+        /// Session-bound write: active, unexpired, owner-matching session rechecked inside the transaction.
+        fn set_page_size_as(
+            &self,
+            actor: &AccountActor,
             size: PageSize,
             ip: Option<&str>,
             now: i64,
@@ -578,6 +641,17 @@ repo! {
             sealed: &[u8],
             replace: bool,
         ) -> Result<Option<Vec<u8>>, StoreError>;
+        /// Reads or creates a secret only for a live pending session with its current token or enrollment proof.
+        fn store_pending_totp_for_session(
+            &self,
+            user_id: i64,
+            session_hash: &[u8; 32],
+            sealed: &[u8],
+            replace: bool,
+            token_hash: Option<[u8; 32]>,
+            now: i64,
+        ) -> Result<Option<Vec<u8>>, StoreError>;
+
         /// The throttle state of `(user_id, ip_key)` as of `now` (read-only; for UI decisions and
         /// health).
         fn throttle_state(
@@ -615,7 +689,7 @@ repo! {
 repo! {
     /// Releases, files, attribution, edits, bulk edits, trash, ingest log, library totals.
     pub trait LibraryRepo {
-        // --- Search index source (ARCHITECTURE 3.1-3.5; adapted to `nzb_search::IndexSource`, `Hydrator` and
+        // --- Search index source (ARCHITECTURE v3 3.1-3.5; adapted to `nzb_search::IndexSource`, `Hydrator` and
         // `DegradedSource` on `Store` by `nzb-search`).
         /// The oldest `limit` outbox rows, ascending sequence.
         fn search_outbox_read(&self, limit: usize) -> Result<Vec<OutboxEntry>, StoreError>;
@@ -697,6 +771,38 @@ repo! {
         fn count_failed_for_sha(&self, sha: &Sha256) -> Result<u32, StoreError>;
         /// Removes the trash record with this id.
         fn forget_trash(&self, id: i64) -> Result<bool, StoreError>;
+        /// Removes the trash record with this id and its NFO (the trash purge; T140).
+        fn purge_trash_record(&self, id: i64, now: i64) -> Result<bool, StoreError>;
+        /// Which of these release ids have a live NFO (T144; one query per index page, at most 1000 ids).
+        fn releases_with_nfo(&self, ids: &[i64]) -> Result<HashSet<i64>, StoreError>;
+        /// The NFO of a release, if it has one (T140).
+        fn release_nfo(&self, release_id: i64) -> Result<Option<ReleaseNfo>, StoreError>;
+        /// Attaches an NFO: an admin or the release's own uploader, only while it has none (D41 b).
+        fn attach_nfo_as(
+            &self,
+            uploader: &Uploader,
+            release_id: i64,
+            expected: &Sha256,
+            bytes: &[u8],
+            now: i64,
+            ip: Option<&str>,
+        ) -> Result<NfoAttach, StoreError>;
+        /// Attaches a watch-folder sidecar NFO (T141): the process (`system` actor), only while the release has none.
+        fn attach_watch_nfo(
+            &self,
+            release_id: i64,
+            expected: &Sha256,
+            bytes: &[u8],
+            now: i64,
+        ) -> Result<NfoAttach, StoreError>;
+        /// Removes the NFO of a release (admin).
+        fn remove_nfo_as(
+            &self,
+            actor: &AccountActor,
+            release_id: i64,
+            now: i64,
+            ip: Option<&str>,
+        ) -> Result<bool, StoreError>;
         /// One file of a release by its index.
         fn get_file(&self, release_id: i64, idx: u32) -> Result<Option<ReleaseFile>, StoreError>;
         /// Fetch a release by id.
@@ -813,7 +919,7 @@ repo! {
         /// Digests of every deleted release (the set of trash blobs that have a record).
         fn trash_shas(&self) -> Result<HashSet<Sha256>, StoreError>;
         /// Re-validates `uploader` without writing anything (T101b).
-        fn validate_uploader(&self, uploader: &Uploader) -> Result<(), StoreError>;
+        fn validate_uploader(&self, uploader: &Uploader, now: i64) -> Result<(), StoreError>;
     }
 }
 

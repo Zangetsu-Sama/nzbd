@@ -253,7 +253,7 @@ pub struct DeepSummary {
     pub at: i64,
     /// Releases whose blob is missing.
     pub missing: usize,
-    /// The run covered only part of the releases.
+    /// The release/store comparison was incomplete (cap, timeout, or read error).
     pub partial: bool,
     /// Database integrity checks passed.
     pub db_ok: bool,
@@ -748,7 +748,7 @@ pub fn counter_checks(live: Option<LiveFacts>, cfg: CfgFacts, now: i64) -> Vec<C
     v
 }
 
-/// Index lag (T114, ARCHITECTURE 3.2): changes not yet in the search index and the age of the oldest. WARN beyond
+/// Index lag (T114, ARCHITECTURE v3 3.2): changes not yet in the search index and the age of the oldest. WARN beyond
 /// `search.lag_warn_secs`, and while the watch-folder scanner is paused for it.
 #[must_use]
 pub fn index_lag_check(
@@ -1139,15 +1139,18 @@ pub fn deep_summary_check(d: Option<DeepSummary>, now: i64) -> Check {
             format!("{} missing blob(s); {}", d.missing, fmt_age(now, d.at)),
             "Run `nzbd store verify` on the host and restore the missing NZBs.",
         ),
+        Some(d) if d.partial => mk(
+            Group::Storage,
+            name,
+            Status::Warn,
+            format!("incomplete check; {}", fmt_age(now, d.at)),
+            "The last comparison could not cover every release. Run the deep check again or use `nzbd store verify` on the host.",
+        ),
         Some(d) => mk(
             Group::Storage,
             name,
             Status::Ok,
-            format!(
-                "consistent{}; {}",
-                if d.partial { " (partial run)" } else { "" },
-                fmt_age(now, d.at)
-            ),
+            format!("consistent; {}", fmt_age(now, d.at)),
             "",
         ),
     }
@@ -1705,26 +1708,28 @@ fn path_with_suffix(p: &Path, suffix: &str) -> PathBuf {
 #[must_use]
 pub fn gather_fs(cfg: &Config) -> FsFacts {
     let p = &cfg.paths;
-    // The database directory is probed unless it is the watch folder itself.
-    let db_dir =
-        p.db.parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-    let same_dir = |a: &Path, b: &Path| matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y);
-    let db_probe = if same_dir(db_dir, &p.watch) {
-        Probe::Access
-    } else {
-        Probe::Write
-    };
-    let dirs = vec![
+    let mut dirs = vec![
         dir_facts("Watch folder", &p.watch, Probe::Access),
         dir_facts("Blob store", &p.store, Probe::WriteIn(".tmp")),
         dir_facts("Failed folder", &p.failed, Probe::Write),
         dir_facts("Duplicates folder", &p.duplicates, Probe::Write),
         dir_facts("Upload staging folder", &p.tmp, Probe::Write),
         dir_facts("Backups folder", &p.backups, Probe::Write),
-        dir_facts("Database folder", db_dir, db_probe),
     ];
+    if cfg.db.backend == nzb_store::DbBackend::Sqlite {
+        // The SQLite directory is probed unless it is the watch folder itself.
+        let db_dir =
+            p.db.parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+        let same_dir = |a: &Path, b: &Path| matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y);
+        let db_probe = if same_dir(db_dir, &p.watch) {
+            Probe::Access
+        } else {
+            Probe::Write
+        };
+        dirs.push(dir_facts("Database folder", db_dir, db_probe));
+    }
     let dev = |d: &Path| fs::metadata(d).map(|m| m.dev()).ok();
     let same_fs = match (dev(&p.watch), dev(&p.store), dev(&p.failed)) {
         (Some(a), Some(b), Some(c)) => Some(a == b && b == c),
@@ -1734,21 +1739,31 @@ pub fn gather_fs(cfg: &Config) -> FsFacts {
         .into_iter()
         .filter_map(|d| count_dir(d, &|n, _| is_leftover(n)).ok())
         .fold(0usize, |a, c| a.saturating_add(c.n));
+    let (db_bytes, wal_bytes) = match cfg.db.backend {
+        nzb_store::DbBackend::Sqlite => (
+            fs::metadata(&p.db).map(|m| m.len()).ok(),
+            match fs::metadata(path_with_suffix(&p.db, "-wal")) {
+                Ok(m) => Some(m.len()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Some(0),
+                Err(_) => None,
+            },
+        ),
+        nzb_store::DbBackend::Postgres => (None, None),
+    };
     FsFacts {
         dirs,
-        db_bytes: fs::metadata(&p.db).map(|m| m.len()).ok(),
-        wal_bytes: match fs::metadata(path_with_suffix(&p.db, "-wal")) {
-            Ok(m) => Some(m.len()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Some(0),
-            Err(_) => None,
-        },
+        db_bytes,
+        wal_bytes,
         same_fs,
         layout_ok: cfg.check_layout().is_ok(),
         anchor_same_fs: crate::library::anchor_shares_filesystem(cfg),
         key_ok: crate::config::load_key_file(&cfg.security.totp_key_file).is_ok(),
         waiting: count_dir(&p.watch, &is_nzb_candidate),
         failed: count_dir(&p.failed, &|n, f| f && ing::is_failed_name(n)),
-        duplicates: count_dir(&p.duplicates, &|n, f| f && !n.starts_with('.')),
+        // A sidecar NFO moved next to its duplicate NZB (T141) is not a duplicate of its own.
+        duplicates: count_dir(&p.duplicates, &|n, f| {
+            f && !n.starts_with('.') && !n.to_ascii_lowercase().ends_with(".nfo")
+        }),
         leftovers,
         gc_trash: count_dir(&p.store.join(".gc-trash"), &|_, f| f)
             .map(|c| c.n)
@@ -1900,15 +1915,23 @@ impl Engine {
         })
     }
 
-    /// Facts for the metrics listener (T105): database aggregates, `/proc/self` and two `stat` calls. Unlike
+    /// Facts for the metrics listener (T105): database aggregates, `/proc/self` and, for SQLite, two `stat` calls. Unlike
     /// [`Engine::inputs`] it never writes a probe file.
     pub async fn metrics_facts(&self, now: i64) -> crate::metrics::MetricsFacts {
         let db = match &self.db {
             Some(db) => Some(gather_db(db, now).await),
             None => None,
         };
-        let size = |p: PathBuf| fs::metadata(p).ok().map(|m| m.len());
-        let wal = path_with_suffix(&self.cfg.paths.db, "-wal");
+        let (db_bytes, wal_bytes) = match self.cfg.db.backend {
+            nzb_store::DbBackend::Sqlite => {
+                let size = |p: &Path| fs::metadata(p).ok().map(|m| m.len());
+                (
+                    size(&self.cfg.paths.db),
+                    size(&path_with_suffix(&self.cfg.paths.db, "-wal")),
+                )
+            }
+            nzb_store::DbBackend::Postgres => (None, None),
+        };
         crate::metrics::MetricsFacts {
             uptime: self.live.as_ref().map(|_| self.started.elapsed().as_secs()),
             db,
@@ -1916,8 +1939,8 @@ impl Engine {
                 .await
                 .unwrap_or_default(),
             live: self.live_facts(),
-            db_bytes: size(self.cfg.paths.db.clone()),
-            wal_bytes: size(wal),
+            db_bytes,
+            wal_bytes,
         }
     }
 
@@ -1974,9 +1997,15 @@ impl Engine {
     }
 
     /// The deep, on-demand checks. Read-only: a reader connection, a passive store handle (it
-    /// never touches `.tmp/`), `stat`/`read_dir` and a dry-run GC plan.
-    #[allow(clippy::too_many_lines)] // one linear sequence of independent checks
+    /// never touches `.tmp/`), `stat`/`read_dir` and a dry-run GC plan. The web monitor bounds
+    /// the displayed response while this collector retains ownership until filesystem work
+    /// actually finishes; an operating-system filesystem call cannot be cancelled safely.
     pub async fn deep(&self, now: i64) -> Vec<Check> {
+        self.deep_with_fs_timeout(now, DEEP_FS_DEADLINE).await
+    }
+
+    #[allow(clippy::too_many_lines)] // one linear sequence of independent checks
+    async fn deep_with_fs_timeout(&self, now: i64, fs_timeout: Duration) -> Vec<Check> {
         let g = Group::Deep;
         let mut v = Vec::new();
         let Some(db) = self.db.clone() else {
@@ -2041,7 +2070,9 @@ impl Engine {
         let failed_dir = self.cfg.paths.failed.clone();
         let shas = db.release_shas_limited(DEEP_RELEASE_CAP).await;
         let mut missing = 0usize;
-        let mut partial = false;
+        // Only a completed comparison may claim consistency. Errors and unfinished walks
+        // remain visible in the cheap summary after the detailed rows have expired.
+        let mut partial = true;
         match shas {
             Err(_) => v.push(mk(
                 g,
@@ -2051,17 +2082,17 @@ impl Engine {
                 "See the server log.",
             )),
             Ok((set, was_partial)) => {
-                partial = was_partial;
                 let looked = set.len();
                 let dir = store_dir.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    deep_store_blocking(&dir, set, Instant::now() + DEEP_FS_DEADLINE)
+                    deep_store_blocking(&dir, set, Instant::now() + fs_timeout)
                 })
                 .await
                 .unwrap_or(Err(()));
                 match res {
                     Ok(s) => {
                         missing = s.missing;
+                        partial = was_partial || s.timed_out;
                         v.push(store_lookup_check(
                             looked,
                             s.missing,
@@ -2134,24 +2165,27 @@ impl Engine {
                 "Run `nzbd store gc` on the host for a full plan.",
             );
         }
-        let planned = {
-            if !store_dir.join(".tmp").is_dir() {
-                return mk(g, name, Status::Warn, "store not initialised", "");
+        let dir = store_dir.to_path_buf();
+        let opened = tokio::task::spawn_blocking(move || {
+            if !dir.join(".tmp").is_dir() {
+                return Err("store not initialised");
             }
-            let Ok(store) = FsStore::open_passive(store_dir) else {
-                return mk(g, name, Status::Warn, "store could not be opened", "");
-            };
-            tokio::time::timeout(
-                DEEP_FS_DEADLINE,
-                ing::gc_plan(db, &store, now, ing::DEFAULT_GC_GRACE_SECS),
-            )
-            .await
+            FsStore::open_passive(&dir).map_err(|_| "store could not be opened")
+        })
+        .await;
+        let store = match opened {
+            Ok(Ok(store)) => store,
+            Ok(Err(reason)) => return mk(g, name, Status::Warn, reason, ""),
+            Err(_) => return mk(g, name, Status::Warn, "store could not be opened", ""),
         };
-        match planned {
-            Ok(Ok(plan)) if plan.candidates.is_empty() => {
+        // gc_plan awaits a blocking filesystem walk. An inner timeout would detach that
+        // walk and let the outer collector release its permit too early. The web monitor
+        // publishes its deadline independently while this owned collector awaits real completion.
+        match ing::gc_plan(db, &store, now, ing::DEFAULT_GC_GRACE_SECS).await {
+            Ok(plan) if plan.candidates.is_empty() => {
                 mk(g, name, Status::Ok, "none older than 24 h", "")
             }
-            Ok(Ok(plan)) => mk(
+            Ok(plan) => mk(
                 g,
                 name,
                 Status::Warn,
@@ -2245,7 +2279,7 @@ fn deep_store_blocking(
     let all: Vec<_> = shas.into_iter().collect();
     let (mut missing, mut timed_out) = (0usize, false);
     for chunk in all.chunks(1000) {
-        if Instant::now() > deadline {
+        if Instant::now() >= deadline {
             timed_out = true;
             break;
         }
@@ -2461,3 +2495,403 @@ fn cli_report(cfg: &Config) -> Result<(String, u8), String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod resource_followup_tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn incomplete_deep_summary_never_claims_consistency() {
+        let summary = DeepSummary {
+            at: NOW,
+            missing: 0,
+            partial: true,
+            db_ok: true,
+        };
+        let check = deep_summary_check(Some(summary), NOW + 1);
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "incomplete store checks must not be healthy"
+        );
+        assert!(!check.value.contains("consistent"));
+        assert!(check.value.contains("incomplete"));
+        let complete = DeepSummary {
+            partial: false,
+            ..summary
+        };
+        assert_eq!(deep_summary_check(Some(complete), NOW).status, Status::Ok);
+        assert_eq!(
+            deep_summary_check(
+                Some(DeepSummary {
+                    missing: 1,
+                    ..summary
+                }),
+                NOW
+            )
+            .status,
+            Status::Fail
+        );
+        assert_eq!(
+            deep_summary_check(
+                Some(DeepSummary {
+                    db_ok: false,
+                    ..summary
+                }),
+                NOW
+            )
+            .status,
+            Status::Fail
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_store_does_not_publish_a_consistent_deep_summary() {
+        use nzb_store::{CategorySource, NewRelease, NzbStore, SceneColumns};
+        use sha2::Digest as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ts = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        let mut cfg = Config::default();
+        cfg.paths.store = dir.path().join("store");
+        cfg.paths.failed = dir.path().join("failed");
+        fs::create_dir(&cfg.paths.failed).unwrap();
+        let store = FsStore::open(&cfg.paths.store).unwrap();
+        let bytes = b"health timeout fixture";
+        let sha = nzb_core::Sha256(sha2::Sha256::digest(bytes).into());
+        store.put(sha, bytes).await.unwrap();
+        let analysis = nzb_core::Analysis {
+            sha256: sha,
+            name_candidates: Vec::new(),
+            meta_name_candidates: 0,
+            title: "health timeout fixture".to_owned(),
+            poster: None,
+            posted_at: None,
+            total_bytes: 0,
+            file_count: 0,
+            segment_count: 0,
+            duplicate_segments: 0,
+            par2_blocks: 0,
+            flags: nzb_core::ReleaseFlags::EMPTY,
+            meta_category: None,
+            repairable_estimate: None,
+            files: Vec::new(),
+        };
+        ts.store
+            .insert_release(&NewRelease {
+                analysis: &analysis,
+                nzb_size_bytes: u64::try_from(bytes.len()).unwrap(),
+                source_name: None,
+                source_label: None,
+                category_id: 8010,
+                category_source: CategorySource::Fallback,
+                meta_json: None,
+                scene: SceneColumns::default(),
+                ingested_at: NOW,
+            })
+            .await
+            .unwrap();
+        let engine = Engine::offline(&cfg, Some(ts.store.clone()), false);
+        let checks = engine.deep_with_fs_timeout(NOW, Duration::ZERO).await;
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "Releases vs store" && c.value.contains("incomplete run"))
+        );
+        let summary = *engine
+            .last_deep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let check = deep_summary_check(summary, NOW + 601);
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "timed out store traversal was recorded as consistent"
+        );
+        assert!(!check.value.contains("consistent"));
+        engine.deep(NOW + 602).await;
+        let summary = *engine
+            .last_deep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(deep_summary_check(summary, NOW + 603).status, Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn unreadable_store_does_not_publish_a_consistent_deep_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        let mut cfg = Config::default();
+        cfg.paths.store = dir.path().join("uninitialized-store");
+        cfg.paths.failed = dir.path().join("failed");
+        fs::create_dir(&cfg.paths.store).unwrap();
+        fs::create_dir(&cfg.paths.failed).unwrap();
+        let engine = Engine::offline(&cfg, Some(ts.store.clone()), false);
+        let checks = engine.deep(NOW).await;
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "Releases vs store" && c.value == "store could not be read")
+        );
+        let summary = *engine
+            .last_deep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let check = deep_summary_check(summary, NOW + 601);
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "failed store traversal was recorded as consistent"
+        );
+        assert!(!check.value.contains("consistent"));
+        // Recovering the store makes a subsequent complete check healthy again.
+        let _store = FsStore::open(&cfg.paths.store).unwrap();
+        engine.deep(NOW + 602).await;
+        let summary = *engine
+            .last_deep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(deep_summary_check(summary, NOW + 603).status, Status::Ok);
+    }
+}
+
+#[cfg(test)]
+mod metrics_backend_regressions {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn file_size_metrics_belong_to_the_selected_database_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("metrics.sqlite");
+        let wal_path = path_with_suffix(&db_path, "-wal");
+        let ts = nzb_store::test_backend::TestStore::open_file(&db_path).await;
+        let mut cfg = Config::default();
+        cfg.db.backend = ts.backend();
+        cfg.paths.db = db_path.clone();
+        let foreign_db = b"foreign database file";
+        let foreign_wal = b"foreign journal";
+        if ts.backend() == nzb_store::DbBackend::Postgres {
+            // These belong to no library: PostgreSQL uses its real isolated test database.
+            assert!(!db_path.exists() && !wal_path.exists());
+            fs::write(&db_path, foreign_db).unwrap();
+            fs::write(&wal_path, foreign_wal).unwrap();
+        }
+        let engine = Engine::offline(&cfg, Some(ts.store.clone()), false);
+        let facts =
+            tokio::time::timeout(Duration::from_secs(60), engine.metrics_facts(1_800_000_000))
+                .await
+                .expect("real metrics collection must finish");
+        let rendered = crate::metrics::render(&facts);
+        let db = facts
+            .db
+            .as_ref()
+            .expect("real database facts must be collected");
+        assert!(
+            db.writer_ok && db.reader_ok,
+            "real database connections must answer"
+        );
+        assert!(
+            db.totals.is_some(),
+            "real database aggregates must be collected"
+        );
+        match ts.backend() {
+            nzb_store::DbBackend::Postgres => {
+                assert_eq!(fs::read(&db_path).unwrap(), foreign_db);
+                assert_eq!(fs::read(&wal_path).unwrap(), foreign_wal);
+                assert_eq!(
+                    (facts.db_bytes, facts.wal_bytes),
+                    (None, None),
+                    "PostgreSQL metrics must not report unrelated SQLite path sizes"
+                );
+                assert!(!rendered.contains("nzbd_db_file_bytes"));
+                assert!(!rendered.contains("nzbd_db_wal_bytes"));
+            }
+            nzb_store::DbBackend::Sqlite => {
+                let db_bytes = fs::metadata(&db_path).unwrap().len();
+                let wal_bytes = fs::metadata(&wal_path).unwrap().len();
+                assert!(db_bytes > 0 && wal_bytes > 0);
+                assert_eq!(
+                    (facts.db_bytes, facts.wal_bytes),
+                    (Some(db_bytes), Some(wal_bytes))
+                );
+                assert!(
+                    rendered
+                        .lines()
+                        .any(|line| line == format!("nzbd_db_file_bytes {db_bytes}"))
+                );
+                assert!(
+                    rendered
+                        .lines()
+                        .any(|line| line == format!("nzbd_db_wal_bytes {wal_bytes}"))
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod health_backend_regressions {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    const DB_SENTINEL: &[u8] = b"unrelated local database file";
+    const WAL_SENTINEL: &[u8] = b"unrelated local journal";
+
+    fn filesystem_config(root: &Path) -> Config {
+        let mut cfg = Config::default();
+        for (slot, name) in [
+            (&mut cfg.paths.watch, "watch"),
+            (&mut cfg.paths.store, "store"),
+            (&mut cfg.paths.failed, "failed"),
+            (&mut cfg.paths.duplicates, "duplicates"),
+            (&mut cfg.paths.tmp, "tmp"),
+            (&mut cfg.paths.backups, "backups"),
+        ] {
+            *slot = root.join(name);
+            fs::create_dir(&*slot).unwrap();
+        }
+        fs::create_dir(root.join("store/.tmp")).unwrap();
+        for name in ["sqlite-only", "state", "index"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        cfg.paths.db = root.join("sqlite-only/unused.sqlite");
+        cfg.paths.state = Some(root.join("state"));
+        cfg.search.index_dir = Some(root.join("index"));
+        cfg.security.totp_key_file = root.join("unused-test-key");
+        cfg
+    }
+
+    fn health_checks(cfg: &Config, facts: FsFacts) -> Vec<Check> {
+        // Connection facts are held constant: this regression exercises real filesystem
+        // collection and the public health evaluator, not a PostgreSQL connection fixture.
+        build(&Inputs {
+            now: 1_800_000_000,
+            uptime: None,
+            live: None,
+            dev_tools: false,
+            debug_build: false,
+            cfg: CfgFacts::of(cfg),
+            proc: ProcFacts::default(),
+            db: Some(DbFacts {
+                writer_ok: true,
+                reader_ok: true,
+                schema: None,
+                totals: None,
+                logs: None,
+                pools: PoolInfo {
+                    writer_open: 1,
+                    readers_open: 1,
+                    readers_idle: 1,
+                    readers_max: 1,
+                    closed: false,
+                },
+                security: None,
+                last_ok_ingest: None,
+                audit_chain: None,
+                outbox: None,
+            }),
+            fs: facts,
+            recovery: None,
+            deep: None,
+            http_probe: None,
+        })
+    }
+
+    fn file_rows(checks: Vec<Check>) -> Vec<Check> {
+        checks
+            .into_iter()
+            .filter(|check| matches!(check.name, "Database file size" | "WAL file size"))
+            .collect()
+    }
+
+    #[test]
+    fn filesystem_health_belongs_to_selected_database_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = filesystem_config(dir.path());
+        let wal_path = path_with_suffix(&cfg.paths.db, "-wal");
+        fs::write(&cfg.paths.db, DB_SENTINEL).unwrap();
+        let mut wal = fs::File::create(&wal_path).unwrap();
+        wal.write_all(WAL_SENTINEL).unwrap();
+        // A sparse file crosses the real warning threshold without allocating 256 MiB.
+        wal.set_len(WAL_WARN_BYTES + 1).unwrap();
+        drop(wal);
+        let db_meta = fs::metadata(&cfg.paths.db).unwrap();
+        let wal_meta = fs::metadata(&wal_path).unwrap();
+
+        cfg.db.backend = nzb_store::DbBackend::Sqlite;
+        let sqlite_fs = gather_fs(&cfg);
+        assert_eq!(
+            (sqlite_fs.db_bytes, sqlite_fs.wal_bytes),
+            (Some(db_meta.len()), Some(wal_meta.len()))
+        );
+        assert!(sqlite_fs.dirs.iter().any(|d| d.name == "Database folder"));
+        let sqlite_checks = health_checks(&cfg, sqlite_fs);
+        assert!(sqlite_checks.iter().any(|c| c.name == "Database folder"));
+        let sqlite_rows = file_rows(sqlite_checks);
+        assert_eq!(sqlite_rows.len(), 2);
+        let sqlite_wal = sqlite_rows
+            .iter()
+            .find(|c| c.name == "WAL file size")
+            .expect("SQLite must retain its real WAL row");
+        assert_eq!(sqlite_wal.status, Status::Warn);
+        assert_eq!(sqlite_wal.value, human_bytes(wal_meta.len()));
+        let sqlite_summary = nzb_web::health::Summary::of(&sqlite_rows);
+        assert_eq!((sqlite_summary.warnings, sqlite_summary.failures), (1, 0));
+        assert_eq!(sqlite_summary.exit_code(), 1);
+        assert!(render_text(&sqlite_rows).contains("Restart the server to checkpoint."));
+
+        cfg.db.backend = nzb_store::DbBackend::Postgres;
+        let pg_fs = gather_fs(&cfg);
+        let pg_sizes = (pg_fs.db_bytes, pg_fs.wal_bytes);
+        let pg_has_directory = pg_fs.dirs.iter().any(|d| d.name == "Database folder");
+        let pg_checks = health_checks(&cfg, pg_fs);
+        let pg_has_directory_row = pg_checks.iter().any(|c| c.name == "Database folder");
+        let pg_rows = file_rows(pg_checks);
+        let pg_summary = nzb_web::health::Summary::of(&pg_rows);
+
+        assert_eq!(fs::read(&cfg.paths.db).unwrap(), DB_SENTINEL);
+        let mut journal_prefix = [0; WAL_SENTINEL.len()];
+        fs::File::open(&wal_path)
+            .unwrap()
+            .read_exact(&mut journal_prefix)
+            .unwrap();
+        assert_eq!(journal_prefix, WAL_SENTINEL);
+        let after_db = fs::metadata(&cfg.paths.db).unwrap();
+        let after_wal = fs::metadata(&wal_path).unwrap();
+        assert_eq!(after_db.len(), db_meta.len());
+        assert_eq!(after_wal.len(), wal_meta.len());
+        assert_eq!(after_db.modified().unwrap(), db_meta.modified().unwrap());
+        assert_eq!(after_wal.modified().unwrap(), wal_meta.modified().unwrap());
+        assert_eq!(
+            fs::read_dir(dir.path().join("sqlite-only"))
+                .unwrap()
+                .count(),
+            2
+        );
+
+        assert_eq!(
+            pg_sizes,
+            (None, None),
+            "PostgreSQL health must not report unrelated SQLite file sizes"
+        );
+        assert!(
+            !pg_has_directory && !pg_has_directory_row,
+            "PostgreSQL health must not probe the unrelated SQLite database directory"
+        );
+        assert!(
+            pg_rows
+                .iter()
+                .all(|c| c.status == Status::Info && c.value == "n/a")
+        );
+        assert_eq!((pg_summary.warnings, pg_summary.failures), (0, 0));
+        assert_eq!(pg_summary.exit_code(), 0);
+        assert!(!render_text(&pg_rows).contains("checkpoint"));
+    }
+}

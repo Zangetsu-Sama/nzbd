@@ -291,8 +291,8 @@ pub(crate) async fn create<S: SearchIndexV3>(
     }
     match st
         .db
-        .create_saved_search(
-            sess.user_id,
+        .create_saved_search_as(
+            &sess.actor(),
             &name,
             &to_stored(&p, tax),
             st.clock.now_secs(),
@@ -328,7 +328,7 @@ pub(crate) async fn open<S: SearchIndexV3>(
     };
     match st
         .db
-        .open_saved_search(sess.user_id, id, st.clock.now_secs())
+        .open_saved_search_as(&sess.actor(), id, st.clock.now_secs())
         .await
     {
         Ok(Some(_)) => see_other(&p.href(tax, p.sort, 1, true)),
@@ -360,7 +360,11 @@ pub(crate) async fn rename<S: SearchIndexV3>(
             SavedSearchError::InvalidName.code(),
         );
     };
-    match st.db.rename_saved_search(sess.user_id, id, &name).await {
+    match st
+        .db
+        .rename_saved_search_as(&sess.actor(), id, &name, st.clock.now_secs())
+        .await
+    {
         Ok(()) => see_other("/search/saved"),
         Err(e) => store_error(e),
     }
@@ -379,7 +383,11 @@ pub(crate) async fn delete<S: SearchIndexV3>(
     if csrf::parse_form_strict(&body, SMALL_FORM_MAX_FIELDS).is_none() {
         return bad_request();
     }
-    match st.db.delete_saved_search(sess.user_id, id).await {
+    match st
+        .db
+        .delete_saved_search_as(&sess.actor(), id, st.clock.now_secs())
+        .await
+    {
         Ok(()) => see_other("/search/saved"),
         Err(e) => store_error(e),
     }
@@ -520,5 +528,291 @@ mod tests {
         for bad in ["", "0", "-1", "1e3", "12a", "1234567890123456", " 1"] {
             assert_eq!(parse_id(bad), None, "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::too_many_lines)]
+
+    use std::sync::Arc;
+
+    use super::*;
+    use axum::http::{HeaderMap, Request};
+    use futures_util::{StreamExt as _, stream};
+    use nzb_store::{AccountPolicy, NewAccount, Role, SessionStage, Theme, UserPrefs};
+    use tokio::sync::oneshot;
+    use tower::ServiceExt as _;
+
+    use crate::auth::{AuthConfig, AuthState, ClientMeta, ManualWallClock, WallClock as _};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Operation {
+        Create,
+        Rename,
+        Delete,
+        Preferences,
+        ReleaseSize,
+        FileSize,
+    }
+
+    impl Operation {
+        fn form(self, id: i64) -> (String, &'static str) {
+            match self {
+                Self::Create => ("/search/saved".into(), "name=New&q=example"),
+                Self::Rename => (format!("/search/saved/{id}/rename"), "name=Renamed"),
+                Self::Delete => (format!("/search/saved/{id}/delete"), ""),
+                Self::Preferences => ("/account/preferences".into(), "theme=dark&hide_xxx=1"),
+                Self::ReleaseSize => ("/page-size".into(), "list=releases&per_page=100"),
+                Self::FileSize => ("/page-size".into(), "list=files&per_page=500&release=1"),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DuringBody {
+        Logout,
+        Expire,
+        KeepSession,
+    }
+
+    /// The router has read the session before requesting the next chunk. Keep the body incomplete
+    /// until the test has committed logout or advanced the injected clock past the session deadline.
+    fn suspended_form(form: &str) -> (Body, oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let split = form.len() / 2;
+        let head = Bytes::copy_from_slice(&form.as_bytes()[..split]);
+        let tail = Bytes::copy_from_slice(&form.as_bytes()[split..]);
+        let (waiting, reached) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        let rest = stream::once(async move {
+            let _ = waiting.send(());
+            paused
+                .await
+                .map_err(|_| std::io::Error::other("display test cancelled"))?;
+            Ok::<_, std::io::Error>(tail)
+        });
+        let first = stream::iter([Ok::<_, std::io::Error>(head)]);
+        (Body::from_stream(first.chain(rest)), reached, resume)
+    }
+
+    fn request(path: &str, cookie: &str) -> axum::http::request::Builder {
+        Request::post(path)
+            .header(header::HOST, "localhost")
+            .header(header::ORIGIN, "http://localhost")
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+    }
+
+    async fn check_suspended(operation: Operation) {
+        let dir = tempfile::tempdir().unwrap();
+        let test_store = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        let db = test_store.store.clone();
+        let policy = AccountPolicy {
+            multi_user: true,
+            ..AccountPolicy::default()
+        };
+        let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+        db.create_account_operator(
+            &NewAccount {
+                username: "display-admin",
+                password_hash: "unused-test-hash",
+                role: Some(Role::Admin),
+            },
+            policy,
+            clock.now_secs(),
+        )
+        .await
+        .unwrap();
+        let auth = AuthState::new(
+            db.clone(),
+            AuthConfig {
+                multi_user: true,
+                idle_secs: 60,
+                insecure_cookies: true,
+                ..AuthConfig::default()
+            },
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let search = nzb_search::testing::SettlingIndex::open(&db, &dir.path().join("index")).await;
+        let routes = crate::index::routes_with_clock(
+            db.clone(),
+            search,
+            Arc::new(nzb_core::Taxonomy::builtin().unwrap()),
+            clock.clone(),
+        )
+        .merge(crate::account::account_routes(&auth));
+        let app = crate::router_with_auth(
+            &crate::WebConfig {
+                insecure_cookies: true,
+                ..crate::WebConfig::default()
+            },
+            &auth,
+            routes,
+        );
+        for header_token in [false, true] {
+            for (n, action) in [
+                DuringBody::Logout,
+                DuringBody::Expire,
+                DuringBody::KeepSession,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let name = format!("display-{}-{n}", u8::from(header_token));
+                let uid = db
+                    .create_account_operator(
+                        &NewAccount {
+                            username: &name,
+                            password_hash: "unused-test-hash",
+                            role: Some(Role::Viewer),
+                        },
+                        policy,
+                        clock.now_secs(),
+                    )
+                    .await
+                    .unwrap();
+                let saved = db
+                    .create_saved_search(uid, "Original", "{}", clock.now_secs())
+                    .await
+                    .unwrap();
+                let before = db.saved_searches(uid).await.unwrap();
+                let (set_cookie, csrf) = auth
+                    .start_session_full(uid, SessionStage::Active, &ClientMeta::default(), None)
+                    .await
+                    .unwrap();
+                let cookie = set_cookie.to_str().unwrap().split(';').next().unwrap();
+                let mut headers = HeaderMap::new();
+                headers.insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+                assert!(auth.peek_session(&headers).await.unwrap().is_some());
+                let (path, fields) = operation.form(saved);
+                let (body, reached, resume) =
+                    suspended_form(&format!("csrf_token={csrf}&{fields}"));
+                let mut builder = request(&path, cookie);
+                if header_token {
+                    builder = builder.header("x-csrf-token", &csrf);
+                }
+                let request_app = app.clone();
+                let req = builder.body(body).unwrap();
+                let pending = tokio::spawn(async move { request_app.oneshot(req).await.unwrap() });
+                tokio::time::timeout(Duration::from_secs(5), reached)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    !pending.is_finished(),
+                    "{operation:?}/{action:?} must wait for its form"
+                );
+                assert_eq!(db.saved_searches(uid).await.unwrap(), before);
+                assert_eq!(db.user_prefs(uid).await.unwrap(), UserPrefs::default());
+                match action {
+                    DuringBody::Logout => {
+                        let out = app
+                            .clone()
+                            .oneshot(
+                                request("/logout", cookie)
+                                    .header("x-csrf-token", &csrf)
+                                    .body(Body::empty())
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(out.status(), StatusCode::SEE_OTHER);
+                        assert!(auth.peek_session(&headers).await.unwrap().is_none());
+                    }
+                    DuringBody::Expire => clock.advance(60),
+                    DuringBody::KeepSession => {}
+                }
+                resume.send(()).unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(10), pending)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let refused = !matches!(action, DuringBody::KeepSession);
+                assert_eq!(
+                    response.status(),
+                    if refused {
+                        StatusCode::NOT_FOUND
+                    } else if matches!(operation, Operation::Preferences) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SEE_OTHER
+                    },
+                    "{operation:?}/{action:?}, header token = {header_token}"
+                );
+                let searches = db.saved_searches(uid).await.unwrap();
+                let prefs = db.user_prefs(uid).await.unwrap();
+                let pref_events = test_store.i64(&format!("SELECT count(*) FROM audit_log WHERE event = 'pref_change' AND actor_id = {uid}")).await;
+                if refused {
+                    assert_eq!(searches, before, "refused operation changed saved searches");
+                    assert_eq!(prefs, UserPrefs::default());
+                    assert_eq!(pref_events, 0);
+                    assert_eq!(
+                        test_store
+                            .i64(&format!(
+                                "SELECT count(*) FROM user_pref WHERE account_id = {uid}"
+                            ))
+                            .await,
+                        0
+                    );
+                    // In the form-token case touch happens AFTER the body; zero affected rows must
+                    // never resurrect an expired or revoked session, nor authorize the mutation.
+                    assert!(auth.peek_session(&headers).await.unwrap().is_none());
+                } else {
+                    match operation {
+                        Operation::Create => {
+                            assert_eq!(searches.len(), 2);
+                            assert!(searches.iter().any(|s| s.name == "New"));
+                        }
+                        Operation::Rename => assert_eq!(searches[0].name, "Renamed"),
+                        Operation::Delete => assert_eq!(searches.len(), 0),
+                        Operation::Preferences => {
+                            assert_eq!(prefs.theme, Theme::Dark);
+                            assert!(prefs.hide_xxx);
+                        }
+                        Operation::ReleaseSize => assert_eq!(prefs.page_size_releases.get(), 100),
+                        Operation::FileSize => assert_eq!(prefs.page_size_files.get(), 500),
+                    }
+                    assert_eq!(
+                        pref_events,
+                        i64::from(matches!(
+                            operation,
+                            Operation::Preferences | Operation::ReleaseSize | Operation::FileSize
+                        ))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sec_036_saved_create_rechecks_session_after_suspended_body() {
+        check_suspended(Operation::Create).await;
+    }
+
+    #[tokio::test]
+    async fn sec_036_saved_rename_rechecks_session_after_suspended_body() {
+        check_suspended(Operation::Rename).await;
+    }
+
+    #[tokio::test]
+    async fn sec_036_saved_delete_rechecks_session_after_suspended_body() {
+        check_suspended(Operation::Delete).await;
+    }
+
+    #[tokio::test]
+    async fn sec_036_preferences_recheck_session_after_suspended_body() {
+        check_suspended(Operation::Preferences).await;
+    }
+
+    #[tokio::test]
+    async fn sec_036_release_page_size_rechecks_session_after_suspended_body() {
+        check_suspended(Operation::ReleaseSize).await;
+    }
+
+    #[tokio::test]
+    async fn sec_036_file_page_size_rechecks_session_after_suspended_body() {
+        check_suspended(Operation::FileSize).await;
     }
 }

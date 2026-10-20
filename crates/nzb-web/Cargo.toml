@@ -26,13 +26,16 @@ hmac = "0.12"
 # `Body` trait for the permit-holding download body (already in the lockfile via axum/hyper).
 http-body = "1"
 http-body-util = "0.1.5"
+# Configure the existing HTTP/1 parser's header timer and bounded buffers (already locked).
+hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
 # Upload pipeline handle/Job types (T051); workspace-internal.
-nzb-ingest = { version = "0.5.1", path = "../nzb-ingest" }
-nzb-core = { version = "0.5.1", path = "../nzb-core" }
-nzb-store = { version = "0.5.1", path = "../nzb-store" }
+nzb-ingest = { version = "0.6.0", path = "../nzb-ingest" }
+nzb-core = { version = "0.6.0", path = "../nzb-core" }
+nzb-store = { version = "0.6.0", path = "../nzb-store" }
 # The search contract: `SearchIndexV3` (prefix, fuzzy fallback, "more than n", narrowed) and the bounded
 # degraded browse; workspace-internal, already linked into nzbd.
-nzb-search = { version = "0.5.1", path = "../nzb-search" }
+nzb-search = { version = "0.6.0", path = "../nzb-search" }
 # Server-side QR code as inline SVG for TOTP enrollment (no JS, no external service).
 qrcode = { version = "0.14", default-features = false }
 # HMAC-SHA1 is what RFC 6238 authenticator apps expect; already in the lockfile.
@@ -51,14 +54,14 @@ zeroize = "1"
 # Test-only slow blob store implementing the async `NzbStore` trait (already in the lockfile).
 async-trait = "0.1"
 # Generated NZB documents for the explorer tests (workspace-internal, dev only).
-nzb-testkit = { version = "0.5.1", path = "../nzb-testkit" }
+nzb-testkit = { version = "0.6.0", path = "../nzb-testkit" }
 # The listing in tests: the Tantivy index over the test store, settled before every read (workspace-internal, dev only).
-nzb-search = { version = "0.5.1", path = "../nzb-search", features = ["test-support"] }
+nzb-search = { version = "0.6.0", path = "../nzb-search", features = ["test-support"] }
 # The backend matrix (NZBD_TEST_BACKEND, no default) and the Postgres test harness (T122).
-nzb-store = { version = "0.5.1", path = "../nzb-store", features = ["pg-test-support"] }
+nzb-store = { version = "0.6.0", path = "../nzb-store", features = ["pg-test-support"] }
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
-tokio = { version = "1.53.2", features = ["rt", "macros", "time", "net", "io-util"] }
+tokio = { version = "1.53.2", features = ["rt", "macros", "time", "net", "io-util", "test-util"] }
 # Same sqlx as nzb-store (tests flip user columns directly).
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "sqlite-unlock-notify"] }
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

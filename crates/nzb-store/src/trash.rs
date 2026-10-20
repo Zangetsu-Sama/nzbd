@@ -15,13 +15,13 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use nzb_core::Sha256;
 use sqlx::Row;
 
-use crate::account::{AuditActor, Role, require_actor, write_audit};
+use crate::account::{AuditActor, Role, require_session_actor, write_audit};
 use crate::attribution::TrashActor;
 use crate::fs_store::NzbStore;
 use crate::{SqliteDb, StoreError};
@@ -138,11 +138,11 @@ impl SqliteDb {
         let mut tx = self.begin_immediate().await?;
         // An account actor is validated first (admin, live, enabled): a refused role reads nothing.
         let (who, deleted_by) = match actor {
-            TrashActor::Account(uid) => {
-                let a = require_actor(&mut tx, uid, Role::Admin).await?;
+            TrashActor::Account(actor) => {
+                let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
                 (
                     Some(AuditActor::account(a.id, a.role, &a.username)),
-                    Some(uid),
+                    Some(a.id),
                 )
             }
             TrashActor::Text(_) => (None, None),
@@ -189,6 +189,7 @@ impl SqliteDb {
         .bind(deleted_by)
         .fetch_one(&mut *tx)
         .await?;
+        crate::nfo::hide_for_trash(&mut tx, &sha, now).await?;
         // `nzb_file` goes with the release (ON DELETE CASCADE); ingest_log keeps its rows with
         // `release_id` set to NULL.
         sqlx::query("DELETE FROM release WHERE id = ?1")
@@ -301,11 +302,25 @@ impl SqliteDb {
     /// # Errors
     /// Database errors.
     pub async fn forget_trash(&self, id: i64) -> Result<bool, StoreError> {
-        let res = sqlx::query("DELETE FROM release_trash WHERE id = ?1")
-            .bind(id)
-            .execute(self.writer())
-            .await?;
-        Ok(res.rows_affected() > 0)
+        let mut tx = self.begin_immediate().await?;
+        let sha: Option<Vec<u8>> =
+            sqlx::query_scalar("DELETE FROM release_trash WHERE id = ?1 RETURNING sha256")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(sha) = sha else {
+            return Ok(false);
+        };
+        // The restore: the NFO is shown again once the NZB is re-ingested (T140).
+        sqlx::query(
+            "UPDATE release_nfo SET trashed_at = NULL, restored_at = unixepoch() \
+             WHERE sha256 = ?1 AND trashed_at IS NOT NULL",
+        )
+        .bind(&sha)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 }
 
@@ -359,6 +374,15 @@ pub struct QuarantinePurge {
     /// Entries refused by the safety checks (symlink, hard-linked, swapped, not regular) and
     /// foreign names.
     pub skipped: u64,
+    /// Managed files left because the deadline or authority gate stopped the purge.
+    pub remaining: u64,
+    /// The authority gate refused; no subsequent file was removed.
+    pub aborted: bool,
+}
+
+impl QuarantinePurge {
+    /// Maximum number of managed entries between authority checks.
+    pub const BATCH_SIZE: u64 = 50;
 }
 
 /// Result of [`TrashStore::trash_purge`].
@@ -428,5 +452,17 @@ pub trait TrashStore: NzbStore {
     async fn quarantine_list(&self, limit: usize) -> Result<QuarantineListing, StoreError>;
 
     /// Removes quarantined files whose quarantine time is before `older_than` (unix seconds).
-    async fn quarantine_purge(&self, older_than: i64) -> Result<QuarantinePurge, StoreError>;
+    async fn quarantine_purge(&self, older_than: i64) -> Result<QuarantinePurge, StoreError> {
+        self.quarantine_purge_checked(older_than, None, None).await
+    }
+
+    /// A bounded purge: check the deadline before removal and the authority gate on a blocking
+    /// thread before every [`QuarantinePurge::BATCH_SIZE`] entries, including the first batch.
+    /// A false gate stops the run; implementations must not fall back to an unchecked purge.
+    async fn quarantine_purge_checked(
+        &self,
+        older_than: i64,
+        deadline: Option<Instant>,
+        gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<QuarantinePurge, StoreError>;
 }

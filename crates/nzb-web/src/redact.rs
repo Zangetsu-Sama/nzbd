@@ -61,6 +61,17 @@ pub fn is_sensitive_name(name: &str) -> bool {
     SENSITIVE_KEYS.iter().any(|k| name.eq_ignore_ascii_case(k))
 }
 
+/// True if a structured field name matches the text scrubber's secret-name policy.
+/// Also recognises suffixed names, dotted paths such as `request.sid`, and Rust raw identifiers.
+#[must_use]
+pub fn is_sensitive_field(name: &str) -> bool {
+    let lower = name.strip_prefix("r#").unwrap_or(name).to_ascii_lowercase();
+    is_sensitive_key(&lower)
+        || lower.rsplit_once('.').is_some_and(|(_, component)| {
+            is_sensitive_key(component.strip_prefix("r#").unwrap_or(component))
+        })
+}
+
 /// Returns the value to log for header `name`: the real value, or [`REDACTED`] if sensitive.
 #[must_use]
 pub fn header_for_log<'a>(name: &str, value: &'a str) -> &'a str {
@@ -172,7 +183,7 @@ fn json_member(b: &[u8], lb: &[u8], lower: &str, i: usize) -> Step {
         return Step::Skip(ks); // a string value, not a key: scan its content as text
     }
     let key = lower.get(ks..kend).unwrap_or_default();
-    if !is_sensitive_key(key) {
+    if !is_sensitive_field(key) {
         return Step::Skip(kend.saturating_add(1));
     }
     let vs = skip_blanks(lb, p.saturating_add(1));
@@ -305,6 +316,58 @@ mod tests {
         assert_eq!(header_for_log("X-Api-Key", "k"), REDACTED);
         assert_eq!(header_for_log("Accept", "text/html"), "text/html");
         assert_eq!(path_for_log("/login?next=/&token=abc"), "/login");
+    }
+
+    #[test]
+    fn structured_field_names_follow_the_scrubber_policy() {
+        for name in [
+            "password",
+            "PassWord",
+            "user_password",
+            "x-csrf-token",
+            "r#key",
+            "sid",
+            "request.sid",
+            "request.otp",
+            "request.key",
+            "request.csrf",
+            "request.user_password",
+            "request.r#key",
+        ] {
+            assert!(is_sensitive_field(name), "missed secret field {name}");
+        }
+        for name in [
+            "message",
+            "user",
+            "status",
+            "monkey",
+            "public_key_id",
+            "publicrequest.monkey",
+            "request.public_key_id",
+        ] {
+            assert!(!is_sensitive_field(name), "masked public field {name}");
+        }
+    }
+
+    #[test]
+    fn scrub_json_recognises_dotted_sensitive_fields() {
+        for name in [
+            "r#key",
+            "request.sid",
+            "request.otp",
+            "request.key",
+            "request.csrf",
+            "request.user_password",
+            "request.r#key",
+        ] {
+            let input = format!(
+                r#"{{"{name}":"secret head secret tail","publicrequest.monkey":"public words","request.public_key_id":"public id"}}"#
+            );
+            let expected = format!(
+                r#"{{"{name}":"[REDACTED]","publicrequest.monkey":"public words","request.public_key_id":"public id"}}"#
+            );
+            assert_eq!(scrub(&input), expected);
+        }
     }
 
     #[test]

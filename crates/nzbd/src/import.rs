@@ -1,4 +1,4 @@
-//! `nzbd import <dir>` (T115, `docs/MIGRATION.md` section 1): fills a library from a directory of NZB files (a 2.x
+//! `nzbd import <dir>` (T115, `docs/v3/MIGRATION.md` section 1): fills a library from a directory of NZB files (a 2.x
 //! `data/store/`, an original `.nzb` collection) through the ingest pipeline with the configured parser limits,
 //! workers, byte budget and commit groups. Host-only (a CLI command, never a web route).
 //!

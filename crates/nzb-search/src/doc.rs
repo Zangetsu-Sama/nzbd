@@ -88,7 +88,15 @@ impl IndexDoc {
             posted_at: row.posted_at,
             ingested_at: row.ingested_at,
             total_bytes: row.total_bytes,
-            flags: row.flags,
+            // T148: a manual category is not "uncategorized"; mask the stale bit of rows overridden
+            // before the store cleared it (their documents refresh on the next reindex or edit).
+            flags: if row.category_overridden {
+                ReleaseFlags::from_bits_truncate(
+                    row.flags.bits() & !ReleaseFlags::UNCATEGORIZED.bits(),
+                )
+            } else {
+                row.flags
+            },
             family: row.scene.family.clone(),
             resolution: row.scene.resolution.clone(),
             source: row.scene.source.clone(),
@@ -232,4 +240,26 @@ pub fn flag_terms(flags: ReleaseFlags) -> impl Iterator<Item = &'static str> {
         .iter()
         .filter(move |(f, _)| flags.contains(*f))
         .map(|(_, n)| *n)
+}
+
+#[cfg(test)]
+mod t148_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::testkit::{doc, row_of};
+
+    /// T148: a manually categorised row is not indexed as `uncategorized`, the untouched fallback is.
+    #[test]
+    fn manual_category_masks_the_uncategorized_term() {
+        let mut d = doc(1, "x");
+        d.flags = ReleaseFlags::UNCATEGORIZED | ReleaseFlags::HAS_PAR2;
+        let mut row = row_of(&d);
+        let terms = |r: &ReleaseRow| -> Vec<&'static str> {
+            flag_terms(IndexDoc::from_row(r, 8000, "", 1, None).flags).collect()
+        };
+        assert_eq!(terms(&row), vec!["par2", "uncategorized"]);
+        row.category_overridden = true;
+        assert_eq!(terms(&row), vec!["par2"]);
+    }
 }

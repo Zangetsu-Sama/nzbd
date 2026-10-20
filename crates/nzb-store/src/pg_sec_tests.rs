@@ -1,4 +1,4 @@
-//! New v3 security tests of the Postgres store (T112; `docs/SECURITY_DELTA.md` sections 3 and 4).
+//! New v3 security tests of the Postgres store (T112; `docs/v3/SECURITY_DELTA.md` sections 3 and 4).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

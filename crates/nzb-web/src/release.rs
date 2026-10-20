@@ -150,6 +150,10 @@ pub fn routes_with_bulk(deps: ReleaseDeps, bulk: crate::bulk_download::BulkLimit
         )
         .route("/release/{id}/category", post(set_category))
         .route("/release/{id}/source", post(set_source))
+        // T140: the NFO viewer, its raw download and the admin's remove.
+        .route("/release/{id}/nfo", get(crate::nfo::page))
+        .route("/release/{id}/nfo/download", get(crate::nfo::download))
+        .route("/release/{id}/nfo/delete", post(crate::nfo::delete))
         .with_state(st)
 }
 
@@ -421,6 +425,8 @@ struct DetailPage {
     next_href: Option<String>,
     /// The "Per page" control under the files table (T133): the allowlisted sizes with the account's choice selected.
     per_page_choices: Vec<Choice>,
+    /// The release's NFO, decoded (T140); `None` when it has none.
+    nfo: Option<crate::nfo::NfoView>,
 }
 
 fn completeness(present: u64, missing: u64) -> String {
@@ -440,7 +446,10 @@ fn scene_items(r: &ReleaseRow) -> Vec<SceneItem> {
             v.push(SceneItem { label, value });
         }
     };
-    add("Family", s.family.clone());
+    add(
+        "Family",
+        s.family.as_deref().map(crate::index::family_label),
+    );
     add("Year", s.year.map(|y| y.to_string()));
     add("Season", s.season.map(|y| y.to_string()));
     add("Episode", s.episode.map(|y| y.to_string()));
@@ -676,6 +685,13 @@ async fn detail(
             return internal();
         }
     };
+    let nfo = match db.release_nfo(id).await {
+        Ok(n) => n.map(|n| crate::nfo::NfoView::decode(&n.bytes, None).0),
+        Err(e) => {
+            tracing::error!(error = %e, "nfo lookup failed");
+            return internal();
+        }
+    };
     let now = st.deps.clock.now_secs();
     let files: Vec<FileView> = shown.iter().map(|f| file_view(f, health)).collect();
     let flags = flag_views(flag_labels(&row, health));
@@ -734,6 +750,7 @@ async fn detail(
         prev_href: (cur > 1).then(|| href(cur - 1)),
         next_href: (cur < pages).then(|| href(cur + 1)),
         per_page_choices: crate::page_size::choices(nzb_store::FilePageSize::CHOICES, per_page),
+        nfo,
     };
     render(&view)
 }

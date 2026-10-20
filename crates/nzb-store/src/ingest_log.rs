@@ -280,7 +280,9 @@ impl SqliteDb {
 
     /// Newest-first `ingest_log` rows (at most `limit`, capped at 500) that do not belong to a
     /// release whose category id is in `exclude`. A row belongs to such a release when its
-    /// `release_id` or its `sha256` matches one. Failed rows (no release) are kept.
+    /// `release_id` or its `sha256` matches one, including retained trash metadata. With exclusions,
+    /// rows whose former category can no longer be established are omitted; failures without any
+    /// release identity remain visible. The unfiltered operator log retains every row.
     ///
     /// # Errors
     /// Database errors.
@@ -301,6 +303,12 @@ impl SqliteDb {
              AND +r.category_id IN (SELECT value FROM json_each(?1))) \
              AND NOT EXISTS (SELECT 1 FROM release r WHERE r.sha256 = l.sha256 \
              AND +r.category_id IN (SELECT value FROM json_each(?1))) \
+             AND NOT EXISTS (SELECT 1 FROM release_trash t WHERE t.sha256 = l.sha256 \
+             AND +t.category_id IN (SELECT value FROM json_each(?1))) \
+             AND ((l.release_id IS NULL AND l.sha256 IS NULL AND l.outcome = 'failed') \
+             OR EXISTS (SELECT 1 FROM release r WHERE r.id = l.release_id) \
+             OR EXISTS (SELECT 1 FROM release r WHERE r.sha256 = l.sha256) \
+             OR EXISTS (SELECT 1 FROM release_trash t WHERE t.sha256 = l.sha256)) \
              ORDER BY l.ts DESC, l.id DESC LIMIT ?2",
         )
         .bind(json_u32s(exclude))

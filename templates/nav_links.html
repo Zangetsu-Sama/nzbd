@@ -3,8 +3,9 @@
 {% if layout.can_upload %}<a href="/upload"{% if layout.nav == "upload" %} aria-current="page"{% endif %}><span class="gl" aria-hidden="true">&#8593;</span> Upload</a>
 {% endif %}<a href="/stats"{% if layout.nav == "stats" %} aria-current="page"{% endif %}><span class="gl" aria-hidden="true">&#9638;</span> Statistics</a>
 <p class="side-h">Browse</p>
-{% for b in layout.browse %}<a href="/?cat={{ b.slug }}"{% if b.slug == layout.browse_cur %} aria-current="page"{% endif %}><span class="gl" aria-hidden="true">&#8250;</span> {{ b.name }}{% if !b.count.is_empty() %} <span class="cnt"><span class="sr">(</span>{{ b.count }}<span class="sr"> releases)</span></span>{% endif %}</a>
-{% endfor %}{% if layout.saved_section %}<p class="side-h">Saved searches</p>
+{% for b in layout.browse %}<a href="/?cat={{ b.slug }}"{% if b.slug == layout.browse_sel %} aria-current="page"{% endif %}><span class="gl" aria-hidden="true">&#8250;</span> {{ b.name }}{% if !b.count.is_empty() %} <span class="cnt"><span class="sr">(</span>{{ b.count }}<span class="sr"> releases)</span></span>{% endif %}</a>
+{% if b.slug == layout.browse_cur %}{% for c in b.children %}<a href="/?cat={{ c.slug }}" class="sub"{% if c.slug == layout.browse_sel %} aria-current="page"{% endif %}><span class="sr">{{ b.name }}, </span>{{ c.short }}{% if !c.count.is_empty() %} <span class="cnt"><span class="sr">(</span>{{ c.count }}<span class="sr"> releases)</span></span>{% endif %}</a>
+{% endfor %}{% endif %}{% endfor %}{% if layout.saved_section %}<p class="side-h">Saved searches</p>
 {% for s in layout.saved %}<a href="{{ s.href }}" class="saved"><span class="gl" aria-hidden="true">&#9733;</span> {{ s.name }}{% if !s.badge.is_empty() %} <span class="cnt new"><span class="sr">(</span>{{ s.badge }} new<span class="sr">)</span></span>{% endif %}</a>
 {% endfor %}<a href="/search/saved"><span class="gl" aria-hidden="true">&#9998;</span> {% if layout.saved.is_empty() %}No saved searches yet{% else %}Manage saved searches{% endif %}</a>
 {% endif %}{% if layout.is_admin %}<p class="side-h">Manage</p>

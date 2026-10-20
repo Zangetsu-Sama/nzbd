@@ -36,6 +36,8 @@ pub const MAX_RECENT: usize = 4;
 pub const MAX_DISTINCT_VALUES: usize = 100_000;
 /// Dictionary terms resolved between two deadline checks when a segment's counts are merged.
 const MERGE_CHECK_EVERY: u64 = 4_096;
+/// Most distinct ordinals buffered before merging visible counts into the bounded value map.
+const MAX_ORDINAL_COUNTERS: usize = 4_096;
 
 /// What the Statistics page asks for. Every value is chosen by the server (never request text) and clamped here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,7 +125,8 @@ trait Agg {
     /// Opens the columns of `seg`.
     fn open(&mut self, seg: &SegmentReader) -> Result<(), SearchError>;
     /// Counts one alive matching document of the open segment.
-    fn doc(&mut self, doc: DocId);
+    fn doc(&mut self, doc: DocId, deadline: &Deadline, check_every: u64)
+    -> Result<(), SearchError>;
     /// Folds the open segment into the totals, checking `deadline` while doing so.
     fn close(&mut self, deadline: &Deadline, check_every: u64) -> Result<(), SearchError>;
 }
@@ -176,7 +179,7 @@ fn scan(
             if alive.is_none_or(|a| a.is_alive(doc)) {
                 counted = counted.saturating_add(1);
                 for a in aggs.iter_mut() {
-                    a.doc(doc);
+                    a.doc(doc, deadline, check_every)?;
                 }
             }
             doc = scorer.advance();
@@ -188,16 +191,17 @@ fn scan(
     Ok(counted)
 }
 
-/// Counts the values of one keyword (dictionary-encoded string) column: per segment by term ordinal, then merged by
-/// value.
+/// Counts one keyword column in bounded batches of visible term ordinals, then merges by value.
 struct StrCount {
     column: &'static str,
     col: Option<StrColumn>,
-    per_ord: Vec<u64>,
+    per_ord: HashMap<u64, u64>,
     without: u64,
     by_value: HashMap<String, u64>,
     cap: usize,
     capped: bool,
+    #[cfg(test)]
+    peak_ordinal_capacity: usize,
 }
 
 impl StrCount {
@@ -205,11 +209,13 @@ impl StrCount {
         Self {
             column,
             col: None,
-            per_ord: Vec::new(),
+            per_ord: HashMap::new(),
             without: 0,
             by_value: HashMap::new(),
             cap: MAX_DISTINCT_VALUES,
             capped: false,
+            #[cfg(test)]
+            peak_ordinal_capacity: 0,
         }
     }
 
@@ -235,73 +241,84 @@ impl StrCount {
             capped: self.capped,
         }
     }
+
+    fn flush(&mut self, deadline: &Deadline, check_every: u64) -> Result<(), SearchError> {
+        let Some(col) = self.col.as_ref() else {
+            return Ok(());
+        };
+        // Only visible ordinals are buffered. Sorting and resolving this batch never scales with
+        // the segment dictionary; a full batch is flushed even once the global value cap is reached,
+        // so groups already retained still receive all of their subsequent counts.
+        let mut counts: Vec<(u64, u64)> = self.per_ord.drain().collect();
+        counts.sort_unstable_by_key(|(ord, _)| *ord);
+        let by_value = &mut self.by_value;
+        let cap = self.cap;
+        let capped = &mut self.capped;
+        let every = usize::try_from(check_every.clamp(1, MERGE_CHECK_EVERY)).unwrap_or(1);
+        let mut ords = Vec::with_capacity(every.min(counts.len()));
+        // Tantivy's dictionary callback cannot stop early: use bounded ascending batches with
+        // deadline checks, including when a flush is triggered in the middle of a segment.
+        for chunk in counts.chunks(every) {
+            if chunk.len() == every {
+                deadline.check()?;
+            }
+            ords.clear();
+            ords.extend(chunk.iter().map(|(ord, _)| *ord));
+            let mut values = chunk.iter().map(|(_, n)| *n);
+            col.dictionary().sorted_ords_to_term_cb(&ords, |bytes| {
+                let n = values.next().unwrap_or(0);
+                // Keyword values are UTF-8; invalid values are skipped, never reinterpreted.
+                let Ok(v) = std::str::from_utf8(bytes) else {
+                    return;
+                };
+                if let Some(slot) = by_value.get_mut(v) {
+                    *slot = slot.saturating_add(n);
+                } else if by_value.len() < cap {
+                    by_value.insert(v.to_owned(), n);
+                } else {
+                    *capped = true;
+                }
+            })?;
+        }
+        Ok(())
+    }
 }
 
 impl Agg for StrCount {
     fn open(&mut self, seg: &SegmentReader) -> Result<(), SearchError> {
         self.col = seg.fast_fields().str(self.column)?;
         self.per_ord.clear();
-        // One counter per term of this segment's dictionary (never more than the segment's documents).
-        self.per_ord
-            .resize(self.col.as_ref().map_or(0, |c| c.num_terms()), 0);
         Ok(())
     }
 
-    fn doc(&mut self, doc: DocId) {
-        let ord = self.col.as_ref().and_then(|c| c.ords().first(doc));
-        match ord
-            .and_then(|o| usize::try_from(o).ok())
-            .and_then(|o| self.per_ord.get_mut(o))
-        {
-            Some(n) => *n = n.saturating_add(1),
-            None => self.without = self.without.saturating_add(1),
+    fn doc(
+        &mut self,
+        doc: DocId,
+        deadline: &Deadline,
+        check_every: u64,
+    ) -> Result<(), SearchError> {
+        let Some(ord) = self.col.as_ref().and_then(|c| c.ords().first(doc)) else {
+            self.without = self.without.saturating_add(1);
+            return Ok(());
+        };
+        if let Some(n) = self.per_ord.get_mut(&ord) {
+            *n = n.saturating_add(1);
+            return Ok(());
         }
+        if self.per_ord.len() >= self.cap.clamp(1, MAX_ORDINAL_COUNTERS) {
+            self.flush(deadline, check_every)?;
+        }
+        self.per_ord.insert(ord, 1);
+        #[cfg(test)]
+        {
+            self.peak_ordinal_capacity = self.peak_ordinal_capacity.max(self.per_ord.capacity());
+        }
+        Ok(())
     }
 
     fn close(&mut self, deadline: &Deadline, check_every: u64) -> Result<(), SearchError> {
-        let Some(col) = self.col.take() else {
-            return Ok(());
-        };
-        // One ascending stream over the dictionary blocks for the ordinals that were counted (each block is decoded
-        // once), not one random lookup per ordinal; the deadline is checked every few terms (review 47 M1).
-        let per_ord = &self.per_ord;
-        let by_value = &mut self.by_value;
-        let cap = self.cap;
-        let capped = &mut self.capped;
-        let every = check_every.clamp(1, MERGE_CHECK_EVERY);
-        let mut counts = per_ord.iter().copied().filter(|n| *n > 0);
-        let ords = per_ord
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| **n > 0)
-            .filter_map(|(o, _)| u64::try_from(o).ok());
-        let mut seen = 0u64;
-        let mut expired = false;
-        let streamed = col.dictionary().sorted_ords_to_term_cb(ords, |bytes| {
-            seen = seen.saturating_add(1);
-            if seen.is_multiple_of(every) && deadline.expired() {
-                expired = true;
-                return Err(std::io::Error::other("statistics deadline"));
-            }
-            let n = counts.next().unwrap_or(0);
-            // Keyword values are UTF-8 (they come from `str` values); anything else is skipped, never reinterpreted.
-            let Ok(v) = std::str::from_utf8(bytes) else {
-                return Ok(());
-            };
-            if let Some(slot) = by_value.get_mut(v) {
-                *slot = slot.saturating_add(n);
-            } else if by_value.len() < cap {
-                by_value.insert(v.to_owned(), n);
-            } else {
-                *capped = true;
-            }
-            Ok(())
-        });
-        self.per_ord.clear();
-        if expired {
-            return Err(SearchError::Deadline);
-        }
-        streamed?;
+        self.flush(deadline, check_every)?;
+        self.col = None;
         Ok(())
     }
 }
@@ -321,7 +338,12 @@ impl Agg for YearCount {
         Ok(())
     }
 
-    fn doc(&mut self, doc: DocId) {
+    fn doc(
+        &mut self,
+        doc: DocId,
+        _deadline: &Deadline,
+        _check_every: u64,
+    ) -> Result<(), SearchError> {
         match self.col.as_ref().and_then(|c| c.first(doc)) {
             Some(y) => {
                 if let Some(slot) = self.by_year.get_mut(&y) {
@@ -334,6 +356,7 @@ impl Agg for YearCount {
             }
             None => self.without = self.without.saturating_add(1),
         }
+        Ok(())
     }
 
     fn close(&mut self, _deadline: &Deadline, _check_every: u64) -> Result<(), SearchError> {
@@ -374,9 +397,14 @@ impl Agg for AddedCount {
         Ok(())
     }
 
-    fn doc(&mut self, doc: DocId) {
+    fn doc(
+        &mut self,
+        doc: DocId,
+        _deadline: &Deadline,
+        _check_every: u64,
+    ) -> Result<(), SearchError> {
         let Some(t) = self.col.as_ref().and_then(|c| c.first(doc)) else {
-            return;
+            return Ok(());
         };
         // Bucket i holds [bounds[i], bounds[i + 1]): the number of boundaries <= t, minus one.
         let after = self.bounds.partition_point(|b| *b <= t);
@@ -390,6 +418,7 @@ impl Agg for AddedCount {
                 *n = n.saturating_add(1);
             }
         }
+        Ok(())
     }
 
     fn close(&mut self, _deadline: &Deadline, _check_every: u64) -> Result<(), SearchError> {
@@ -426,6 +455,21 @@ pub(crate) fn groups_with_cap(
     let total = scan(engine, &req.exclude, deadline, check_every, &mut [&mut g])?;
     let held = g.by_value.len();
     Ok((g.ranked(req.top_groups, total), held))
+}
+
+/// Includes the peak allocated ordinal-counter capacity, not just the final distinct-value map (tests).
+#[cfg(test)]
+pub(crate) fn groups_with_cap_and_ordinal_capacity(
+    engine: &Engine,
+    req: &StatsRequest,
+    deadline: &Deadline,
+    check_every: u64,
+    cap: usize,
+) -> Result<(Ranked, usize), SearchError> {
+    let mut g = StrCount::with_cap("group", cap);
+    let total = scan(engine, &req.exclude, deadline, check_every, &mut [&mut g])?;
+    let capacity = g.peak_ordinal_capacity;
+    Ok((g.ranked(req.top_groups, total), capacity))
 }
 
 /// Resolution, source, family and top years in one pass.

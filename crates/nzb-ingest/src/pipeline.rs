@@ -4,7 +4,7 @@
 //! candidate, staged upload file, or in-memory bytes) on a bounded queue and awaits the
 //! [`IngestOutcome`]. Workers run [`Pipeline::process`].
 //!
-//! Ingest at scale (T114, ARCHITECTURE 5): `workers` tasks read, hash, parse, categorize and
+//! Ingest at scale (T114, ARCHITECTURE v3 5): `workers` tasks read, hash, parse, categorize and
 //! store the blob of each job in parallel; one **commit-group writer** then commits up to
 //! `group_max_jobs` prepared jobs (or what arrived within `group_window`) in ONE transaction
 //! ([`nzb_store::LibraryRepo::insert_release_group`]) and finishes each job afterwards (source
@@ -32,8 +32,10 @@
 //!
 //! File names are display data: destination names are `<UTC stamp>-<sha8>` only (SEC-005).
 
+use futures_util::FutureExt as _;
 use nzb_store::prelude::*;
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -45,7 +47,7 @@ use nzb_core::{
 };
 use nzb_store::{
     CategorySource, GroupItem, GroupOutcome, IngestLogEntry, LogOutcome, LogSource, NewRelease,
-    NzbStore, SceneColumns, Store, StoreError, Uploader,
+    NfoAttach, NzbStore, SceneColumns, Store, StoreError, Uploader,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -55,6 +57,7 @@ use crate::failure;
 use crate::fsops::{self, Loaded};
 use crate::rules::WatchRules;
 use crate::scanner::Candidate;
+use crate::sidecar;
 use crate::timefmt::{utc_stamp, utc_year};
 
 /// Capacity of the bounded job queue of [`Pipeline::spawn_workers`] (`INGEST_SPEC` §Backpressure);
@@ -64,18 +67,18 @@ pub const QUEUE_CAP: usize = 64;
 pub const MAX_QUEUE_CAP: usize = 8192;
 /// Hard ceiling of `ingest.workers` (parallel parse).
 pub const MAX_WORKERS: usize = 32;
-/// Default in-flight byte budget (`ingest.max_inflight_bytes`, PERFORMANCE 7.3: 256 MiB at ~1M).
+/// Default in-flight byte budget (`ingest.max_inflight_bytes`, PERFORMANCE v3 7.3: 256 MiB at ~1M).
 pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
-/// Default jobs per commit group (ARCHITECTURE 5).
+/// Default jobs per commit group (ARCHITECTURE v3 5).
 pub const DEFAULT_GROUP_MAX_JOBS: usize = 256;
-/// Default time a commit group waits for more prepared jobs (ARCHITECTURE 5).
+/// Default time a commit group waits for more prepared jobs (ARCHITECTURE v3 5).
 pub const DEFAULT_GROUP_WINDOW: Duration = Duration::from_millis(50);
 /// Default writer hold cap of one group on SQLite (review 34 L5: ~50 ms).
 pub const DEFAULT_WRITER_HOLD: Duration = Duration::from_millis(50);
 /// Budget unit: permits are KiB, so a 512 MiB budget fits a `u32` permit count.
 const BUDGET_UNIT: u64 = 1024;
 
-/// Throughput and memory settings of [`Pipeline::spawn`] (`[ingest]`, ARCHITECTURE 5, T114).
+/// Throughput and memory settings of [`Pipeline::spawn`] (`[ingest]`, ARCHITECTURE v3 5, T114).
 #[derive(Debug, Clone, Copy)]
 pub struct IngestSettings {
     /// Parallel prepare tasks (read, hash, parse, categorize, blob put); clamped to 1..=[`MAX_WORKERS`].
@@ -172,7 +175,7 @@ pub struct PipelineConfig {
 
 /// A retry-class failure of the same watch path is logged once per this many attempts.
 const RETRY_LOG_EVERY: u32 = 10;
-/// A watch file whose processing panics this many times is quarantined (bounded retry).
+/// Panics before quarantining a watch file whose validated read identity is still available.
 const MAX_PANICS: u32 = 3;
 /// Bound on the in-memory per-path attempt table.
 const MAX_TRACKED_PATHS: usize = 4096;
@@ -285,7 +288,8 @@ impl Job {
     /// Bytes this job will read: what it takes from the in-flight budget.
     fn size_hint(&self) -> u64 {
         match &self.payload {
-            Payload::Watch(c) => c.size,
+            // The NFO sidecar (T141) is read after the commit while the permits are still held.
+            Payload::Watch(c) => c.size.saturating_add(crate::sidecar::size_hint(&c.path)),
             Payload::Staged(p) => std::fs::symlink_metadata(p).map_or(0, |m| m.len()),
             Payload::Bytes(b) => u64::try_from(b.len()).unwrap_or(u64::MAX),
             Payload::Import(f) => f.size,
@@ -337,9 +341,9 @@ impl Job {
     }
 
     /// The submitting account or API key (default: unattributed, as for the watch folder). The
-    /// store re-validates it in the transaction that writes the row: a key revoked or an owner
-    /// disabled while the body streamed is refused with [`IngestError::UploaderRefused`] and
-    /// nothing is written.
+    /// store re-validates it in the transaction that writes the row: a session expired/revoked,
+    /// a key revoked or an owner disabled while the body streamed is refused with
+    /// [`IngestError::UploaderRefused`] and nothing is written.
     #[must_use]
     pub fn with_uploader(mut self, uploader: Uploader) -> Self {
         self.uploader = uploader;
@@ -461,6 +465,8 @@ pub(crate) enum CrashPoint {
     /// The group writer is about to open the group transaction (every blob is durable).
     BeforeGroupCommit,
     AfterCommit,
+    /// The watch-folder NFO sidecar was attached (T141); neither it nor the NZB is disposed yet.
+    AfterNfoAttach,
     /// Failure path: the source is in `failed/`, no `reason.json` yet.
     AfterQuarantineMove,
     /// `reason.json` written to its tmp name, not yet renamed.
@@ -493,6 +499,9 @@ struct Inner {
     /// Test fault: the next multi-job group fails as a whole once (review 38 L5).
     #[cfg(test)]
     fail_next_group: std::sync::atomic::AtomicBool,
+    /// Test fault: every group transaction holding this release panics.
+    #[cfg(test)]
+    panic_on_commit: std::sync::Mutex<Option<Sha256>>,
 }
 
 /// Test hook: called at each [`CrashPoint`]; `true` simulates the process dying right there.
@@ -512,6 +521,29 @@ struct Ctx {
     ident: Option<fsops::SourceIdent>,
     /// Test-only: an injected crash happened; skip failure handling (a dead process does none).
     crashed: bool,
+    /// A blocking step (read, parse) or the job's own commit panicked: counted like a panicking
+    /// job, so a validated watch source is quarantined after [`MAX_PANICS`].
+    panicked: bool,
+}
+
+/// The result of a blocking task of a job; a panic in it marks the job as panicked (see
+/// [`Ctx::panicked`]), so hostile input whose identity was validated can be quarantined.
+fn joined<T>(r: Result<T, tokio::task::JoinError>, ctx: &mut Ctx) -> Result<T, IngestError> {
+    r.map_err(|e| {
+        ctx.panicked |= e.is_panic();
+        IngestError::Internal
+    })
+}
+
+/// The outcome of a group transaction of exactly one job.
+fn committed_one(res: Result<Vec<GroupOutcome>, StoreError>) -> Committed {
+    match res {
+        Ok(mut v) if v.len() == 1 => v
+            .pop()
+            .map_or(Committed::Failed(IngestError::Internal), Committed::from),
+        Ok(_) => Committed::Failed(IngestError::Internal),
+        Err(e) => Committed::Failed(uploader_error(e)),
+    }
 }
 
 impl Pipeline {
@@ -593,6 +625,8 @@ impl Pipeline {
                 hook: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 fail_next_group: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                panic_on_commit: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -680,7 +714,7 @@ impl Pipeline {
             let Some(Queued { job, reply }) = next else {
                 break;
             };
-            // Bytes before the read (ARCHITECTURE 5.2): waits while the budget is spent.
+            // Bytes before the read (ARCHITECTURE v3 5.2): waits while the budget is spent.
             let want = u32::try_from(job.size_hint().div_ceil(BUDGET_UNIT))
                 .unwrap_or(u32::MAX)
                 .clamp(1, total.max(1));
@@ -711,11 +745,11 @@ impl Pipeline {
                     drop(permit);
                     let _ = reply.send(r);
                 }
-                // A panic inside a job must not kill the worker; it is handled like any other
-                // failure (INTERNAL, bounded retry, then quarantine).
+                // A panic inside a job must not kill the worker. The read identity did not
+                // survive this task, so a watch source must remain in place for scanner backoff.
                 Err(_) => {
                     drop(permit);
-                    let _ = reply.send(Err(self.fail_panicked(&meta).await));
+                    let _ = reply.send(Err(self.fail_panicked(&meta, None, None).await));
                 }
             }
             self.inner.in_prep.fetch_sub(1, Ordering::SeqCst);
@@ -758,7 +792,7 @@ impl Pipeline {
                     let q = p.clone();
                     let r = match tokio::spawn(async move { q.finish(ready, c).await }).await {
                         Ok(r) => r,
-                        Err(_) => Err(p.fail_panicked(&meta).await),
+                        Err(_) => Err(p.fail_panicked(&meta, None, None).await),
                     };
                     if let Some(tx) = reply {
                         let _ = tx.send(r);
@@ -867,6 +901,11 @@ impl Pipeline {
             job.discard();
             return e;
         }
+        if ctx.panicked {
+            return self
+                .fail_panicked(&job.meta(), ctx.sha, ctx.ident.take())
+                .await;
+        }
         if !ctx.crashed {
             self.fail(&job.meta(), ctx.sha, ctx.ident.take(), &e, 0)
                 .await;
@@ -875,8 +914,10 @@ impl Pipeline {
     }
 
     /// Step 6 for a group: one transaction ([`nzb_store::LibraryRepo::insert_release_group`]).
-    /// When the whole group fails (not one job: I/O, a lost connection, a deadlock), each job is
-    /// retried alone, so one bad job never fails the others (ARCHITECTURE 5).
+    /// When the whole group fails (not one job: I/O, a lost connection, a deadlock) or panics, each
+    /// job is retried alone, so one bad job never fails the others (ARCHITECTURE v3 5). A job whose own
+    /// transaction panics is counted like a panicking job (quarantined after [`MAX_PANICS`]) instead
+    /// of taking the writer, and with it the process, down.
     pub(crate) async fn commit(
         &self,
         mut group: Vec<Ready>,
@@ -892,47 +933,76 @@ impl Pipeline {
             }
             return group.into_iter().map(|r| (r, Committed::Crashed)).collect();
         }
+        let outcomes = self.commit_outcomes(&mut group, hold).await;
+        group.into_iter().zip(outcomes).collect()
+    }
+
+    /// The outcome of each job of `group`, in order (see [`Pipeline::commit`]).
+    async fn commit_outcomes(&self, group: &mut [Ready], hold: Duration) -> Vec<Committed> {
         let now = self.now();
         self.inner
             .counters
             .commit_groups
             .fetch_add(1, Ordering::Relaxed);
-        let outcomes = {
+        let whole = {
             let items: Vec<GroupItem<'_>> = group.iter().map(|r| r.item(now)).collect();
-            self.insert_group(&items, hold).await
+            self.insert_caught(&items, hold).await
         };
-        let outcomes = match outcomes {
-            Ok(v) if v.len() == group.len() => v.into_iter().map(Committed::from).collect(),
-            Ok(_) => group
-                .iter()
-                .map(|_| Committed::Failed(IngestError::Internal))
-                .collect(),
-            Err(e) if group.len() == 1 => vec![Committed::Failed(uploader_error(e))],
-            Err(e) => {
-                tracing::warn!(
-                    jobs = group.len(),
-                    error = %e,
-                    "commit group failed; committing its jobs one by one"
-                );
-                let mut one_by_one = Vec::with_capacity(group.len());
-                for r in &group {
-                    let item = [r.item(now)];
-                    let c = match self.inner.db.insert_release_group(&item, hold).await {
-                        Ok(mut v) if v.len() == 1 => v
-                            .pop()
-                            .map_or(Committed::Failed(IngestError::Internal), Committed::from),
-                        Ok(_) => Committed::Failed(IngestError::Internal),
-                        Err(e) => Committed::Failed(uploader_error(e)),
-                    };
-                    one_by_one.push(c);
-                }
-                one_by_one
+        match whole {
+            Some(Ok(v)) if v.len() == group.len() => {
+                return v.into_iter().map(Committed::from).collect();
             }
-        };
-        group.into_iter().zip(outcomes).collect()
+            Some(Ok(_)) => {
+                return group
+                    .iter()
+                    .map(|_| Committed::Failed(IngestError::Internal))
+                    .collect();
+            }
+            Some(Err(e)) if group.len() == 1 => return vec![Committed::Failed(uploader_error(e))],
+            Some(Err(e)) => tracing::warn!(
+                jobs = group.len(),
+                error = %e,
+                "commit group failed; committing its jobs one by one"
+            ),
+            None => tracing::error!(
+                jobs = group.len(),
+                "commit group panicked; committing its jobs one by one"
+            ),
+        }
+        let mut one_by_one = Vec::with_capacity(group.len());
+        for r in group.iter_mut() {
+            let res = {
+                // A failed group may have waited for a database lock. Recheck credentials with
+                // a fresh injected wall-clock value for each retry, rather than its old timestamp.
+                let item = [r.item(self.now())];
+                self.insert_caught(&item, hold).await
+            };
+            one_by_one.push(res.map_or_else(
+                || {
+                    r.ctx.panicked = true;
+                    Committed::Failed(IngestError::Internal)
+                },
+                committed_one,
+            ));
+        }
+        one_by_one
     }
 
-    /// One group transaction (the test build can make a multi-job group fail as a whole once).
+    /// [`Pipeline::insert_group`] with a panic contained: `None` when it panicked (an unfinished
+    /// transaction is rolled back when it is dropped).
+    async fn insert_caught(
+        &self,
+        items: &[GroupItem<'_>],
+        hold: Duration,
+    ) -> Option<Result<Vec<GroupOutcome>, StoreError>> {
+        AssertUnwindSafe(self.insert_group(items, hold))
+            .catch_unwind()
+            .await
+            .ok()
+    }
+
+    /// One group transaction (the test build can make a multi-job group fail as a whole once, or
+    /// panic).
     async fn insert_group(
         &self,
         items: &[GroupItem<'_>],
@@ -944,6 +1014,13 @@ impl Pipeline {
                 "injected group failure",
             )));
         }
+        #[cfg(test)]
+        if let Some(sha) = self.inner.panic_on_commit.lock().ok().and_then(|g| *g)
+            && items.iter().any(|i| i.new.analysis.sha256 == sha)
+        {
+            #[allow(clippy::panic)] // the injected fault itself
+            std::panic::panic_any("injected commit panic");
+        }
         self.inner.db.insert_release_group(items, hold).await
     }
 
@@ -951,6 +1028,14 @@ impl Pipeline {
     #[cfg(test)]
     pub(crate) fn fail_next_group(&self) {
         self.inner.fail_next_group.store(true, Ordering::SeqCst);
+    }
+
+    /// Test fault injection: every group transaction holding `sha` panics.
+    #[cfg(test)]
+    pub(crate) fn panic_on_commit(&self, sha: Sha256) {
+        if let Ok(mut g) = self.inner.panic_on_commit.lock() {
+            *g = Some(sha);
+        }
     }
 
     /// Step 7 of a committed (or refused) job: source removal, counters, outcome.
@@ -966,11 +1051,30 @@ impl Pipeline {
             Committed::Crashed | Committed::Deferred => Err(IngestError::Internal),
             Committed::Failed(e) => Err(e),
             Committed::Inserted(release_id) => {
-                if let Err(e) = self.crash(CrashPoint::AfterCommit, &mut ctx) {
+                let sha = st.analysis.sha256;
+                let disposed = async {
+                    self.crash(CrashPoint::AfterCommit, &mut ctx)?;
+                    // T141: the sidecar is attached in its own transaction after the release commit and
+                    // before any source is touched, so a crash in between re-processes the NZB as a
+                    // duplicate, which attaches it then (INGEST_SPEC §NFO sidecar).
+                    let sc = self
+                        .attach_sidecar(&job, release_id, sha, ctx.ident.as_ref())
+                        .await;
+                    self.crash(CrashPoint::AfterNfoAttach, &mut ctx)?;
+                    // Only now are the sources disposable: the sidecar first, so a crash before the NZB
+                    // is removed leaves the NZB (re-processed as a duplicate), never an orphan sidecar.
+                    let fate = NzbFate::Removed {
+                        dir: &self.inner.cfg.failed_dir,
+                        sha,
+                    };
+                    self.dispose_sidecar(sc, fate).await;
+                    self.remove_source(&job, ctx.ident.as_ref()).await;
+                    Ok::<(), IngestError>(())
+                }
+                .await;
+                if let Err(e) = disposed {
                     Err(e)
                 } else {
-                    // Only now is the source disposable.
-                    self.remove_source(&job, ctx.ident.as_ref()).await;
                     let inner = &self.inner;
                     inner.counters.ingested_ok.fetch_add(1, Ordering::Relaxed);
                     inner
@@ -1029,7 +1133,12 @@ impl Pipeline {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if g.len() > MAX_TRACKED_PATHS {
-            g.clear();
+            // Retry-only entries go first, so a flood of failing files cannot reset the panic
+            // count that quarantines a panicking one.
+            g.retain(|_, a| a.panics > 0);
+            if g.len() > MAX_TRACKED_PATHS {
+                g.clear();
+            }
         }
         f(&mut g)
     }
@@ -1041,17 +1150,28 @@ impl Pipeline {
     }
 
     /// A job panicked: log it as `INTERNAL` and count it; the third panic of the same watch
-    /// path quarantines the file so it cannot loop forever.
-    async fn fail_panicked(&self, meta: &JobMeta) -> IngestError {
+    /// path quarantines the file only when its validated read identity is still available.
+    async fn fail_panicked(
+        &self,
+        meta: &JobMeta,
+        sha: Option<Sha256>,
+        ident: Option<fsops::SourceIdent>,
+    ) -> IngestError {
         let panics = meta.path.as_ref().map_or(MAX_PANICS, |p| {
             self.attempts_mut(|m| {
+                // A flood of panicking paths cannot be tracked individually (the table would be
+                // reset); a path that would overflow it is eligible for immediate quarantine
+                // when its read identity is available.
+                if m.len() >= MAX_TRACKED_PATHS && !m.contains_key(p) {
+                    return MAX_PANICS;
+                }
                 let a = m.entry(p.clone()).or_default();
                 a.panics = a.panics.saturating_add(1);
                 a.panics
             })
         });
         tracing::error!("ingest job panicked");
-        self.fail(meta, None, None, &IngestError::Internal, panics)
+        self.fail(meta, sha, ident, &IngestError::Internal, panics)
             .await;
         IngestError::Internal
     }
@@ -1097,7 +1217,7 @@ impl Pipeline {
     }
 
     /// Step 1: bounded read + hash, off the async threads.
-    async fn load(&self, job: &mut Job) -> Result<Loaded, IngestError> {
+    async fn load(&self, job: &mut Job, ctx: &mut Ctx) -> Result<Loaded, IngestError> {
         let max = self.inner.cfg.limits.max_file_bytes;
         match &mut job.payload {
             Payload::Bytes(b) => {
@@ -1105,7 +1225,7 @@ impl Pipeline {
                     return Err(IngestError::FileTooLarge);
                 }
                 let bytes = std::mem::take(b);
-                tokio::task::spawn_blocking(move || {
+                let r = tokio::task::spawn_blocking(move || {
                     let sha = fsops::digest(&bytes);
                     Loaded {
                         bytes,
@@ -1113,24 +1233,25 @@ impl Pipeline {
                         ident: None,
                     }
                 })
-                .await
-                .map_err(|_| IngestError::Internal)
+                .await;
+                joined(r, ctx)
             }
             Payload::Staged(path) => {
                 let path = path.clone();
-                tokio::task::spawn_blocking(move || fsops::read_source(&path, max, None, None))
-                    .await
-                    .map_err(|_| IngestError::Internal)?
+                let r =
+                    tokio::task::spawn_blocking(move || fsops::read_source(&path, max, None, None))
+                        .await;
+                joined(r, ctx)?
             }
             Payload::Watch(c) => {
                 let path = c.path.clone();
                 let id = c.id.clone();
                 let root = self.inner.cfg.watch_dir.clone();
-                tokio::task::spawn_blocking(move || {
+                let r = tokio::task::spawn_blocking(move || {
                     fsops::read_source(&path, max, Some(&id), Some(&root))
                 })
-                .await
-                .map_err(|_| IngestError::Internal)?
+                .await;
+                joined(r, ctx)?
             }
             Payload::Import(f) => {
                 // The descriptor was opened by the walk (no-follow, regular file); read it once.
@@ -1139,9 +1260,10 @@ impl Pipeline {
                     .try_clone()
                     .map_err(|_| IngestError::SourceUnreadable)?;
                 let size = f.size;
-                tokio::task::spawn_blocking(move || fsops::read_opened(file, size, max, || {}))
-                    .await
-                    .map_err(|_| IngestError::Internal)?
+                let r =
+                    tokio::task::spawn_blocking(move || fsops::read_opened(file, size, max, || {}))
+                        .await;
+                joined(r, ctx)?
             }
         }
     }
@@ -1188,14 +1310,14 @@ impl Pipeline {
         let inner = &self.inner;
         self.apply_watch_rules(job);
         // Step 1: bounded read + SHA-256.
-        let mut loaded = self.load(job).await?;
+        let mut loaded = self.load(job, ctx).await?;
         let sha = loaded.sha;
         ctx.sha = Some(sha);
         ctx.ident.clone_from(&loaded.ident);
 
         // Step 2: already indexed? An uploader that is no longer usable learns nothing about the
         // library either (N9): validated before the duplicate answer as well as in the insert.
-        if let Err(e) = inner.db.validate_uploader(&job.uploader).await {
+        if let Err(e) = inner.db.validate_uploader(&job.uploader, self.now()).await {
             return Err(uploader_error(e));
         }
         if let Some(row) = inner.db.get_release_by_sha(&sha.to_hex()).await? {
@@ -1225,12 +1347,12 @@ impl Pipeline {
         let limits = inner.cfg.limits;
         let deadline = Instant::now() + limits.parse_deadline;
         let bytes = std::mem::take(&mut loaded.bytes);
-        let (bytes, analysed) = tokio::task::spawn_blocking(move || {
+        let r = tokio::task::spawn_blocking(move || {
             let r = analyze(&bytes, &limits, deadline);
             (bytes, r)
         })
-        .await
-        .map_err(|_| IngestError::Internal)?;
+        .await;
+        let (bytes, analysed) = joined(r, ctx)?;
         loaded.bytes = bytes;
         let mut analysis = analysed?;
         if analysis.sha256 != sha {
@@ -1340,7 +1462,11 @@ impl Pipeline {
                 .await?;
         }
         match &job.payload {
-            Payload::Watch(_) => self.dispose_watch_duplicate(job, sha, ident).await,
+            Payload::Watch(_) => {
+                // T141: a known NZB may still bring the NFO its release lacks (D41 b: only while it has none).
+                let sc = self.attach_sidecar(job, release_id, sha, ident).await;
+                self.dispose_watch_duplicate(job, sha, ident, sc).await;
+            }
             // Uploads: acknowledge without keeping a second copy.
             Payload::Staged(_) => self.remove_source(job, ident).await,
             Payload::Bytes(_) | Payload::Import(_) => {}
@@ -1364,15 +1490,21 @@ impl Pipeline {
         job: &Job,
         sha: Sha256,
         ident: Option<&fsops::SourceIdent>,
+        sc: Option<SidecarState>,
     ) {
         let inner = &self.inner;
         let delete = inner.cfg.duplicates_action == DuplicatesAction::Delete
             // Never delete unless the identical blob is confirmed present.
             && matches!(inner.store.exists(&sha).await, Ok(true));
         if delete {
+            let fate = NzbFate::Removed {
+                dir: &inner.cfg.duplicates_dir,
+                sha,
+            };
+            self.dispose_sidecar(sc, fate).await;
             self.remove_source(job, ident).await;
         } else if let Some(path) = job.path() {
-            let _ = self
+            let dest = self
                 .move_to(
                     path,
                     &inner.cfg.duplicates_dir.clone(),
@@ -1381,6 +1513,160 @@ impl Pipeline {
                     false,
                 )
                 .await;
+            if let Some(dest) = dest {
+                self.dispose_sidecar(sc, NzbFate::MovedTo(&dest)).await;
+            }
+        }
+    }
+
+    /// Examines the NFO sidecar of the watch NZB `nzb` (read with identity `nzb_ident`) relative to its verified
+    /// directory (T141, review 54 L1). `None` when there is none, or when it is refused for anything but its size
+    /// (logged with the stable code and the Debug-escaped name, never content): such a file is never touched.
+    async fn examine_sidecar(
+        &self,
+        nzb: &Path,
+        nzb_ident: &fsops::SourceIdent,
+    ) -> Option<(SidecarState, bool)> {
+        let (path, root, dev_ino) = (
+            nzb.to_path_buf(),
+            self.inner.cfg.watch_dir.clone(),
+            nzb_ident.dev_ino(),
+        );
+        let probed = tokio::task::spawn_blocking(move || {
+            let (dir, name) = sidecar::open_dir(&path, dev_ino, &root)?;
+            let p = sidecar::probe(&dir, &name);
+            Ok::<_, &'static str>((dir, p))
+        })
+        .await
+        .ok()?;
+        let nzb_name = shown(nzb);
+        match probed {
+            Err(code) => {
+                tracing::warn!(code, nzb = %nzb_name, "watch NFO sidecar not looked for");
+                None
+            }
+            Ok((_, sidecar::Probe::Absent)) => None,
+            Ok((_, sidecar::Probe::Refused(code))) => {
+                tracing::warn!(code, nzb = %nzb_name, "watch NFO sidecar not attached; left in place");
+                None
+            }
+            Ok((dir, sidecar::Probe::Unattachable(e, code))) => {
+                tracing::warn!(code, file = ?e.name, "watch NFO sidecar not attached");
+                Some((
+                    SidecarState {
+                        dir,
+                        e,
+                        stored: false,
+                    },
+                    false,
+                ))
+            }
+            Ok((dir, sidecar::Probe::Ready(e))) => Some((
+                SidecarState {
+                    dir,
+                    e,
+                    stored: false,
+                },
+                true,
+            )),
+        }
+    }
+
+    /// Finds and reads the NFO sidecar of a watch-folder job and attaches it to `release_id` (T141). `None` when
+    /// the job is not a watch file or has no sidecar it may touch; the NZB is unaffected either way.
+    async fn attach_sidecar(
+        &self,
+        job: &Job,
+        release_id: i64,
+        sha: Sha256,
+        nzb_ident: Option<&fsops::SourceIdent>,
+    ) -> Option<SidecarState> {
+        let Payload::Watch(c) = &job.payload else {
+            return None;
+        };
+        let (mut sc, attachable) = self.examine_sidecar(&c.path, nzb_ident?).await?;
+        let (Some(bytes), true) = (&sc.e.bytes, attachable) else {
+            return Some(sc);
+        };
+        let file = format!("{:?}", sc.e.name);
+        let db = &self.inner.db;
+        sc.stored = match db
+            .attach_watch_nfo(release_id, &sha, bytes, self.now())
+            .await
+        {
+            Ok(NfoAttach::Attached) => {
+                tracing::info!(file = %file, "watch NFO sidecar attached");
+                true
+            }
+            Ok(NfoAttach::AlreadyPresent) => {
+                // Removable only when the database already holds these very bytes (a re-run after a crash).
+                let same = matches!(
+                    db.release_nfo(release_id).await,
+                    Ok(Some(n)) if &n.bytes == bytes
+                );
+                tracing::info!(
+                    code = "NFO_EXISTS",
+                    same,
+                    file = %file,
+                    "the release already has an NFO; watch sidecar not attached"
+                );
+                same
+            }
+            Err(e) => {
+                tracing::warn!(
+                    code = "NFO_STORE_FAILED",
+                    error = %e,
+                    file = %file,
+                    "watch NFO sidecar not attached"
+                );
+                false
+            }
+        };
+        Some(sc)
+    }
+
+    /// The sidecar follows its NZB (T141): next to it when the NZB was moved (`failed/`, `duplicates/`, exactly the
+    /// NZB's generated stem with `.nfo`, never a counter); when the NZB was removed, the sidecar is removed only if
+    /// the database holds its bytes, else it is moved into `dir` as exactly `<stamp>-<sha8>.nfo` (BETA: move, don't
+    /// delete). Every step is relative to the verified directory and re-checks the examined identity; a taken name
+    /// or a changed file leaves the sidecar where it is.
+    async fn dispose_sidecar(&self, sc: Option<SidecarState>, fate: NzbFate<'_>) {
+        let Some(sc) = sc else { return };
+        let (dest_dir, dest_name, remove) = match fate {
+            NzbFate::MovedTo(dest) => {
+                let (Some(dir), Some(stem)) =
+                    (dest.parent(), dest.file_stem().and_then(|s| s.to_str()))
+                else {
+                    return;
+                };
+                (dir.to_path_buf(), format!("{stem}.nfo"), false)
+            }
+            NzbFate::Removed { dir, sha } => (
+                dir.to_path_buf(),
+                format!("{}-{}.nfo", utc_stamp(self.now()), sha.short()),
+                sc.stored,
+            ),
+        };
+        let file = format!("{:?}", sc.e.name);
+        let dest_shown = format!("{dest_name:?}");
+        let res = tokio::task::spawn_blocking(move || {
+            if remove {
+                sidecar::remove(&sc.dir, &sc.e.name, &sc.e.id, || {})
+            } else {
+                sidecar::move_to(&sc.dir, &sc.e, &dest_dir, &dest_name, || {})
+            }
+        })
+        .await;
+        match res {
+            Ok(sidecar::Outcome::Removed) => {}
+            // Review 54 I2: an unattached NFO is findable by its generated name (no input in it).
+            Ok(sidecar::Outcome::Moved) => {
+                tracing::info!(file = %file, dest = %dest_shown, "watch NFO sidecar moved");
+            }
+            Ok(sidecar::Outcome::Left(code)) => {
+                tracing::warn!(code, file = %file, "watch NFO sidecar left in place");
+            }
+            Err(_) => tracing::error!("sidecar task failed"),
         }
     }
 
@@ -1456,10 +1742,11 @@ impl Pipeline {
         }
     }
 
-    /// Failure bookkeeping: counters, `ingest_log(failed)`, and the source per [`Disposition`]
-    /// (rejects are moved to `failed/` and get a `reason.json`, see [`crate::failure`]). Retry-class failures of the same watch path are logged
-    /// once per [`RETRY_LOG_EVERY`] attempts (a stuck file must not flood the log table);
-    /// `panics` is the number of panics seen for the path (quarantine at [`MAX_PANICS`]).
+    /// Failure bookkeeping: counters, `ingest_log(failed)`, and the source per [`Disposition`].
+    /// Watch rejects with a validated identity are moved to `failed/` and get a `reason.json`
+    /// (see [`crate::failure`]). Retry-class failures and unvalidated watch sources are logged once
+    /// per [`RETRY_LOG_EVERY`] attempts, so a stuck file cannot flood the log table.
+    /// `panics` counts panics for this path (eligible for quarantine at [`MAX_PANICS`]).
     async fn fail(
         &self,
         meta: &JobMeta,
@@ -1472,11 +1759,15 @@ impl Pipeline {
             return;
         }
         let inner = &self.inner;
+        // A failed read may never have validated the scanner's source identity (for example,
+        // growth past the size cap). Do not acquire authority over whatever now occupies that
+        // watch path. Staged uploads are service-owned and still need failure cleanup.
         let quarantine = meta.staged
             || (meta.path.is_some()
+                && ident.is_some()
                 && (err.disposition() == Disposition::Reject || panics >= MAX_PANICS));
         if !quarantine
-            && panics == 0
+            && (panics == 0 || ident.is_none())
             && let Some(p) = &meta.path
         {
             let n = self.attempts_mut(|m| {
@@ -1520,6 +1811,12 @@ impl Pipeline {
             tracing::error!(error = %e, "cannot write ingest_log");
         }
         if quarantine && let Some(path) = &meta.path {
+            // T141: a watch NZB's sidecar is examined while the NZB still sits next to it (its directory is
+            // proven by the NZB's inode), then follows it into `failed/` (never attached: no release).
+            let sc = match (&ident, meta.staged) {
+                (Some(id), false) => self.examine_sidecar(path, id).await.map(|(sc, _)| sc),
+                _ => None,
+            };
             let dest = self
                 .move_to(
                     path,
@@ -1530,6 +1827,7 @@ impl Pipeline {
                 )
                 .await;
             if let Some(dest) = dest {
+                self.dispose_sidecar(sc, NzbFate::MovedTo(&dest)).await;
                 let reason = failure::Reason::new(
                     err.code(),
                     &err.to_string(),
@@ -1547,6 +1845,24 @@ impl Pipeline {
             }
         }
     }
+}
+
+/// The NFO sidecar of a watch job after the attach attempt (T141).
+struct SidecarState {
+    /// The NZB's verified directory (every later step is relative to it).
+    dir: sidecar::Dir,
+    /// What was examined (and read).
+    e: sidecar::Examined,
+    /// The database holds exactly these bytes for the release (so the file may be removed with the NZB).
+    stored: bool,
+}
+
+/// Where the NZB of a sidecar went.
+enum NzbFate<'a> {
+    /// Moved to this path (`failed/` or `duplicates/`).
+    MovedTo(&'a Path),
+    /// Removed from the watch folder (its bytes are in the store); an unstored sidecar goes to `dir`.
+    Removed { dir: &'a Path, sha: Sha256 },
 }
 
 /// The parsed form of a job that waits for its commit group (its bytes are already in the store).
@@ -1570,6 +1886,18 @@ pub(crate) struct Ready {
 }
 
 impl Ready {
+    /// Test access: the release hash of this job.
+    #[cfg(test)]
+    pub(crate) fn sha256(&self) -> Sha256 {
+        self.st.analysis.sha256
+    }
+
+    /// Test access: whether this job panicked (counted towards [`MAX_PANICS`]).
+    #[cfg(test)]
+    pub(crate) fn panicked(&self) -> bool {
+        self.ctx.panicked
+    }
+
     /// The job as one item of a commit group.
     fn item(&self, now: i64) -> GroupItem<'_> {
         let job = &self.job;
@@ -1744,5 +2072,149 @@ impl IngestHandle {
     #[must_use]
     pub fn queue_len(&self) -> usize {
         self.tx.max_capacity().saturating_sub(self.tx.capacity())
+    }
+}
+
+#[cfg(test)]
+mod retry_capacity_tests {
+    #![allow(clippy::unwrap_used, clippy::too_many_lines)]
+
+    use super::*;
+
+    struct FixedClock;
+
+    impl WallClock for FixedClock {
+        fn now_unix(&self) -> i64 {
+            1_700_000_000
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_tracker_saturation_quarantines_overflow_without_resetting_existing_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        let watch = directory("watch");
+        let failed = directory("failed");
+        let duplicates = directory("duplicates");
+        let store_root = directory("store");
+        let test_store = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        let pipeline = Pipeline::new(
+            PipelineConfig {
+                limits: Limits::default(),
+                watch_dir: watch.clone(),
+                failed_dir: failed.clone(),
+                duplicates_dir: duplicates,
+                duplicates_action: DuplicatesAction::Move,
+                category_from_subfolder: false,
+                failed_uploads_max_files: 0,
+                failed_uploads_max_bytes: 0,
+            },
+            test_store.store.clone(),
+            Arc::new(nzb_store::FsStore::open(&store_root).unwrap()),
+            Arc::new(FixedClock),
+        )
+        .unwrap();
+        let tracked = watch.join("tracked-0.nzb");
+        let overflow = watch.join("overflow.nzb");
+        std::fs::write(&tracked, b"original tracked file").unwrap();
+        std::fs::write(&overflow, b"original overflow file").unwrap();
+        let tracked_ident = fsops::read_source(&tracked, 1024, None, Some(&watch))
+            .unwrap()
+            .ident;
+        let overflow_ident = fsops::read_source(&overflow, 1024, None, Some(&watch))
+            .unwrap()
+            .ident;
+        assert!(tracked_ident.is_some());
+        assert!(overflow_ident.is_some());
+        // Seed only the prior observations, then exercise real failure logging and moving.
+        // Thousands of actual panics/SQL writes would add runtime without testing another path.
+        pipeline.attempts_mut(|attempts| {
+            for n in 0..MAX_TRACKED_PATHS {
+                attempts.insert(
+                    watch.join(format!("tracked-{n}.nzb")),
+                    Attempts {
+                        retries: 0,
+                        panics: 1,
+                    },
+                );
+            }
+        });
+        let meta = |path: &Path| JobMeta {
+            source: LogSource::Watch,
+            source_name: path.file_name().map(|n| n.to_string_lossy().into_owned()),
+            api_key_id: None,
+            uploader: Uploader::Unattributed,
+            path: Some(path.to_path_buf()),
+            staged: false,
+            import: false,
+        };
+        let error = pipeline
+            .fail_panicked(&meta(&overflow), None, overflow_ident)
+            .await;
+        assert_eq!(error.code(), "INTERNAL");
+        assert!(
+            !overflow.exists(),
+            "an untrackable panic must be quarantined immediately"
+        );
+        assert!(
+            tracked.exists(),
+            "existing paths retain their retry allowance"
+        );
+        pipeline.attempts_mut(|attempts| {
+            assert_eq!(attempts.len(), MAX_TRACKED_PATHS);
+            assert_eq!(attempts.get(&tracked).unwrap().panics, 1);
+            assert!(!attempts.contains_key(&overflow));
+        });
+
+        // A retry-only entry can temporarily cross the cap; pruning it must not erase the
+        // panic counters or let an already tracked file start its three attempts over.
+        let retry = watch.join("retry-only.nzb");
+        pipeline.attempts_mut(|attempts| {
+            attempts.insert(
+                retry.clone(),
+                Attempts {
+                    retries: 1,
+                    panics: 0,
+                },
+            );
+        });
+        pipeline
+            .fail_panicked(&meta(&tracked), None, tracked_ident.clone())
+            .await;
+        assert!(tracked.exists());
+        pipeline.attempts_mut(|attempts| {
+            assert_eq!(attempts.len(), MAX_TRACKED_PATHS);
+            assert_eq!(attempts.get(&tracked).unwrap().panics, 2);
+            assert!(!attempts.contains_key(&retry));
+        });
+        pipeline
+            .fail_panicked(&meta(&tracked), None, tracked_ident)
+            .await;
+        assert!(
+            !tracked.exists(),
+            "the third tracked panic still quarantines"
+        );
+        pipeline.attempts_mut(|attempts| {
+            assert_eq!(attempts.len(), MAX_TRACKED_PATHS - 1);
+            assert!(attempts.values().all(|a| a.panics == 1));
+        });
+        let entries = failure::list_failed(&failed).unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let reason = entry.reason.unwrap();
+            assert_eq!(reason.error_code, "INTERNAL");
+            let expected: &[u8] = if reason.source_name.as_deref() == Some("overflow.nzb") {
+                b"original overflow file"
+            } else {
+                assert_eq!(reason.source_name.as_deref(), Some("tracked-0.nzb"));
+                b"original tracked file"
+            };
+            assert_eq!(std::fs::read(failed.join(entry.name)).unwrap(), expected);
+        }
+        assert_eq!(pipeline.stats().failed, 3);
     }
 }

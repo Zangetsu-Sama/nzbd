@@ -16,6 +16,226 @@ use crate::{
     LogOutcome, LogSource, NewRelease, SceneColumns, SessionStage, StoreError, Uploader,
 };
 
+#[tokio::test]
+async fn sec_060_single_release_mutations_require_current_session() {
+    let e = env().await;
+    let admin = e.admin("root").await;
+    let other = e.admin("other").await;
+    let mut actor = e.actor(admin).await;
+    // Capture the actor before logout, as a request admitted before reading its body would.
+    for (owner, hash, stage) in [
+        (admin, 10, SessionStage::Active),
+        (admin, 11, SessionStage::Active),
+        (admin, 12, SessionStage::PendingMfa),
+        (other, 13, SessionStage::Active),
+    ] {
+        let mut session = sess(owner, hash, stage, T0);
+        if hash == 11 {
+            session.expires_at = T0 + 1;
+        }
+        e.db.insert_session(&session, 10).await.unwrap();
+    }
+    e.db.delete_session(&[10; 32]).await.unwrap();
+    let id = e.release(1, &Uploader::Unattributed).await.unwrap();
+    let before = e.db.get_release(id).await.unwrap().unwrap();
+    let outbox = e.count("search_outbox", "1 = 1").await;
+    let audit = e.count("audit_log", "1 = 1").await;
+    for hash in [10, 11, 12, 13] {
+        actor.session = Some([hash; 32]);
+        let results = [
+            e.db.set_category_as(&actor, id, 5040, None, T0 + 1)
+                .await
+                .map(|_| ()),
+            e.db.set_source_label_as(&actor, id, Some("changed"), None, T0 + 1)
+                .await
+                .map(|_| ()),
+            e.db.trash_release_as(&actor, id, T0 + 1, None)
+                .await
+                .map(|_| ()),
+            e.db.trash_release_checked_as(&actor, id, &before.sha256, T0 + 1, None)
+                .await
+                .map(|_| ()),
+        ];
+        for result in results {
+            assert!(
+                matches!(result, Err(StoreError::Account(AccountError::Forbidden))),
+                "session {hash}: {result:?}"
+            );
+        }
+        assert_eq!(e.db.get_release(id).await.unwrap().unwrap(), before);
+        assert_eq!(e.db.list_trash(10).await.unwrap().len(), 0);
+        assert_eq!(e.count("search_outbox", "1 = 1").await, outbox);
+        assert_eq!(e.count("audit_log", "1 = 1").await, audit);
+    }
+    // The same expiring session remains usable one second before its boundary.
+    actor.session = Some([11; 32]);
+    e.db.set_category_as(&actor, id, 5040, None, T0)
+        .await
+        .unwrap();
+    e.db.set_source_label_as(&actor, id, Some("allowed"), None, T0)
+        .await
+        .unwrap();
+    e.db.trash_release_checked_as(&actor, id, &before.sha256, T0, None)
+        .await
+        .unwrap();
+    // CLI/internal actors intentionally have no browser session.
+    actor.session = None;
+    let legacy = e.release(2, &Uploader::Unattributed).await.unwrap();
+    e.db.trash_release_as(&actor, legacy, T0 + 1, None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sec_060_upload_revalidates_browser_session_at_commit() {
+    let e = env().await;
+    let admin = e.admin("root").await;
+    let other = e.admin("other").await;
+    for (owner, hash, stage) in [
+        (admin, 10, SessionStage::Active),
+        (admin, 11, SessionStage::Active),
+        (admin, 12, SessionStage::PendingMfa),
+        (other, 13, SessionStage::Active),
+    ] {
+        let mut session = sess(owner, hash, stage, T0);
+        if hash == 11 {
+            session.expires_at = T0 + 1;
+        }
+        e.db.insert_session(&session, 10).await.unwrap();
+    }
+    let admitted = Uploader::Session {
+        user_id: admin,
+        id_hash: [10; 32],
+    };
+    e.db.validate_uploader(&admitted, T0).await.unwrap();
+    e.db.delete_session(&[10; 32]).await.unwrap();
+    for hash in [10, 11, 12, 13] {
+        let uploader = Uploader::Session {
+            user_id: admin,
+            id_hash: [hash; 32],
+        };
+        let a = analysis(hash);
+        let new = NewRelease {
+            analysis: &a,
+            nzb_size_bytes: 1,
+            source_name: None,
+            source_label: None,
+            category_id: 8010,
+            category_source: CategorySource::Fallback,
+            meta_json: None,
+            scene: SceneColumns::default(),
+            ingested_at: T0 + 1,
+        };
+        let log = entry(&a, LogSource::UploadUi);
+        assert!(
+            matches!(
+                e.db.validate_uploader(&uploader, T0 + 1).await,
+                Err(StoreError::Account(AccountError::Forbidden))
+            ),
+            "duplicate disclosure must be refused for session {hash}"
+        );
+        assert_eq!(
+            refused(&e.db.insert_release_as(&new, Some(&log), &uploader).await),
+            Some(AccountError::Forbidden),
+            "session {hash}"
+        );
+        let outcomes =
+            e.db.insert_release_group(
+                &[crate::GroupItem { new, log, uploader }],
+                std::time::Duration::MAX,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [crate::GroupOutcome::Failed(StoreError::Account(
+                    AccountError::Forbidden
+                ))]
+            ),
+            "session {hash}: {outcomes:?}"
+        );
+    }
+    for table in ["release", "nzb_file", "search_outbox", "ingest_log"] {
+        assert_eq!(e.count(table, "1 = 1").await, 0, "{table}");
+    }
+    let live = Uploader::Session {
+        user_id: admin,
+        id_hash: [11; 32],
+    };
+    let id = e.release(20, &live).await.unwrap();
+    assert_eq!(
+        e.db.release_attribution(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .added_by,
+        Some(admin)
+    );
+    e.release(21, &Uploader::Account(admin)).await.unwrap();
+    assert_eq!(
+        format!("{live:?}"),
+        format!("Session {{ user_id: {admin}, .. }}")
+    );
+}
+
+#[tokio::test]
+async fn sec_060_upload_group_does_not_cache_session_past_expiry() {
+    let e = env().await;
+    let admin = e.admin("root").await;
+    let mut session = sess(admin, 10, SessionStage::Active, T0);
+    session.expires_at = T0 + 1;
+    e.db.insert_session(&session, 10).await.unwrap();
+    let uploader = Uploader::Session {
+        user_id: admin,
+        id_hash: [10; 32],
+    };
+    let analyses = [analysis(1), analysis(2), analysis(3)];
+    let items: Vec<_> = analyses
+        .iter()
+        .zip([T0, T0 + 1, T0])
+        .map(|(a, now)| crate::GroupItem {
+            new: NewRelease {
+                analysis: a,
+                nzb_size_bytes: 1,
+                source_name: None,
+                source_label: None,
+                category_id: 8010,
+                category_source: CategorySource::Fallback,
+                meta_json: None,
+                scene: SceneColumns::default(),
+                ingested_at: now,
+            },
+            log: entry(a, LogSource::UploadUi),
+            uploader,
+        })
+        .collect();
+    let outcomes =
+        e.db.insert_release_group(&items, std::time::Duration::MAX)
+            .await
+            .unwrap();
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [
+                crate::GroupOutcome::Inserted(_),
+                crate::GroupOutcome::Failed(StoreError::Account(AccountError::Forbidden)),
+                crate::GroupOutcome::Inserted(_),
+            ]
+        ),
+        "{outcomes:?}"
+    );
+    assert_eq!(e.count("release", "1 = 1").await, 2);
+    assert_eq!(e.count("search_outbox", "1 = 1").await, 2);
+    assert_eq!(e.count("ingest_log", "1 = 1").await, 2);
+    assert!(
+        e.db.get_release_by_sha(&analyses[1].sha256.to_hex())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn refused(r: &Result<i64, StoreError>) -> Option<AccountError> {
     match r {
         Err(StoreError::Account(e)) => Some(*e),
@@ -556,7 +776,7 @@ async fn sec_067_audit_survives_account_deletion_unchanged() {
     // The uploader acts on its own key (an uploader edits no metadata since D40).
     let (key, _h) = e.key(m, 7).await;
     assert!(
-        e.db.revoke_api_key_by(m, key, Some("192.0.2.1"), T0)
+        e.db.revoke_api_key_by(&e.actor(m).await, key, Some("192.0.2.1"), T0)
             .await
             .unwrap()
     );

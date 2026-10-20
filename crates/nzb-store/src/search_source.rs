@@ -1,4 +1,4 @@
-//! The store side of the search index (ARCHITECTURE 3.1-3.5, 13.1; T122): what the indexer, the hydrator and the
+//! The store side of the search index (ARCHITECTURE v3 3.1-3.5, 13.1; T122): what the indexer, the hydrator and the
 //! degraded browse read from the source of truth, on both backends. `nzb-search` adapts these methods to its
 //! `IndexSource`, `Hydrator` and `DegradedSource` traits on [`crate::Store`] (one adapter, error mapping in one place);
 //! the types here carry no Tantivy type.
@@ -40,7 +40,7 @@ pub struct OutboxEntry {
     pub release_id: i64,
 }
 
-/// How far the search index is behind the database (ARCHITECTURE 3.2 "Lag and backpressure", T114).
+/// How far the search index is behind the database (ARCHITECTURE v3 3.2 "Lag and backpressure", T114).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutboxLag {
     /// Outbox depth as the span of its sequence (`max(seq) - min(seq) + 1`, two primary-key probes; an upper bound

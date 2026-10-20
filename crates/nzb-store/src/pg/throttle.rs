@@ -516,11 +516,11 @@ impl PgDb {
             audit_failure(&mut tx, now, "login.password_ok", uid, "ok", ip).await?;
         } else {
             // A correct password refused by a lock or throttle is not a guess: it is not counted.
+            // A wrong one is, even when the credentials changed meanwhile (same rule as SQLite).
             if let Some(id) = uid
                 && !disabled
                 && !locked
                 && !verified
-                && !changed
             {
                 record_failure_in(&mut tx, id, ctx.ip_key, FailureKind::Password, now).await?;
             }
@@ -752,6 +752,7 @@ impl PgDb {
     /// swap commits through [`PgDb::commit_staged_recovery`].
     ///
     /// # Errors
+    /// [`StoreError::NotFound`] when the pending session of `ctx` is gone (revoked, expired);
     /// [`StoreError::OutOfRange`] for a bad key; database failure.
     #[allow(clippy::too_many_lines)] // one transaction: the order of its steps is the contract
     pub async fn confirm_totp_enrollment_v2(
@@ -765,27 +766,32 @@ impl PgDb {
         let mut tx = self.begin_account().await?;
         let row = sqlx::query(
             "SELECT username, role, totp_enabled, totp_secret_enc, enroll_token_hash, \
-             enroll_token_expires, disabled_at FROM account WHERE id = $1 AND deleted_at IS NULL",
+             enroll_token_expires, disabled_at FROM account WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         )
         .bind(c.user_id)
         .fetch_optional(&mut *tx)
         .await?;
+        let proven = if let Some(hash) = ctx.session {
+            let live: Option<bool> = sqlx::query_scalar(
+                "SELECT enroll_proven FROM session WHERE id_hash = $1 AND account_id = $2 \
+                     AND stage = 'pending_mfa' AND expires_at > $3 FOR SHARE",
+            )
+            .bind(hash.as_slice())
+            .bind(c.user_id)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await?;
+            // A revoked or expired pending session is not a wrong code: the caller must not
+            // answer it with the secret page again.
+            let Some(proven) = live else {
+                return Err(StoreError::NotFound);
+            };
+            proven
+        } else {
+            false
+        };
         let g = gate(&mut tx, c.user_id, ctx, now).await?;
         let refused = g.aggregate_refused || g.daily_refused;
-        let proven = match ctx.session {
-            Some(s) => {
-                let n: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM session WHERE id_hash = $1 AND account_id = $2 \
-                     AND stage = 'pending_mfa' AND enroll_proven",
-                )
-                .bind(s.as_slice())
-                .bind(c.user_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                n > 0
-            }
-            None => false,
-        };
         let exists = row.is_some();
         let mut pending = false;
         let mut who: Option<AuditActor> = None;

@@ -200,7 +200,14 @@ impl FsStore {
                 continue;
             }
             if let Some(sha) = parse_gc_trash_name(&entry.file_name()) {
-                let dest = self.blob_path(&sha);
+                let dest = match self.checked_blob_path(&sha) {
+                    Ok(d) => d,
+                    // A shard directory replaced by a symlink (or another non-directory): never
+                    // restore through it, and do not let one foreign entry stop the store from
+                    // opening (review 55). The scratch copy stays in `.tmp/` for the next start.
+                    Err(StoreError::Corrupt) => continue,
+                    Err(e) => return Err(e),
+                };
                 if is_regular(&dest) {
                     fs::remove_file(entry.path())?;
                 } else if entry.file_type()?.is_file()
@@ -250,7 +257,7 @@ impl FsStore {
     /// # Errors
     /// I/O errors.
     pub fn move_to_migrated(&self, sha: &Sha256) -> Result<bool, StoreError> {
-        let from = self.blob_path(sha);
+        let from = self.checked_blob_path(sha)?;
         if !is_regular(&from) {
             return Ok(false);
         }
@@ -328,8 +335,9 @@ impl FsStore {
     pub fn restore_gc_trash(&self) -> Result<usize, StoreError> {
         let mut n = 0usize;
         for (sha, _, path) in self.gc_trash_entries()? {
-            let dest = self.blob_path(&sha);
-            if is_regular(&dest) || hash_file(&path).is_ok_and(|h| h != sha) {
+            let dest = self.checked_blob_path(&sha)?;
+            // A blob that cannot be hashed is not verified, so it stays in quarantine.
+            if is_regular(&dest) || !hash_file(&path).is_ok_and(|h| h == sha) {
                 continue;
             }
             if let Some(parent) = dest.parent() {
@@ -413,6 +421,23 @@ impl FsStore {
         self.inner.root.join(a).join(b).join(format!("{hex}.{EXT}"))
     }
 
+    /// Refuses symbolic links in either shard directory, including the dedup/read paths
+    /// that do not create directories. The operator-configured root may itself be a link.
+    fn checked_blob_path(&self, sha: &Sha256) -> Result<PathBuf, StoreError> {
+        let hex = sha.to_hex();
+        let first = self.inner.root.join(hex.get(..2).unwrap_or_default());
+        let second = first.join(hex.get(2..4).unwrap_or_default());
+        for dir in [&first, &second] {
+            match fs::symlink_metadata(dir) {
+                Ok(m) if m.file_type().is_dir() => {}
+                Ok(_) => return Err(StoreError::Corrupt),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(self.blob_path(sha))
+    }
+
     #[cfg(test)]
     pub(crate) fn set_crash_point(&self, step: Option<Step>) {
         if let Ok(mut g) = self.inner.crash_at.lock() {
@@ -440,8 +465,8 @@ impl FsStore {
         if digest(bytes) != *sha {
             return Err(StoreError::HashMismatch);
         }
-        let dest = self.blob_path(sha);
-        if refresh_existing(&dest, bytes.len())? {
+        let dest = self.checked_blob_path(sha)?;
+        if refresh_existing(&dest, sha, bytes.len())? {
             return Ok(PutOutcome::AlreadyExists);
         }
         let parent = dest
@@ -493,7 +518,7 @@ impl FsStore {
     }
 
     fn get_blocking(&self, sha: &Sha256) -> Result<Vec<u8>, StoreError> {
-        let Some(mut f) = open_regular_nofollow(&self.blob_path(sha), false)? else {
+        let Some(mut f) = open_regular_nofollow(&self.checked_blob_path(sha)?, false)? else {
             return Err(StoreError::NotFound);
         };
         // Size cap before any read (T061 L-5), then a bounded read in case the file grows meanwhile.
@@ -515,7 +540,7 @@ impl FsStore {
     }
 
     fn delete_blocking(&self, sha: &Sha256) -> Result<(), StoreError> {
-        let path = self.blob_path(sha);
+        let path = self.checked_blob_path(sha)?;
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -538,7 +563,7 @@ impl FsStore {
     ) -> Result<Vec<Sha256>, StoreError> {
         Ok(shas
             .into_iter()
-            .filter(|s| !is_regular(&self.blob_path(s)))
+            .filter(|s| !self.checked_blob_path(s).is_ok_and(|p| is_regular(&p)))
             .collect())
     }
 
@@ -586,8 +611,8 @@ impl FsStore {
     /// Race safety (SEC-008): a dedup `put` may re-adopt an old unreferenced blob after the
     /// walk. `put` refreshes the blob's mtime, and GC first *renames* the blob into `.tmp/`
     /// (atomic), then re-checks mtime and `still_unreferenced`, and only then unlinks; if
-    /// either check says the blob is wanted it is renamed back. A `put` that arrives after the
-    /// rename simply writes a fresh blob.
+    /// either check says the blob is wanted its live name is restored without overwriting.
+    /// A `put` that arrives after the rename simply writes a fresh blob.
     ///
     /// # Errors
     /// I/O errors while walking or removing.
@@ -654,10 +679,30 @@ impl FsStore {
             .and_then(|m| m.modified())
             .is_ok_and(|m| m < cutoff);
         if !old_enough || !still_unreferenced(sha) {
-            fs::rename(&trash, path)?; // atomic; overwrites an identical blob a racing put wrote
+            match fs::hard_link(&trash, path) {
+                Ok(()) => fs::remove_file(&trash)?,
+                // A racing put may have repaired corrupt bytes. Never overwrite its live
+                // name with the old inode; preserve that inode in quarantine instead.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    self.move_to_gc_trash(&trash, sha)?;
+                }
+                // A filesystem without hard links (review 55): fall back to a rename over a
+                // free name, like `backup_crypto::publish_no_clobber`. The check-then-rename
+                // window is the same accepted one; a name already taken keeps the live blob.
+                Err(e) if hard_link_unsupported(&e) => {
+                    if fs::symlink_metadata(path).is_ok() {
+                        self.move_to_gc_trash(&trash, sha)?;
+                    } else {
+                        fs::rename(&trash, path)?;
+                    }
+                }
+                // Leave the scratch copy for startup recovery if restoration fails.
+                Err(e) => return Err(e.into()),
+            }
             if let Some(p) = path.parent() {
                 sync_dir(p)?;
             }
+            sync_dir(&self.inner.root.join(TMP_DIR))?;
             return Ok(Removal::Wanted);
         }
         // Quarantine, do not destroy: the blob may be the only copy of an NZB if the database
@@ -741,10 +786,12 @@ impl NzbStore for FsStore {
     }
 
     async fn exists(&self, sha: &Sha256) -> Result<bool, StoreError> {
-        let path = self.blob_path(sha);
-        tokio::task::spawn_blocking(move || is_regular(&path))
-            .await
-            .map_err(|e| join_err(&e))
+        let (this, sha) = (self.clone(), *sha);
+        tokio::task::spawn_blocking(move || {
+            this.checked_blob_path(&sha).is_ok_and(|p| is_regular(&p))
+        })
+        .await
+        .map_err(|e| join_err(&e))
     }
 
     async fn delete(&self, sha: &Sha256) -> Result<(), StoreError> {
@@ -776,9 +823,9 @@ pub(crate) fn digest(bytes: &[u8]) -> Sha256 {
 fn open_regular_nofollow(path: &Path, write: bool) -> Result<Option<File>, StoreError> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut o = OpenOptions::new();
-    o.read(!write)
+    o.read(true)
         .write(write)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC);
     match o.open(path) {
         Ok(f) => Ok(f.metadata()?.file_type().is_file().then_some(f)),
         Err(e)
@@ -791,16 +838,16 @@ fn open_regular_nofollow(path: &Path, write: bool) -> Result<Option<File>, Store
     }
 }
 
-/// Dedup path of `put`: if a blob of the right size is already in place, refresh its mtime and
-/// report `true`. The refresh protects the blob from a concurrent GC for the grace period
-/// (SEC-008); the re-check afterwards covers GC having quarantined it in between. A blob of the
-/// wrong size (truncated) is reported absent so `put` atomically rewrites it; same-size
-/// corruption is caught by [`FsStore::verify`] and by the hash check in `get`.
-fn refresh_existing(dest: &Path, len: usize) -> Result<bool, StoreError> {
-    let Some(f) = open_regular_nofollow(dest, true)? else {
+/// Dedup path of `put`: refresh only a verified blob. A damaged blob, including same-size
+/// corruption, must be atomically repaired before the caller discards its incoming copy.
+/// The refresh protects the blob from a concurrent GC for the grace period (SEC-008); the
+/// re-check afterwards covers GC having quarantined it in between.
+fn refresh_existing(dest: &Path, sha: &Sha256, len: usize) -> Result<bool, StoreError> {
+    let Some(mut f) = open_regular_nofollow(dest, true)? else {
         return Ok(false);
     };
-    if f.metadata()?.len() != u64::try_from(len).unwrap_or(u64::MAX) {
+    let len = u64::try_from(len).unwrap_or(u64::MAX);
+    if f.metadata()?.len() != len || hash_reader((&mut f).take(len.saturating_add(1)))? != *sha {
         return Ok(false);
     }
     f.set_modified(SystemTime::now())?;
@@ -809,9 +856,13 @@ fn refresh_existing(dest: &Path, len: usize) -> Result<bool, StoreError> {
 }
 
 fn hash_file(path: &Path) -> Result<Sha256, StoreError> {
-    let Some(mut f) = open_regular_nofollow(path, false)? else {
+    let Some(f) = open_regular_nofollow(path, false)? else {
         return Err(StoreError::NotFound);
     };
+    hash_reader(f)
+}
+
+fn hash_reader(mut f: impl Read) -> Result<Sha256, StoreError> {
     let mut h = Hasher::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -825,6 +876,15 @@ fn hash_file(path: &Path) -> Result<Sha256, StoreError> {
 }
 
 /// Regular file, not following symlinks.
+/// The `hard_link` errors of a filesystem that has no hard links (FAT, some FUSE and network
+/// mounts), as opposed to a real failure.
+pub(crate) fn hard_link_unsupported(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS)
+    )
+}
+
 fn is_regular(p: &Path) -> bool {
     fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file())
 }

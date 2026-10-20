@@ -6,7 +6,7 @@
 # Re-running the role bootstrap on an existing server (it is idempotent): docs/RUNBOOK.md "PostgreSQL maintenance".
 set -eu
 su_psql() {
-  PGHOST= PGHOSTADDR= psql -v ON_ERROR_STOP=1 --username postgres --no-password --no-psqlrc --dbname "$POSTGRES_DB" "$@"
+  PGHOST='' PGHOSTADDR='' psql -v ON_ERROR_STOP=1 --username postgres --no-password --no-psqlrc --dbname "$POSTGRES_DB" "$@"
 }
 for f in /etc/nzbd-pg/superuser/*.sql; do
   printf 'nzbd: running %s\n' "${f##*/}"

@@ -168,6 +168,63 @@ async fn sec_092_poison_release_is_quarantined_and_queue_continues() {
     assert_consistent(&svc, &src, "after quarantine");
 }
 
+/// Review 55: a release whose load fails every time (the outbox itself answers) must not stall the
+/// queue forever. After `MAX_STORE_ERROR_ROUNDS` failed rounds the batch is bisected with
+/// per-document loads; the rest is indexed, and the release is quarantined after `MAX_DOC_ATTEMPTS`.
+#[tokio::test]
+async fn sec_092_unloadable_release_does_not_stall_the_outbox() {
+    use crate::indexer::{MAX_DOC_ATTEMPTS, MAX_STORE_ERROR_ROUNDS};
+
+    let d = tempfile::tempdir().unwrap();
+    let src = MemSource::with(EPOCH);
+    seed(&src, 6);
+    let (svc, mut ix) = start(d.path(), &src).await;
+    ix.settle().await.unwrap();
+    {
+        let mut db = src.db();
+        for id in 1..=6 {
+            db.upsert(id, "changed");
+        }
+        db.load_error_for = Some(2);
+    }
+    // Below the threshold a source error never bisects and never quarantines.
+    for _ in 1..MAX_STORE_ERROR_ROUNDS {
+        assert!(matches!(ix.run_once().await, Err(SearchError::Store(_))));
+        assert!(src.db().quarantine.is_empty());
+        assert_eq!(src.db().outbox.len(), 6);
+    }
+    let bound = MAX_STORE_ERROR_ROUNDS * (MAX_DOC_ATTEMPTS + 2);
+    let mut rounds = 0;
+    while !src.db().outbox.is_empty() {
+        rounds += 1;
+        assert!(
+            rounds <= bound,
+            "the outbox must drain within a bounded number of rounds"
+        );
+        let _ = ix.run_once().await;
+    }
+    assert_eq!(src.db().quarantine.get(&2), Some(&QUARANTINE_DOC_BUILD));
+    assert_eq!(
+        src.db().quarantine.len(),
+        1,
+        "healthy releases are never quarantined"
+    );
+    let engine = svc.engine().unwrap();
+    let live: Vec<(i64, u64)> = engine
+        .live_versions()
+        .unwrap()
+        .into_iter()
+        .filter(|(id, _)| *id != 2)
+        .collect();
+    assert_eq!(live, [(1, 2), (3, 2), (4, 2), (5, 2), (6, 2)]);
+    assert_eq!(svc.status(), ServiceStatus::Serving);
+    // Later changes still flow.
+    src.db().load_error_for = None;
+    src.db().upsert(1, "after");
+    ix.settle().await.unwrap();
+    assert!(src.db().outbox.is_empty());
+}
+
 pub(crate) const LIVE_FAULTS: [Fault; 5] = [
     Fault::AfterRead,
     Fault::AfterLoad,
@@ -175,6 +232,195 @@ pub(crate) const LIVE_FAULTS: [Fault; 5] = [
     Fault::AfterCommit,
     Fault::AfterConsume,
 ];
+
+/// A source timeout after one chunk was queued is not a bad document or a broken index writer.
+/// Keep the committed generation available, discard all pending changes and retry the same outbox.
+#[tokio::test]
+async fn store_failure_after_first_chunk_preserves_outbox_and_recovers_without_rebuild() {
+    use crate::indexer::{LOAD_CHUNK, MAX_WRITER_FAILURES};
+
+    let d = tempfile::tempdir().unwrap();
+    let src = MemSource::with(EPOCH);
+    let count = LOAD_CHUNK + 3;
+    let last_id = i64::try_from(count).unwrap();
+    {
+        let mut db = src.db();
+        for id in 1..=last_id {
+            if id != 3 {
+                db.upsert(id, "before source failure");
+            }
+        }
+    }
+    // A large enough round really crosses the load boundary; small scan settings would only
+    // spend time repeatedly committing the seed data and do not help this failure scenario.
+    let mut config = settings();
+    config.batch = count;
+    config.scan_batch = count;
+    config.scan_commit_docs = count;
+    let svc = SearchService::new(SearchConfig::default(), Arc::new(StepClock::new(0)));
+    let mut ix = Indexer::start(
+        Arc::clone(&svc),
+        src.clone(),
+        IndexDir::open(d.path()).unwrap(),
+        config,
+    )
+    .await
+    .unwrap();
+    ix.settle().await.unwrap();
+    assert_consistent(&svc, &src, "before source failure");
+    let engine = svc.engine().unwrap();
+    let before_versions = engine.live_versions().unwrap();
+    let before_payload = engine.payload();
+    let before_generation = IndexDir::read_only(d.path()).current();
+    let pending = {
+        let mut db = src.db();
+        // All three mutation kinds are in the successful first chunk: delete 1, insert 3,
+        // replace the other rows. The timeout occurs only when loading the last three ids.
+        db.delete(1);
+        for id in 2..=last_id {
+            db.upsert(id, "changed while source is unavailable");
+        }
+        db.load_error_for = Some(last_id);
+        db.outbox.clone()
+    };
+    assert_eq!(pending.len(), count);
+    for _ in 0..=MAX_WRITER_FAILURES {
+        src.db().load_calls.clear();
+        let err = ix.run_once().await.unwrap_err();
+        assert!(
+            matches!(err, SearchError::Store(nzb_store::StoreError::Io(ref e))
+            if e.kind() == std::io::ErrorKind::TimedOut)
+        );
+        {
+            let db = src.db();
+            assert_eq!(
+                db.load_calls.len(),
+                2,
+                "a store outage must not trigger bisection"
+            );
+            assert_eq!(db.load_calls[0].0, LOAD_CHUNK);
+            assert!(
+                db.load_calls[0].1 > 0,
+                "the first chunk was actually loaded"
+            );
+            assert_eq!(db.load_calls[1], (3, 0));
+            assert_eq!(
+                db.outbox, pending,
+                "no uncommitted change may be acknowledged"
+            );
+            assert!(
+                db.quarantine.is_empty(),
+                "healthy documents must not be quarantined"
+            );
+        }
+        assert_eq!(svc.status(), ServiceStatus::Serving);
+        assert!(
+            !ix.rebuild_needed(),
+            "source failures must not exhaust the writer failure budget"
+        );
+        assert_eq!(engine.payload(), before_payload);
+        assert_eq!(engine.live_versions().unwrap(), before_versions);
+        // Looking at the old reader alone cannot prove that queued deletes/adds were discarded.
+        // A later unrelated commit must not publish any part of the failed round either.
+        engine.commit(&engine.payload()).unwrap();
+        assert_eq!(engine.live_versions().unwrap(), before_versions);
+    }
+    {
+        let mut db = src.db();
+        db.load_error_for = None;
+        db.load_calls.clear();
+        // Retry must load the latest source, rather than reuse the chunk from the failed attempt.
+        db.upsert(2, "latest value after source recovery");
+    }
+    ix.settle().await.unwrap();
+    assert_consistent(&svc, &src, "source recovered in the same process");
+    assert_eq!(IndexDir::read_only(d.path()).current(), before_generation);
+    assert!(src.db().quarantine.is_empty());
+    assert_eq!(engine.payload().max_seq, src.db().last_seq);
+    assert!(engine.live_versions().unwrap().contains(&(2, 3)));
+}
+
+/// Source failures during writer diagnosis must not turn healthy releases into poison documents.
+#[tokio::test]
+async fn store_failure_during_writer_isolation_preserves_outbox_and_discards_pending() {
+    use crate::indexer::{LOAD_CHUNK, MAX_WRITER_FAILURES};
+
+    let d = tempfile::tempdir().unwrap();
+    let src = MemSource::with(EPOCH);
+    let count = LOAD_CHUNK + 3;
+    let last_id = i64::try_from(count).unwrap();
+    seed(&src, last_id);
+    let mut config = settings();
+    config.batch = count;
+    config.scan_batch = count;
+    config.scan_commit_docs = count;
+    let svc = SearchService::new(SearchConfig::default(), Arc::new(StepClock::new(0)));
+    let mut ix = Indexer::start(
+        Arc::clone(&svc),
+        src.clone(),
+        IndexDir::open(d.path()).unwrap(),
+        config,
+    )
+    .await
+    .unwrap();
+    ix.settle().await.unwrap();
+    let engine = svc.engine().unwrap();
+    let before_versions = engine.live_versions().unwrap();
+    let before_payload = engine.payload();
+    let before_generation = IndexDir::read_only(d.path()).current();
+    let pending = {
+        let mut db = src.db();
+        db.delete(1);
+        for id in 2..=last_id {
+            db.upsert(id, "changed before writer diagnosis");
+        }
+        db.load_error_for = Some(last_id);
+        db.outbox.clone()
+    };
+
+    for _ in 0..=MAX_WRITER_FAILURES {
+        src.db().load_calls.clear();
+        // The first load succeeds, but its apply finds a lost writer. Isolation reopens it,
+        // queues the first chunk, then hits the source timeout while loading the next chunk.
+        engine.poison_writer();
+        let err = ix.run_once().await.unwrap_err();
+        assert!(
+            matches!(err, SearchError::Store(nzb_store::StoreError::Io(ref e))
+            if e.kind() == std::io::ErrorKind::TimedOut)
+        );
+        {
+            let db = src.db();
+            assert_eq!(db.load_calls.len(), 3, "source errors must stop bisection");
+            for call in &db.load_calls[..2] {
+                assert_eq!(call.0, LOAD_CHUNK);
+                assert!(call.1 > 0);
+            }
+            assert_eq!(db.load_calls[2], (3, 0));
+            assert_eq!(db.outbox, pending, "every event must remain replayable");
+            assert!(db.quarantine.is_empty(), "all source documents are healthy");
+        }
+        assert_eq!(svc.status(), ServiceStatus::Serving);
+        assert!(
+            !ix.rebuild_needed(),
+            "source errors are not writer failures"
+        );
+        assert_eq!(engine.payload(), before_payload);
+        assert_eq!(engine.live_versions().unwrap(), before_versions);
+        // Prove queued replacements and the delete did not survive the interrupted diagnosis.
+        engine.commit(&engine.payload()).unwrap();
+        assert_eq!(engine.live_versions().unwrap(), before_versions);
+    }
+
+    src.db().load_error_for = None;
+    ix.settle().await.unwrap();
+    assert_consistent(
+        &svc,
+        &src,
+        "source recovered after interrupted writer diagnosis",
+    );
+    assert!(src.db().quarantine.is_empty());
+    assert_eq!(IndexDir::read_only(d.path()).current(), before_generation);
+}
 
 pub(crate) const REBUILD_FAULTS: [Fault; 9] = [
     Fault::RebuildAfterBegin,
@@ -291,6 +537,35 @@ async fn sec_091_stale_epoch_index_is_not_served() {
     ix.settle().await.unwrap();
     assert_consistent(&svc, &src, "rebuilt");
     assert_eq!(svc.engine().unwrap().payload().epoch, [9; 16]);
+}
+
+#[tokio::test]
+async fn old_index_schema_is_rebuilt_before_being_served() {
+    let d = tempfile::tempdir().unwrap();
+    let src = MemSource::with(EPOCH);
+    seed(&src, 4);
+    {
+        let (_svc, mut ix) = start(d.path(), &src).await;
+        ix.settle().await.unwrap();
+    }
+    let meta_path = d.path().join("gen-1/meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    let mut payload: serde_json::Value =
+        serde_json::from_str(meta["payload"].as_str().unwrap()).unwrap();
+    payload["schema"] = serde_json::Value::from(crate::schema::INDEX_SCHEMA_VERSION - 1);
+    meta["payload"] = serde_json::Value::from(payload.to_string());
+    std::fs::write(meta_path, meta.to_string()).unwrap();
+    let (svc, mut ix) = start(d.path(), &src).await;
+    assert!(matches!(svc.status(), ServiceStatus::Degraded(_)));
+    assert!(svc.engine().is_err());
+    assert!(ix.rebuild_needed());
+    ix.settle().await.unwrap();
+    assert_consistent(&svc, &src, "rebuilt after index format upgrade");
+    assert_eq!(
+        svc.engine().unwrap().payload().schema,
+        crate::schema::INDEX_SCHEMA_VERSION
+    );
 }
 
 #[tokio::test]

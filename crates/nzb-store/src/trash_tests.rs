@@ -389,3 +389,48 @@ async fn sec_051_quarantine_purge_refuses_hard_linked_files() {
     assert_eq!((rep.removed, rep.skipped), (0, 1));
     assert!(kept.is_file());
 }
+
+#[tokio::test]
+async fn sec_051_quarantine_purge_checks_authority_before_the_first_file() {
+    let (dir, s) = setup();
+    let quarantine = dir.path().join("store/.gc-trash");
+    fs::create_dir(&quarantine).unwrap();
+    let (sha, bytes) = blob(13);
+    let old = quarantine.join(format!("{}.1.0.trash", sha.to_hex()));
+    fs::write(&old, &bytes).unwrap();
+    let rep = s
+        .quarantine_purge_checked(i64::MAX, None, Some(Arc::new(|| false)))
+        .await
+        .unwrap();
+    assert!(rep.aborted);
+    assert_eq!((rep.removed, rep.remaining), (0, 1));
+    assert_eq!(fs::read(old).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn sec_051_quarantine_purge_stops_when_authority_is_revoked_between_batches() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (dir, s) = setup();
+    let quarantine = dir.path().join("store/.gc-trash");
+    fs::create_dir(&quarantine).unwrap();
+    let (sha, bytes) = blob(14);
+    let batch = crate::QuarantinePurge::BATCH_SIZE;
+    for counter in 0..batch + 3 {
+        fs::write(
+            quarantine.join(format!("{}.1.{counter}.trash", sha.to_hex())),
+            &bytes,
+        )
+        .unwrap();
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let gate = Arc::new(move || observed.fetch_add(1, Ordering::SeqCst) == 0);
+    let rep = s
+        .quarantine_purge_checked(i64::MAX, None, Some(gate))
+        .await
+        .unwrap();
+    assert!(rep.aborted);
+    assert_eq!((rep.removed, rep.remaining), (batch, 3));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fs::read_dir(quarantine).unwrap().count(), 3);
+}

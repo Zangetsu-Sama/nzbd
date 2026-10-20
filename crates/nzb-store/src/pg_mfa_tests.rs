@@ -4,7 +4,7 @@
 use crate::pg::PgDb;
 #[allow(unused_imports)]
 use crate::pg::testing::{TEST_APP_PASSWORD, TestDb};
-use crate::{FactorAttempt, SecondFactor};
+use crate::{FactorAttempt, NewSession, SecondFactor, SessionStage, StoreError};
 
 async fn open() -> (TestDb, PgDb, i64) {
     let t = TestDb::new().await;
@@ -25,6 +25,125 @@ fn attempt(uid: i64, factor: SecondFactor, now: i64) -> FactorAttempt<'static> {
 }
 
 const TOKEN: [u8; 32] = [5; 32];
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn sec_024_password_change_locks_account_before_session() {
+    use sqlx::Connection;
+    use std::time::Duration;
+
+    for revoke_while_waiting in [false, true] {
+        let (t, db, uid) = open().await;
+        let old = NewSession {
+            id_hash: [80; 32],
+            user_id: uid,
+            stage: SessionStage::Active,
+            csrf_token: [9; 32],
+            now: 100,
+            expires_at: 10_000,
+            ip: None,
+            user_agent: None,
+        };
+        db.insert_session(&old, 5).await.unwrap();
+        let replacement = NewSession {
+            id_hash: [81; 32],
+            ..old.clone()
+        };
+        let mut holder = t.app_conn().await;
+        let mut observer = t.superuser_conn().await;
+        let mut mutation = holder.begin().await.unwrap();
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *mutation)
+            .await
+            .unwrap();
+        // A release mutation has locked the account and has not yet reached its session check.
+        sqlx::query("SELECT id FROM account WHERE id = $1 FOR SHARE")
+            .bind(uid)
+            .execute(&mut *mutation)
+            .await
+            .unwrap();
+        let change = db.change_password(uid, &old.id_hash, "changed", &replacement, None, 150);
+        let finish_mutation = async {
+            // Wait for an actual server lock wait, never for a guessed scheduling delay.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let waiting: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                         WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)))",
+                    )
+                    .bind(holder_pid)
+                    .fetch_one(&mut observer)
+                    .await
+                    .unwrap();
+                    if waiting {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("password change must wait for the account lock");
+            // If change_password deleted the session first, this errors immediately with 55P03:
+            // each transaction would otherwise wait for the row held by the other.
+            let live: Result<Option<i32>, _> =
+                sqlx::query_scalar("SELECT 1 FROM session WHERE id_hash = $1 FOR SHARE NOWAIT")
+                    .bind(old.id_hash.as_slice())
+                    .fetch_optional(&mut *mutation)
+                    .await;
+            assert!(
+                matches!(live, Ok(Some(1))),
+                "session locked before account: {live:?}"
+            );
+            if revoke_while_waiting {
+                sqlx::query("DELETE FROM session WHERE id_hash = $1")
+                    .bind(old.id_hash.as_slice())
+                    .execute(&mut *mutation)
+                    .await
+                    .unwrap();
+            }
+            mutation.commit().await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(change, finish_mutation)
+        })
+        .await
+        .expect("both transactions must finish");
+        if revoke_while_waiting {
+            assert!(matches!(result, Err(StoreError::NotFound)), "{result:?}");
+        } else {
+            result.unwrap();
+        }
+        let password: String =
+            sqlx::query_scalar("SELECT password_hash FROM account WHERE id = $1")
+                .bind(uid)
+                .fetch_one(db.web())
+                .await
+                .unwrap();
+        assert_eq!(
+            password,
+            if revoke_while_waiting {
+                "hash"
+            } else {
+                "changed"
+            }
+        );
+        assert!(db.get_session(&old.id_hash).await.unwrap().is_none());
+        assert_eq!(
+            db.get_session(&replacement.id_hash)
+                .await
+                .unwrap()
+                .is_some(),
+            !revoke_while_waiting
+        );
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE event = 'user.password_changed'",
+        )
+        .fetch_one(db.web())
+        .await
+        .unwrap();
+        assert_eq!(audits, i64::from(!revoke_while_waiting));
+    }
+}
 
 async fn enroll(db: &PgDb, uid: i64, step: i64, codes: &[[u8; 32]]) {
     assert!(db.set_enrollment_token(&TOKEN, 10_000, 50).await.unwrap());
@@ -104,7 +223,22 @@ async fn sec_023_recovery_code_is_single_use_and_regeneration_invalidates_old() 
             .unwrap()
     );
     assert_eq!(db.count_unused_recovery_codes(uid).await.unwrap(), 1);
-    db.replace_recovery_codes(uid, &[[3; 32]], None, 202)
+    db.insert_session(
+        &NewSession {
+            id_hash: [80; 32],
+            user_id: uid,
+            stage: SessionStage::Active,
+            csrf_token: [9; 32],
+            now: 202,
+            expires_at: 10_000,
+            ip: None,
+            user_agent: None,
+        },
+        5,
+    )
+    .await
+    .unwrap();
+    db.replace_recovery_codes(uid, &[80; 32], &[[3; 32]], None, 202)
         .await
         .unwrap();
     assert!(
@@ -384,4 +518,35 @@ async fn sec_024_strict_rotation_refuses_a_vanished_pending_session() {
     assert!(matches!(e, Err(crate::StoreError::NotFound)));
     assert!(db.get_session(&[3; 32]).await.unwrap().is_none());
     assert!(db.get_session(&[2; 32]).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn recovery_code_regeneration_is_bound_to_the_reauthenticated_session() {
+    let (_d, db, uid) = open().await;
+    enroll(&db, uid, 1, &[[1; 32]]).await;
+    // No live session: refused, and the old code keeps working.
+    let r = db
+        .replace_recovery_codes(uid, &[80; 32], &[[3; 32]], None, 150)
+        .await;
+    assert!(matches!(r, Err(StoreError::NotFound)));
+    assert_eq!(db.count_unused_recovery_codes(uid).await.unwrap(), 1);
+    db.insert_session(
+        &NewSession {
+            id_hash: [80; 32],
+            user_id: uid,
+            stage: SessionStage::Active,
+            csrf_token: [9; 32],
+            now: 150,
+            expires_at: 10_000,
+            ip: None,
+            user_agent: None,
+        },
+        5,
+    )
+    .await
+    .unwrap();
+    db.replace_recovery_codes(uid, &[80; 32], &[[3; 32], [4; 32]], None, 151)
+        .await
+        .unwrap();
+    assert_eq!(db.count_unused_recovery_codes(uid).await.unwrap(), 2);
 }

@@ -175,7 +175,7 @@ fn a_warning_gives_one_and_a_failure_gives_two() {
     assert!(text.contains("FAIL") && text.contains("failure(s)"));
 }
 
-/// T114: the index lag line (ARCHITECTURE 3.2): OK while the oldest pending change is younger than
+/// T114: the index lag line (ARCHITECTURE v3 3.2): OK while the oldest pending change is younger than
 /// `search.lag_warn_secs`, WARN past it, WARN while the scanner is paused for the lag, WARN when unreadable.
 #[test]
 fn t114_index_lag_line_warns_past_the_threshold_and_while_paused() {
@@ -648,6 +648,22 @@ fn gather_fs_on_a_healthy_tree() {
     assert_eq!(f.gc_trash, Some(0));
 }
 
+/// T141 (review 54 I6, L2): an NFO that followed its NZB into `duplicates/` is not a duplicate of its own, and an
+/// interrupted NFO sidecar removal (`.nzbd-trash.nfo.*`) counts as a leftover like any other trash name.
+#[test]
+fn t141_nfo_sidecars_are_not_duplicates_and_their_trash_is_a_leftover() {
+    let t = tree();
+    let dups = &t.cfg.paths.duplicates;
+    std::fs::write(dups.join("20231114T221320Z-0123abcd.nzb"), b"x").unwrap();
+    std::fs::write(dups.join("20231114T221320Z-0123abcd.nfo"), b"art").unwrap();
+    std::fs::write(dups.join("20231114T221320Z-0123abce.NFO"), b"art").unwrap();
+    std::fs::write(t.cfg.paths.watch.join(".nzbd-trash.nfo.1-2-3"), b"art").unwrap();
+    std::fs::write(t.cfg.paths.failed.join(".nzbd-trash.4-5-6"), b"x").unwrap();
+    let f = gather_fs(&t.cfg);
+    assert_eq!(f.duplicates.unwrap().n, 1);
+    assert_eq!(f.leftovers, 2);
+}
+
 #[test]
 fn gather_fs_never_leaves_probe_files_and_never_writes_into_watch() {
     let t = tree();
@@ -1036,7 +1052,7 @@ fn cli_without_a_database_fails_and_creates_nothing() {
 }
 
 #[test]
-fn cli_with_a_database_and_a_live_listener_reports_warnings_only() {
+fn cli_with_a_database_and_a_live_listener_reports_expected_build_diagnostics() {
     let t = tree();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let ts = rt.block_on(async {
@@ -1063,12 +1079,36 @@ fn cli_with_a_database_and_a_live_listener_reports_warnings_only() {
     use_leg_backend(&mut cfg, &ts, t.root.path());
     let (text, code) = cli_report(&cfg).unwrap();
     drop(ts);
-    // Debug build, no backup, MFA not enrolled: warnings. A small test volume may add a
-    // free-space failure, but nothing else may fail.
-    assert!(code >= 1, "{text}");
-    for l in text.lines().filter(|l| l.trim_start().starts_with("FAIL")) {
+    // Production builds report no development helpers; --all-features intentionally reports
+    // dev-tools as a security failure, including exit code 2. Neither diagnostic may disappear.
+    let build_rows: Vec<_> = text
+        .lines()
+        .filter(|l| l.contains("Build features"))
+        .collect();
+    assert_eq!(build_rows.len(), 1, "{text}");
+    let build_row = build_rows[0];
+    let expected = if cfg!(feature = "dev-tools") {
+        "FAIL Build features dev-tools compiled in"
+    } else {
+        "OK Build features no development tools"
+    };
+    assert_eq!(
+        build_row.split_whitespace().collect::<Vec<_>>().join(" "),
+        expected
+    );
+    // Debug build, no backup and MFA not enrolled yield warnings. A small test volume may
+    // additionally report low free space; every other unexpected failure must still fail the test.
+    let failures: Vec<_> = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("FAIL"))
+        .collect();
+    for l in &failures {
+        if cfg!(feature = "dev-tools") && *l == build_row {
+            continue;
+        }
         assert!(l.contains("% free"), "{l}");
     }
+    assert_eq!(code, if failures.is_empty() { 1 } else { 2 }, "{text}");
     assert!(text.contains("WARN"));
 }
 

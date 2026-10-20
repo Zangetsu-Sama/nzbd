@@ -3,12 +3,15 @@
 //! (`patch_user_prefs`, `set_page_size`) apply to the row as read under that lock, so concurrent saves of different
 //! fields never revert each other (T133 review 48 L1).
 
+//! Account-id mutation methods are for trusted internal callers; HTTP handlers use the `*_as`
+//! methods, which bind the transaction to the authenticated session as well as its account.
+
 use sqlx::Row;
 
 use crate::StoreError;
-use crate::account::{AuditActor, Role};
+use crate::account::{AccountActor, AuditActor, Role};
 use crate::pg::PgDb;
-use crate::pg::account::{require_actor, write_audit};
+use crate::pg::account::{require_actor, require_session_actor, write_audit};
 use crate::pref::{PREF_CHANGE_EVENT, PageSize, PrefColumns, PrefsPatch, UserPrefs};
 
 /// Decodes one optional Postgres `user_pref` row (`SELECT hide_xxx, theme, page_size_releases, page_size_files`).
@@ -74,8 +77,39 @@ impl PgDb {
         ip: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
+        self.patch_user_prefs_inner(actor_id, None, patch, ip, now)
+            .await
+    }
+
+    /// Session-bound form of [`Self::patch_user_prefs`]; rechecks the session in the write transaction.
+    ///
+    /// # Errors
+    /// As the trusted account-id form, plus [`crate::AccountError::Forbidden`] for a revoked, expired,
+    /// pending, or foreign session. `now` is the caller's clock at the start of this write attempt.
+    pub async fn patch_user_prefs_as(
+        &self,
+        actor: &AccountActor,
+        patch: PrefsPatch,
+        ip: Option<&str>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        self.patch_user_prefs_inner(actor.user_id, Some(actor), patch, ip, now)
+            .await
+    }
+
+    async fn patch_user_prefs_inner(
+        &self,
+        actor_id: i64,
+        actor: Option<&AccountActor>,
+        patch: PrefsPatch,
+        ip: Option<&str>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
         let mut tx = self.begin_account().await?;
-        let s = require_actor(&mut tx, actor_id, Role::Viewer).await?;
+        let s = match actor {
+            Some(a) => require_session_actor(&mut tx, a, Role::Viewer, now).await?,
+            None => require_actor(&mut tx, actor_id, Role::Viewer).await?,
+        };
         let row = sqlx::query(
             "SELECT hide_xxx, theme, page_size_releases, page_size_files FROM user_pref WHERE account_id = $1",
         )
@@ -128,8 +162,39 @@ impl PgDb {
         ip: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
+        self.set_page_size_inner(actor_id, None, size, ip, now)
+            .await
+    }
+
+    /// Session-bound form of [`Self::set_page_size`]; rechecks the session in the write transaction.
+    ///
+    /// # Errors
+    /// As the trusted account-id form, plus [`crate::AccountError::Forbidden`] for a revoked, expired,
+    /// pending, or foreign session. `now` is the caller's clock at the start of this write attempt.
+    pub async fn set_page_size_as(
+        &self,
+        actor: &AccountActor,
+        size: PageSize,
+        ip: Option<&str>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        self.set_page_size_inner(actor.user_id, Some(actor), size, ip, now)
+            .await
+    }
+
+    async fn set_page_size_inner(
+        &self,
+        actor_id: i64,
+        actor: Option<&AccountActor>,
+        size: PageSize,
+        ip: Option<&str>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
         let mut tx = self.begin_account().await?;
-        let s = require_actor(&mut tx, actor_id, Role::Viewer).await?;
+        let s = match actor {
+            Some(a) => require_session_actor(&mut tx, a, Role::Viewer, now).await?,
+            None => require_actor(&mut tx, actor_id, Role::Viewer).await?,
+        };
         let row = sqlx::query(
             "SELECT hide_xxx, theme, page_size_releases, page_size_files FROM user_pref WHERE account_id = $1",
         )

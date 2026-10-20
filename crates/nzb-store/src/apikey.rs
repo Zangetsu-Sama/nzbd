@@ -5,7 +5,9 @@
 
 use sqlx::Row;
 
-use crate::account::{AuditActor, Role, require_actor, write_audit};
+use crate::account::{
+    AccountActor, AuditActor, Role, require_actor, require_session_actor, write_audit,
+};
 use crate::{AccountError, SqliteDb, StoreError};
 
 macro_rules! key_select_sql {
@@ -269,11 +271,52 @@ impl SqliteDb {
         who: &AuditActor,
         ip: Option<&str>,
     ) -> Result<CreateKey, StoreError> {
+        self.create_key_owned(key, owner_id, None, max_active, now, who, ip)
+            .await
+    }
+
+    /// Like [`Self::create_api_key_for`] from a web session that re-authenticated: the key is only
+    /// created while `session_hash` is still a live `active` session of the owner, so a key cannot
+    /// outlive a recovery, reset or revocation that committed after the re-authentication.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] if the session is gone; otherwise as [`Self::create_api_key_for`].
+    #[allow(clippy::too_many_arguments)] // `create_api_key_for` plus the session
+    pub async fn create_api_key_for_session(
+        &self,
+        key: NewApiKey<'_>,
+        owner_id: i64,
+        session_hash: &[u8; 32],
+        max_active: u32,
+        now: i64,
+        who: &AuditActor,
+        ip: Option<&str>,
+    ) -> Result<CreateKey, StoreError> {
+        self.create_key_owned(key, owner_id, Some(session_hash), max_active, now, who, ip)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // the two public entry points above, plus the session
+    async fn create_key_owned(
+        &self,
+        key: NewApiKey<'_>,
+        owner_id: i64,
+        session_hash: Option<&[u8; 32]>,
+        max_active: u32,
+        now: i64,
+        who: &AuditActor,
+        ip: Option<&str>,
+    ) -> Result<CreateKey, StoreError> {
         let label = sanitize_label(key.label).ok_or(StoreError::InvalidLabel)?;
         let mut tx = self.begin_immediate().await?;
         require_actor(&mut tx, owner_id, Role::Uploader)
             .await
             .map_err(|_| StoreError::from(AccountError::Forbidden))?;
+        if let Some(h) = session_hash
+            && !crate::auth::session_is_live(&mut tx, h, owner_id, now).await?
+        {
+            return Err(StoreError::NotFound);
+        }
         let Some(id) = insert_key(&mut tx, key, &label, Some(owner_id), max_active, now).await?
         else {
             if instance_cap_hit(&mut tx).await? {
@@ -431,7 +474,7 @@ impl SqliteDb {
         now: i64,
         actor: Actor<'_>,
     ) -> Result<bool, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let res =
             sqlx::query("UPDATE api_key SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL")
                 .bind(now)
@@ -448,22 +491,23 @@ impl SqliteDb {
 
     /// Revokes one active key on behalf of a signed-in account (T103): the OWNER may revoke its own
     /// keys, an ADMIN any key. The actor is re-validated inside the transaction (live, enabled, at least
-    /// uploader) and the key's owner is read in the same transaction. Returns `false` when the key does not
+    /// uploader, with its calling session still active) and the key's owner is read in the same transaction.
+    /// Returns `false` when the key does not
     /// exist, was revoked already, or belongs to someone else and the actor is not an admin: the three
     /// cases are indistinguishable to the caller. An admin acting on another account's key is attributed
     /// with the owner as `target_id`.
     ///
     /// # Errors
-    /// [`AccountError::Forbidden`] when the actor is no longer a live, enabled uploader or admin.
+    /// [`AccountError::Forbidden`] when the actor or its calling session is no longer usable.
     pub async fn revoke_api_key_by(
         &self,
-        actor_id: i64,
+        actor: &AccountActor,
         id: i64,
         ip: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
         let mut tx = self.begin_immediate().await?;
-        let a = require_actor(&mut tx, actor_id, Role::Uploader).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Uploader, now).await?;
         let owner: Option<Option<i64>> =
             sqlx::query_scalar("SELECT owner_id FROM api_key WHERE id = ?1 AND revoked_at IS NULL")
                 .bind(id)

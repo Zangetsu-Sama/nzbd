@@ -487,8 +487,19 @@ fn sec_095_stats_group_merge_checks_the_deadline() {
     let req = request(&[]);
     // A real clock and a far deadline: the whole merge runs and every group is counted.
     let far = Deadline::after(Arc::new(SystemClock::new()), 60_000);
-    let g = crate::stats::groups(&engine, &req, &far, u64::MAX).unwrap();
+    let (g, allocated) = crate::stats::groups_with_cap_and_ordinal_capacity(
+        &engine,
+        &req,
+        &far,
+        u64::MAX,
+        crate::stats::MAX_DISTINCT_VALUES,
+    )
+    .unwrap();
     assert_eq!((g.distinct, g.total, g.capped), (20_000, 20_000, false));
+    assert!(
+        allocated <= 8_192,
+        "visible group cardinality must not determine ordinal allocation: {allocated}"
+    );
     // Every clock reading takes 1 ms and the budget is 3 ms. The scan reads the clock once for the segment (the
     // per-document checks never fire with `u64::MAX`), so only the checks inside the merge can hit the deadline.
     let slow = Deadline::after(Arc::new(StepClock::new(1)), 3);
@@ -548,4 +559,114 @@ fn sec_095_stats_distinct_values_are_capped() {
     // Under the cap nothing is flagged.
     let (g, held) = crate::stats::groups_with_cap(&engine, &request(&[]), &far, 1, 1_000).unwrap();
     assert_eq!((held, g.distinct, g.capped), (300, 300, false));
+}
+
+/// Hidden dictionary terms must neither allocate counters nor consume the visible distinct-value budget.
+/// Retained groups must keep receiving counts across segments and after a batch containing a discarded group.
+#[test]
+fn sec_095_stats_ordinal_memory_is_bounded_after_visibility_filtering() {
+    let batches: Vec<Vec<IndexDoc>> = (0..3)
+        .map(|s| {
+            let mut docs: Vec<IndexDoc> = (1..=512)
+                .map(|i| {
+                    release(
+                        s * 1_000 + i,
+                        6040,
+                        Some(&format!("hidden{s}-{i:03}")),
+                        None,
+                        None,
+                        None,
+                        None,
+                        T0,
+                    )
+                })
+                .collect();
+            // Visible terms sort after every hidden term, so truncating the dictionary would lose them.
+            let visible: &[Option<&str>] = match s {
+                0 => &[Some("z-alpha"), Some("z-alpha"), Some("z-beta"), None],
+                1 => &[
+                    Some("z-alpha"),
+                    Some("z-beta"),
+                    Some("z-gamma"),
+                    Some("z-alpha"),
+                    Some("z-alpha"),
+                    Some("z-beta"),
+                    Some("z-alpha"),
+                    Some("z-beta"),
+                    None,
+                ],
+                _ => &[],
+            };
+            docs.extend(visible.iter().enumerate().map(|(i, group)| {
+                release(
+                    s * 1_000 + 600 + i as i64,
+                    5040,
+                    *group,
+                    None,
+                    None,
+                    None,
+                    None,
+                    T0,
+                )
+            }));
+            docs
+        })
+        .collect();
+    let engine = crate::testkit::engine_with(&batches);
+    let far = Deadline::after(Arc::new(SystemClock::new()), 60_000);
+    let (exact, allocated) =
+        crate::stats::groups_with_cap_and_ordinal_capacity(&engine, &request(&XXX), &far, 1, 3)
+            .unwrap();
+    assert_eq!(
+        top(&exact),
+        vec![("z-alpha", 6), ("z-beta", 4), ("z-gamma", 1)]
+    );
+    assert_eq!(
+        (exact.without, exact.distinct, exact.total, exact.capped),
+        (2, 3, 13, false)
+    );
+    assert!(
+        allocated <= 16,
+        "three visible groups allocated {allocated} ordinal counters"
+    );
+
+    // With those 1,536 hidden groups now visible, the counter storage stays bounded too.
+    let (all, allocated) =
+        crate::stats::groups_with_cap_and_ordinal_capacity(&engine, &request(&[]), &far, 1, 3)
+            .unwrap();
+    assert_eq!(
+        (all.without, all.distinct, all.total, all.capped),
+        (2, 3, 1_549, true)
+    );
+    assert!(
+        allocated <= 16,
+        "visible terms allocated {allocated} ordinal counters"
+    );
+
+    let (capped, allocated) =
+        crate::stats::groups_with_cap_and_ordinal_capacity(&engine, &request(&XXX), &far, 1, 2)
+            .unwrap();
+    assert_eq!(top(&capped), vec![("z-alpha", 6), ("z-beta", 4)]);
+    assert_eq!(
+        (capped.without, capped.distinct, capped.total, capped.capped),
+        (2, 2, 13, true)
+    );
+    assert!(
+        allocated <= 16,
+        "two retained groups allocated {allocated} ordinal counters"
+    );
+
+    let (empty, allocated) = crate::stats::groups_with_cap_and_ordinal_capacity(
+        &engine,
+        &request(&[5000, 5040, 6000, 6040]),
+        &far,
+        1,
+        3,
+    )
+    .unwrap();
+    assert_eq!(empty, Ranked::default());
+    assert_eq!(
+        allocated, 0,
+        "excluded dictionary terms must allocate no ordinal counters"
+    );
 }

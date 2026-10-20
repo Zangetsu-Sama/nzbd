@@ -1,7 +1,9 @@
 //! MFA repository tests (TOTP replay floor, recovery single use, lock interplay).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use crate::{DbConfig, FactorAttempt, SecondFactor, SqliteDb};
+use crate::{
+    DbConfig, FactorAttempt, NewSession, SecondFactor, SessionStage, SqliteDb, StoreError,
+};
 
 async fn open() -> (tempfile::TempDir, SqliteDb, i64) {
     let dir = tempfile::tempdir().unwrap();
@@ -105,7 +107,22 @@ async fn sec_023_recovery_code_is_single_use_and_regeneration_invalidates_old() 
             .unwrap()
     );
     assert_eq!(db.count_unused_recovery_codes(uid).await.unwrap(), 1);
-    db.replace_recovery_codes(uid, &[[3; 32]], None, 202)
+    db.insert_session(
+        &NewSession {
+            id_hash: [80; 32],
+            user_id: uid,
+            stage: SessionStage::Active,
+            csrf_token: [9; 32],
+            now: 202,
+            expires_at: 10_000,
+            ip: None,
+            user_agent: None,
+        },
+        5,
+    )
+    .await
+    .unwrap();
+    db.replace_recovery_codes(uid, &[80; 32], &[[3; 32]], None, 202)
         .await
         .unwrap();
     assert!(
@@ -385,4 +402,35 @@ async fn sec_024_strict_rotation_refuses_a_vanished_pending_session() {
     assert!(matches!(e, Err(crate::StoreError::NotFound)));
     assert!(db.get_session(&[3; 32]).await.unwrap().is_none());
     assert!(db.get_session(&[2; 32]).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn recovery_code_regeneration_is_bound_to_the_reauthenticated_session() {
+    let (_d, db, uid) = open().await;
+    enroll(&db, uid, 1, &[[1; 32]]).await;
+    // No live session: refused, and the old code keeps working.
+    let r = db
+        .replace_recovery_codes(uid, &[80; 32], &[[3; 32]], None, 150)
+        .await;
+    assert!(matches!(r, Err(StoreError::NotFound)));
+    assert_eq!(db.count_unused_recovery_codes(uid).await.unwrap(), 1);
+    db.insert_session(
+        &NewSession {
+            id_hash: [80; 32],
+            user_id: uid,
+            stage: SessionStage::Active,
+            csrf_token: [9; 32],
+            now: 150,
+            expires_at: 10_000,
+            ip: None,
+            user_agent: None,
+        },
+        5,
+    )
+    .await
+    .unwrap();
+    db.replace_recovery_codes(uid, &[80; 32], &[[3; 32], [4; 32]], None, 151)
+        .await
+        .unwrap();
+    assert_eq!(db.count_unused_recovery_codes(uid).await.unwrap(), 2);
 }

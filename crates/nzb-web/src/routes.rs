@@ -166,6 +166,20 @@ pub const INVENTORY: &[RouteSpec] = &[
     ),
     r("POST", "/release/{id}/category", RouteClass::Session, Admin),
     r("POST", "/release/{id}/source", RouteClass::Session, Admin),
+    // NFO viewer (T140): reading is the download's role; removing is an edit (admin, D40).
+    r("GET", "/release/{id}/nfo", RouteClass::Session, Viewer),
+    r(
+        "GET",
+        "/release/{id}/nfo/download",
+        RouteClass::Session,
+        Viewer,
+    ),
+    r(
+        "POST",
+        "/release/{id}/nfo/delete",
+        RouteClass::Session,
+        Admin,
+    ),
     r("GET", "/release/{id}/delete", RouteClass::Session, Admin),
     r("POST", "/release/{id}/delete", RouteClass::Session, Admin),
     // Bulk actions (T119): edits like the single edits (admin, D40), delete like the single delete

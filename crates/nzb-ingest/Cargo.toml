@@ -11,10 +11,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# `catch_unwind` on the commit-group future: a panic there must not end the writer (already in the
+# lockfile; same version and features as nzb-web).
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 libc = "0.2"
 notify = { version = "8", default-features = false }
-nzb-core = { path = "../nzb-core", version = "0.5.1" }
-nzb-store = { path = "../nzb-store", version = "0.5.1" }
+nzb-core = { path = "../nzb-core", version = "0.6.0" }
+nzb-store = { path = "../nzb-store", version = "0.6.0" }
 # `nzbd import` (T115): a no-follow directory walk relative to directory descriptors (`openat`, `fstatat`, `Dir`)
 # through a safe API; std has no `openat`. Already in the lockfile and used by nzbd (same version and features).
 rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
@@ -32,11 +35,11 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 # Test-only: seeds quarantine rows directly (same sqlx as nzb-store, already in the lockfile).
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
-nzb-testkit = { path = "../nzb-testkit", version = "0.5.1" }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "sqlite-unlock-notify"] }
+nzb-testkit = { path = "../nzb-testkit", version = "0.6.0" }
 # The backend matrix (NZBD_TEST_BACKEND) and the Postgres test harness (T122).
-nzb-store = { path = "../nzb-store", version = "0.5.1", features = ["pg-test-support"] }
+nzb-store = { path = "../nzb-store", version = "0.6.0", features = ["pg-test-support"] }
 # T131: ingest-to-search tests through the real indexer (`SettlingIndex`); workspace crate, no new package.
-nzb-search = { path = "../nzb-search", version = "0.5.1", features = ["test-support"] }
+nzb-search = { path = "../nzb-search", version = "0.6.0", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

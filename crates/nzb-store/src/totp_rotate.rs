@@ -51,7 +51,7 @@ impl SqliteDb {
     where
         F: FnMut(i64, &[u8]) -> Reseal,
     {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let rows = sqlx::query("SELECT id, totp_secret_enc FROM account ORDER BY id")
             .fetch_all(&mut *tx)
             .await?;

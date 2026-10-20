@@ -26,7 +26,7 @@ use nzb_core::Sha256;
 use serde_json::json;
 use sqlx::{Row, SqliteConnection};
 
-use crate::account::{AccountActor, AuditActor, Role, require_actor, write_audit};
+use crate::account::{AccountActor, AuditActor, Role, require_session_actor, write_audit};
 use crate::{SqliteDb, StoreError, clean_source_label};
 
 /// Most releases one bulk request may address (two index pages of 50).
@@ -153,7 +153,7 @@ impl SqliteDb {
         }
         let ids = normalize(ids).ok_or(StoreError::NotFound)?;
         let mut tx = self.begin_immediate().await?;
-        let a = require_actor(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
         let items = load_visible(&mut tx, &ids, hidden).await?;
         let known: i64 = sqlx::query_scalar("SELECT count(*) FROM category WHERE id = ?1")
             .bind(i64::from(category_id))
@@ -164,7 +164,7 @@ impl SqliteDb {
         }
         sqlx::query(
             "UPDATE release SET category_id = ?1, category_overridden = 1, \
-             category_source = 'manual' WHERE id IN (SELECT value FROM json_each(?2))",
+             category_source = 'manual', flags = flags & ~512 WHERE id IN (SELECT value FROM json_each(?2))",
         )
         .bind(i64::from(category_id))
         .bind(json_ids(&ids))
@@ -225,7 +225,7 @@ impl SqliteDb {
         let ids = normalize(ids).ok_or(StoreError::NotFound)?;
         let clean = clean_source_label(label);
         let mut tx = self.begin_immediate().await?;
-        let a = require_actor(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
         let items = load_visible(&mut tx, &ids, hidden).await?;
         sqlx::query(
             "UPDATE release SET source_label = ?1 WHERE id IN (SELECT value FROM json_each(?2))",

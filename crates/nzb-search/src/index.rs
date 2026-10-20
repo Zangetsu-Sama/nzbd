@@ -256,6 +256,8 @@ struct EnginePage {
     has_more: bool,
     facets: Vec<(u32, u64)>,
     narrowed: bool,
+    /// Expansion is possible for this request/configuration, independent of dictionary contents.
+    expansion_bounded: bool,
     fuzzy_fallback: bool,
     stats: ExpansionStats,
     /// The count stopped at the count budget: `total` is a lower bound (Q1).
@@ -327,7 +329,7 @@ pub fn engine_search(
     })
 }
 
-/// The v3 additions to [`SearchIndex`] (ARCHITECTURE 3.5 item 4); an extension trait so the 2.x
+/// The v3 additions to [`SearchIndex`] (ARCHITECTURE v3 3.5 item 4); an extension trait so the 2.x
 /// trait stays unchanged.
 pub trait SearchIndexV3: SearchIndex {
     /// One offset page of `req` with v3 matching, facets and the narrowed/fuzzy flags.
@@ -449,6 +451,7 @@ impl<H: Hydrator> TantivyIndex<H> {
             limit,
             facets: page.facets,
             narrowed: page.narrowed,
+            expansion_bounded: page.expansion_bounded,
             fuzzy_fallback: page.fuzzy_fallback,
             dropped,
         })
@@ -532,10 +535,13 @@ fn engine_page(
 ) -> Result<EnginePage, SearchError> {
     let searcher = engine.searcher();
     let fields = engine.fields();
-    let budgets = Budgets {
+    let mut budgets = Budgets {
         terms_max: cfg.expansion_terms_max,
         postings: cfg.expansion_postings_budget,
         dict_entries: cfg.expansion_dict_entries,
+        visibility_postings: cfg
+            .expansion_postings_budget
+            .min(query::MAX_VISIBILITY_POSTINGS),
     };
     let prefix = !exact_only && cfg.prefix && req.match_mode != MatchMode::Exact;
     let fuzzy_allowed = !exact_only
@@ -545,6 +551,12 @@ fn engine_page(
             FuzzyMode::Fallback => true,
             FuzzyMode::Toggle => req.fuzzy_requested || req.match_mode == MatchMode::Fuzzy,
         };
+    let tokens = query::text_tokens(req.query.q.as_deref());
+    let expansion_bounded = tokens.iter().enumerate().any(|(i, token)| {
+        let chars = token.chars().count();
+        (prefix && i + 1 == tokens.len() && chars >= crate::config::PREFIX_MIN_CHARS)
+            || (fuzzy_allowed && chars >= crate::config::FUZZY_MIN_CHARS)
+    });
     let limit = usize::try_from(req.query.limit.clamp(1, MAX_LIMIT)).unwrap_or(1);
     let wanted = match nav {
         Nav::Offset(o) => usize::try_from(*o)
@@ -577,8 +589,13 @@ fn engine_page(
     let mut fuzzy_fallback = false;
     loop {
         let built = query::build(&searcher, fields, req, expand, budgets, deadline)?;
+        // The zero-hit fallback shares the same visibility work allowance as the first pass.
+        budgets.visibility_postings = budgets
+            .visibility_postings
+            .saturating_sub(built.stats.visibility_postings);
         let mut page = ctx.run_nav(&*built.query, nav)?;
         page.narrowed = built.narrowed;
+        page.expansion_bounded = expansion_bounded;
         page.fuzzy_fallback = fuzzy_fallback;
         page.stats = built.stats;
         if page.total == 0 && built.has_text && fuzzy_allowed && !expand.fuzzy {
@@ -832,6 +849,9 @@ fn count(
         terms_max: cfg.expansion_terms_max,
         postings: cfg.expansion_postings_budget,
         dict_entries: cfg.expansion_dict_entries,
+        visibility_postings: cfg
+            .expansion_postings_budget
+            .min(query::MAX_VISIBILITY_POSTINGS),
     };
     let expand = Expand {
         prefix: !exact && cfg.prefix && req.match_mode != MatchMode::Exact,

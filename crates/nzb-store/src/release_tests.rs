@@ -81,10 +81,36 @@ pub(crate) fn new<'a>(a: &'a Analysis) -> NewRelease<'a> {
 
 pub(crate) async fn count(db: &SqliteDb, table: &str) -> i64 {
     // Table names are literals in this test file only.
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
         .fetch_one(db.readers())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn newest_ingested_at_tracks_insertion_order_when_the_clock_moves_backwards() {
+    let (_dir, db) = open().await;
+    assert_eq!(db.newest_ingested_at().await.unwrap(), None);
+    let older = analysis(1, "Before clock correction", 1, None);
+    let newer = analysis(2, "After clock correction", 1, None);
+    let mut before = new(&older);
+    before.ingested_at = 1_700_000_100;
+    let first = db.insert_release(&before).await.unwrap();
+    let mut after = new(&newer);
+    after.ingested_at = 1_700_000_000;
+    let last = db.insert_release(&after).await.unwrap();
+    assert!(last > first);
+    // GC must regard a blob dated between these timestamps as suspicious. Taking MAX
+    // would hide that signal after an operator corrects a clock that was running ahead.
+    let newest = db.newest_ingested_at().await.unwrap().unwrap();
+    assert_eq!(newest, after.ingested_at);
+    db.delete_release(last).await.unwrap();
+    assert_eq!(
+        db.newest_ingested_at().await.unwrap(),
+        Some(before.ingested_at)
+    );
+    db.delete_release(first).await.unwrap();
+    assert_eq!(db.newest_ingested_at().await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -290,6 +316,73 @@ async fn sec_020_source_label_is_sanitized_capped_and_empty_is_null() {
     assert_eq!(db.release_totals().await.unwrap().segments, 12);
 }
 
+/// SEC-092: the SQLite outbox has the same payload-free, transactional contract as Postgres.
+#[tokio::test]
+async fn sec_092_outbox_rows_carry_no_payload() {
+    let e = crate::acct_testkit::env().await;
+    let db = e.db.clone();
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('search_outbox') ORDER BY cid")
+            .fetch_all(db.readers())
+            .await
+            .unwrap();
+    assert_eq!(cols, ["seq", "release_id", "enqueued_at"]);
+    let admin = e.admin("root").await;
+    let act = e.actor(admin).await;
+    let outbox = |db: SqliteDb| async move {
+        sqlx::query_scalar::<_, i64>("SELECT release_id FROM search_outbox ORDER BY seq")
+            .fetch_all(db.readers())
+            .await
+            .unwrap()
+    };
+    let a = analysis(1, "One", 1, None);
+    let id = db.insert_release(&new(&a)).await.unwrap();
+    assert_eq!(outbox(db.clone()).await, [id]);
+    db.set_source_label_as(&act, id, Some("lbl"), None, 2)
+        .await
+        .unwrap();
+    db.set_category_as(&act, id, 5040, None, 3).await.unwrap();
+    db.bulk_set_source_label_as(&act, &[id], "x", &[], None, 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_release(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .source_label
+            .as_deref(),
+        Some("x")
+    );
+    let version: i64 = sqlx::query_scalar("SELECT index_version FROM release WHERE id = ?1")
+        .bind(id)
+        .fetch_one(db.readers())
+        .await
+        .unwrap();
+    assert_eq!(version, 4, "each indexed change bumps index_version");
+    db.trash_release_as(&act, id, 5, None).await.unwrap();
+    assert_eq!(outbox(db.clone()).await, [id, id, id, id, id]);
+
+    let b = analysis(2, "Two", 1, None);
+    let id2 = db.insert_release(&new(&b)).await.unwrap();
+    assert!(db.set_category_as(&act, id2, 1, None, 6).await.is_err());
+    let v = e.viewer("v").await;
+    let viewer = e.actor(v).await;
+    assert!(
+        db.set_source_label_as(&viewer, id2, Some("x"), None, 6)
+            .await
+            .is_err()
+    );
+    assert!(db.insert_release(&new(&b)).await.is_err());
+    // Fail after the release insert and its trigger have run: the outbox row rolls back too.
+    let mut broken = analysis(3, "Broken", 1, None);
+    broken.files.push(file(0, "duplicate-index.mkv"));
+    assert!(db.insert_release(&new(&broken)).await.is_err());
+    assert_eq!(outbox(db.clone()).await.len(), 6);
+    db.enqueue_reindex(&[id2, 424_242]).await.unwrap();
+    assert_eq!(outbox(db).await.len(), 8);
+}
+
 /// Display rule `ui.show_xxx = false`: excluded categories vanish from the aggregates and the ingest
 /// timeline (listing pages: the search index's conformance suite).
 #[tokio::test]
@@ -322,14 +415,14 @@ async fn exclude_categories_applies_to_search_totals_and_log() {
         .await
         .unwrap();
     }
-    // A failed row without a release is always kept.
+    // A failed row without any release identity remains visible.
     db.log_ingest(
         &IngestLogEntry {
             ts: 9,
             source: LogSource::Watch,
             api_key_id: None,
             source_name: Some("bad.nzb"),
-            sha256: Some(sha(99)),
+            sha256: None,
             outcome: LogOutcome::Failed,
             error_code: Some("NZB_XML"),
             detail: None,
@@ -366,7 +459,8 @@ async fn exclude_categories_applies_to_search_totals_and_log() {
 }
 
 /// Duplicate rows carry no release id, only the sha256 of the hidden release's NZB: they must be hidden
-/// with it, while unrelated rows (and failures) stay. Both legs of the exclusion (id and sha256) are
+/// with it. Unresolved digest-bearing failures are also hidden when categories are excluded.
+/// Both legs of the exclusion (id and sha256) are
 /// probed per log row, not materialised.
 #[tokio::test]
 async fn excluded_log_hides_rows_by_release_id_and_by_sha256() {
@@ -412,7 +506,7 @@ async fn excluded_log_hides_rows_by_release_id_and_by_sha256() {
         .iter()
         .map(|r| r.ts)
         .collect();
-    assert_eq!(ts, [5, 4, 3]);
+    assert_eq!(ts, [4, 3]);
 }
 
 /// SEC-095 (degraded mode, review 30 L5, review 35 L5): on SQLite too, one page never walks more than

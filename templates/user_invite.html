@@ -7,9 +7,9 @@
 {% endif %}<form method="post" action="/admin/users/invite" autocomplete="off">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <p><label for="username">Username (1 to 64 letters, digits, . _ -)</label><br>
-<input id="username" name="username" type="text" maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false" required autofocus></p>
+<input id="username" name="username" type="text" maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false" value="{{ username }}" required autofocus></p>
 <p><label for="role">Role</label><br>
-<select id="role" name="role"><option value="viewer">Viewer</option><option value="uploader">Uploader</option></select></p>
+<select id="role" name="role"><option value="viewer"{% if !uploader %} selected{% endif %}>Viewer</option><option value="uploader"{% if uploader %} selected{% endif %}>Uploader</option></select></p>
 <p><label for="current_password">Your current password</label><br>
 <input id="current_password" name="current_password" type="password" maxlength="256" autocomplete="current-password" required></p>
 <p><label for="code">Your authenticator code</label><br>

@@ -1,4 +1,4 @@
-//! `nzbd db set-retention` (ARCHITECTURE section 9, T122). On Postgres it uses the OWNER role and runs only in the
+//! `nzbd db set-retention` (ARCHITECTURE v3 section 9, T122). On Postgres it uses the OWNER role and runs only in the
 //! one-shot `setup` service (review 30 M4: `serve` never holds the owner credential); on SQLite the policy is written
 //! with the file's own connection. (`db migrate` and `db restore` live in `dbsetup.rs`, T116.)
 

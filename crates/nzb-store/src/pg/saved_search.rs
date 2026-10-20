@@ -1,12 +1,15 @@
 //! Saved searches on Postgres (T127; same rules as the SQLite module `saved_search`): owner-scoped on every call,
 //! actor re-validated and the limit/uniqueness checked under the account-domain lock, `UNIQUE` as the backstop.
 
+//! Account-id mutation methods are for trusted internal callers. Session-backed handlers use `*_as`,
+//! which also reject a revoked, expired, pending, or foreign session inside the same transaction.
+
 use sqlx::Row;
 
 use crate::StoreError;
-use crate::account::Role;
+use crate::account::{AccountActor, Role};
 use crate::pg::PgDb;
-use crate::pg::account::require_actor;
+use crate::pg::account::{require_actor, require_session_actor};
 use crate::saved_search::{
     MAX_SAVED_SEARCHES, SavedSearch, SavedSearchError, check_filters, check_name,
 };
@@ -58,10 +61,41 @@ impl PgDb {
         filters: &str,
         now: i64,
     ) -> Result<i64, StoreError> {
+        self.create_saved_search_inner(account_id, None, name, filters, now)
+            .await
+    }
+
+    /// Session-bound form of [`Self::create_saved_search`]; checks the session inside the write transaction.
+    ///
+    /// # Errors
+    /// As the trusted account-id form, plus [`crate::AccountError::Forbidden`] for a revoked, expired,
+    /// pending, or foreign session. `now` is the caller's clock at the start of this write attempt.
+    pub async fn create_saved_search_as(
+        &self,
+        actor: &AccountActor,
+        name: &str,
+        filters: &str,
+        now: i64,
+    ) -> Result<i64, StoreError> {
+        self.create_saved_search_inner(actor.user_id, Some(actor), name, filters, now)
+            .await
+    }
+
+    async fn create_saved_search_inner(
+        &self,
+        account_id: i64,
+        actor: Option<&AccountActor>,
+        name: &str,
+        filters: &str,
+        now: i64,
+    ) -> Result<i64, StoreError> {
         check_name(name)?;
         check_filters(filters)?;
         let mut tx = self.begin_account().await?;
-        let s = require_actor(&mut tx, account_id, Role::Viewer).await?;
+        let s = match actor {
+            Some(a) => require_session_actor(&mut tx, a, Role::Viewer, now).await?,
+            None => require_actor(&mut tx, account_id, Role::Viewer).await?,
+        };
         let (n, same): (i64, i64) = sqlx::query_as(
             "SELECT count(*), count(*) FILTER (WHERE name = $2) FROM saved_search WHERE account_id = $1",
         )
@@ -100,9 +134,40 @@ impl PgDb {
         id: i64,
         name: &str,
     ) -> Result<(), StoreError> {
+        self.rename_saved_search_inner(account_id, None, id, name, 0)
+            .await
+    }
+
+    /// Session-bound form of [`Self::rename_saved_search`]; checks the session inside the write transaction.
+    ///
+    /// # Errors
+    /// As the trusted account-id form, plus [`crate::AccountError::Forbidden`] for a revoked, expired,
+    /// pending, or foreign session. `now` is the caller's clock at the start of this write attempt.
+    pub async fn rename_saved_search_as(
+        &self,
+        actor: &AccountActor,
+        id: i64,
+        name: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.rename_saved_search_inner(actor.user_id, Some(actor), id, name, now)
+            .await
+    }
+
+    async fn rename_saved_search_inner(
+        &self,
+        account_id: i64,
+        actor: Option<&AccountActor>,
+        id: i64,
+        name: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
         check_name(name)?;
         let mut tx = self.begin_account().await?;
-        let s = require_actor(&mut tx, account_id, Role::Viewer).await?;
+        let s = match actor {
+            Some(a) => require_session_actor(&mut tx, a, Role::Viewer, now).await?,
+            None => require_actor(&mut tx, account_id, Role::Viewer).await?,
+        };
         let current: Option<String> =
             sqlx::query_scalar("SELECT name FROM saved_search WHERE id = $1 AND account_id = $2")
                 .bind(id)
@@ -140,8 +205,37 @@ impl PgDb {
     /// # Errors
     /// As the SQLite twin.
     pub async fn delete_saved_search(&self, account_id: i64, id: i64) -> Result<(), StoreError> {
+        self.delete_saved_search_inner(account_id, None, id, 0)
+            .await
+    }
+
+    /// Session-bound form of [`Self::delete_saved_search`]; checks the session inside the write transaction.
+    ///
+    /// # Errors
+    /// As the trusted account-id form, plus [`crate::AccountError::Forbidden`] for a revoked, expired,
+    /// pending, or foreign session. `now` is the caller's clock at the start of this write attempt.
+    pub async fn delete_saved_search_as(
+        &self,
+        actor: &AccountActor,
+        id: i64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.delete_saved_search_inner(actor.user_id, Some(actor), id, now)
+            .await
+    }
+
+    async fn delete_saved_search_inner(
+        &self,
+        account_id: i64,
+        actor: Option<&AccountActor>,
+        id: i64,
+        now: i64,
+    ) -> Result<(), StoreError> {
         let mut tx = self.begin_account().await?;
-        let s = require_actor(&mut tx, account_id, Role::Viewer).await?;
+        let s = match actor {
+            Some(a) => require_session_actor(&mut tx, a, Role::Viewer, now).await?,
+            None => require_actor(&mut tx, account_id, Role::Viewer).await?,
+        };
         let n = sqlx::query("DELETE FROM saved_search WHERE id = $1 AND account_id = $2")
             .bind(id)
             .bind(s.id)
@@ -166,6 +260,36 @@ impl PgDb {
         id: i64,
         now: i64,
     ) -> Result<Option<SavedSearch>, StoreError> {
+        self.open_saved_search_inner(account_id, None, id, now)
+            .await
+    }
+
+    /// Session-bound form of [`Self::open_saved_search`]; checks the session inside the write transaction.
+    ///
+    /// # Errors
+    /// As the trusted account-id form, plus [`crate::AccountError::Forbidden`] for a revoked, expired,
+    /// pending, or foreign session. `now` is the caller's clock at the start of this write attempt.
+    pub async fn open_saved_search_as(
+        &self,
+        actor: &AccountActor,
+        id: i64,
+        now: i64,
+    ) -> Result<Option<SavedSearch>, StoreError> {
+        self.open_saved_search_inner(actor.user_id, Some(actor), id, now)
+            .await
+    }
+
+    async fn open_saved_search_inner(
+        &self,
+        account_id: i64,
+        actor: Option<&AccountActor>,
+        id: i64,
+        now: i64,
+    ) -> Result<Option<SavedSearch>, StoreError> {
+        let mut tx = self.begin_account().await?;
+        if let Some(a) = actor {
+            require_session_actor(&mut tx, a, Role::Viewer, now).await?;
+        }
         let row = sqlx::query(
             "WITH old AS (SELECT id, name, filters, created_at, last_seen_at FROM saved_search \
                           WHERE id = $1 AND account_id = $2 FOR UPDATE), \
@@ -176,8 +300,10 @@ impl PgDb {
         .bind(id)
         .bind(account_id)
         .bind(now)
-        .fetch_optional(self.web())
+        .fetch_optional(&mut *tx)
         .await?;
-        row.as_ref().map(from_row).transpose()
+        let found = row.as_ref().map(from_row).transpose()?;
+        tx.commit().await?;
+        Ok(found)
     }
 }

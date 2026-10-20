@@ -57,6 +57,11 @@ impl SourceIdent {
         self.size
     }
 
+    /// Device and inode.
+    pub(crate) fn dev_ino(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+
     /// Same inode and content stamps, ignoring `ctime` (which links and renames advance).
     fn same_content(&self, other: &Self) -> bool {
         self.dev == other.dev
@@ -160,11 +165,31 @@ pub(crate) fn remove_if_unchanged(path: &Path, ident: &SourceIdent) -> io::Resul
     remove_with_hook(path, ident, || {})
 }
 
+/// Hidden name of a file between the rename and the unlink of a verified removal.
+pub(crate) const TRASH_PREFIX: &str = ".nzbd-trash.";
+/// The same for an NFO sidecar (T141, review 54 L2): startup recovery moves such a leftover to `failed/` as an
+/// `.nfo`, never back into the watch folder as an NZB.
+pub(crate) const NFO_TRASH_PREFIX: &str = ".nzbd-trash.nfo.";
+
+/// [`remove_if_unchanged`] for an NFO: its interrupted unlink leaves an [`NFO_TRASH_PREFIX`] name.
+pub(crate) fn remove_nfo_if_unchanged(path: &Path, ident: &SourceIdent) -> io::Result<bool> {
+    remove_as(path, ident, NFO_TRASH_PREFIX, || {})
+}
+
 /// [`remove_if_unchanged`] with a hook between the precheck and the rename (tests swap the
 /// file there to exercise the rename-over race).
 pub(crate) fn remove_with_hook(
     path: &Path,
     ident: &SourceIdent,
+    between: impl FnOnce(),
+) -> io::Result<bool> {
+    remove_as(path, ident, TRASH_PREFIX, between)
+}
+
+fn remove_as(
+    path: &Path,
+    ident: &SourceIdent,
+    prefix: &str,
     between: impl FnOnce(),
 ) -> io::Result<bool> {
     if lstat_ident(path)?.as_ref() != Some(ident) {
@@ -173,7 +198,7 @@ pub(crate) fn remove_with_hook(
     between();
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     // Hidden, so the scanner never offers it; unique, so the rename never replaces anything.
-    let trash = dir.join(format!(".nzbd-trash.{}", unique_tag()));
+    let trash = dir.join(format!("{prefix}{}", unique_tag()));
     fs::rename(path, &trash)?;
     // The rename advanced the ctime, so compare inode, size and mtime only.
     if lstat_ident(&trash)?.is_some_and(|t| t.same_content(ident)) {
@@ -189,11 +214,45 @@ pub(crate) fn remove_with_hook(
     Ok(false)
 }
 
-fn candidate_name(stem: &str, n: u32) -> String {
+fn candidate_name(stem: &str, ext: &str, n: u32) -> String {
     if n == 0 {
-        format!("{stem}.nzb")
+        format!("{stem}.{ext}")
     } else {
-        format!("{stem}-{n}.nzb")
+        format!("{stem}-{n}.{ext}")
+    }
+}
+
+/// How a move names its destination: the extension (a constant of this crate, never input) and whether only the
+/// exact `<stem>.<ext>` is acceptable (no `-N` counter).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Naming {
+    pub(crate) ext: &'static str,
+    pub(crate) exact: bool,
+}
+
+/// An NZB under a free collision-counter name (the default of every NZB move).
+pub(crate) const NZB_NAMING: Naming = Naming {
+    ext: "nzb",
+    exact: false,
+};
+
+/// The NFO that follows its NZB (T141, review 54 L3): exactly `<the NZB's final stem>.nfo`, never a counter, so a
+/// sidecar can never drift onto another NZB's name.
+pub(crate) const NFO_EXACT: Naming = Naming {
+    ext: "nfo",
+    exact: true,
+};
+
+impl Naming {
+    fn tries(self) -> u32 {
+        if self.exact { 1 } else { MAX_NAME_TRIES }
+    }
+
+    /// Candidate `n` is usable: for an NZB also its `.nfo` twin must be free, so an NZB never lands next to a stale
+    /// NFO of the same name that `failed retry` or expiry would then carry along with it (review 54 L3).
+    fn usable(self, dest_dir: &Path, stem: &str, n: u32) -> bool {
+        self.ext != "nzb"
+            || fs::symlink_metadata(dest_dir.join(candidate_name(stem, "nfo", n))).is_err()
     }
 }
 
@@ -207,14 +266,30 @@ pub(crate) fn move_no_clobber(
     stem: &str,
     read: Option<&SourceIdent>,
 ) -> io::Result<PathBuf> {
+    move_named(src, dest_dir, stem, NZB_NAMING, read, None)
+}
+
+/// [`move_no_clobber`] with an explicit [`Naming`]; a cross-filesystem copy is refused past `copy_cap` bytes (an
+/// NFO is never copied unbounded, review 54 I5). `AlreadyExists` when an exact name is taken.
+pub(crate) fn move_named(
+    src: &Path,
+    dest_dir: &Path,
+    stem: &str,
+    naming: Naming,
+    read: Option<&SourceIdent>,
+    copy_cap: Option<u64>,
+) -> io::Result<PathBuf> {
     let Some(snapshot) = lstat_ident(src)? else {
         return Err(io::Error::other("source is not a regular file"));
     };
     if read.is_some_and(|r| !r.same_content(&snapshot)) {
         return Err(io::Error::other("source changed since it was read"));
     }
-    for n in 0..MAX_NAME_TRIES {
-        let dest = dest_dir.join(candidate_name(stem, n));
+    for n in 0..naming.tries() {
+        if !naming.usable(dest_dir, stem, n) {
+            continue;
+        }
+        let dest = dest_dir.join(candidate_name(stem, naming.ext, n));
         match fs::hard_link(src, &dest) {
             Ok(()) => {
                 // The link must point at the inode we snapshotted (a rename-over between the
@@ -229,10 +304,13 @@ pub(crate) fn move_no_clobber(
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             // EXDEV, or a filesystem without hard links (some SMB/FUSE mounts).
-            Err(_) => return copy_no_clobber(src, dest_dir, stem, read),
+            Err(_) => return copy_no_clobber(src, dest_dir, stem, naming, read, copy_cap),
         }
     }
-    Err(io::Error::other("no free destination name"))
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free destination name",
+    ))
 }
 
 /// After the hard link both names share one inode. Remove the source name with the verified
@@ -262,7 +340,9 @@ pub(crate) fn copy_no_clobber(
     src: &Path,
     dest_dir: &Path,
     stem: &str,
+    naming: Naming,
     read: Option<&SourceIdent>,
+    copy_cap: Option<u64>,
 ) -> io::Result<PathBuf> {
     let mut input = OpenOptions::new()
         .read(true)
@@ -272,6 +352,9 @@ pub(crate) fn copy_no_clobber(
     if !meta.file_type().is_file() {
         return Err(io::Error::other("source is not a regular file"));
     }
+    if copy_cap.is_some_and(|cap| meta.len() > cap) {
+        return Err(io::Error::other("too large to copy"));
+    }
     let before = SourceIdent::of(&meta);
     if read.is_some_and(|r| !r.same_content(&before)) {
         return Err(io::Error::other("source changed since it was read"));
@@ -280,10 +363,15 @@ pub(crate) fn copy_no_clobber(
     let result = (|| -> io::Result<PathBuf> {
         let mut hasher = Hasher::new();
         let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
         loop {
             let n = input.read(&mut buf)?;
             if n == 0 {
                 break;
+            }
+            total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            if copy_cap.is_some_and(|cap| total > cap) {
+                return Err(io::Error::other("too large to copy"));
             }
             let chunk = buf.get(..n).unwrap_or_default();
             hasher.update(chunk);
@@ -295,7 +383,7 @@ pub(crate) fn copy_no_clobber(
         if copied != reread || SourceIdent::of(&input.metadata()?) != before {
             return Err(io::Error::other("copy verification failed"));
         }
-        publish(&part, dest_dir, stem)
+        publish(&part, dest_dir, stem, naming)
     })();
     let _ = fs::remove_file(&part);
     let dest = result?;
@@ -308,6 +396,60 @@ pub(crate) fn copy_no_clobber(
         Err(io::Error::other(
             "source changed during copy; left in place",
         ))
+    }
+}
+
+/// What happened to the `.nfo` twin of a moved or removed `failed/` NZB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Twin {
+    /// There is no regular, singly linked `<stem>.nfo`.
+    None,
+    /// Moved (or removed) together with its NZB.
+    Done,
+    /// Left where it is (destination name taken, too large to copy, changed, I/O error).
+    Left,
+}
+
+/// The `<stem>.nfo` twin in `dir`, when it is a regular file with one link (`lstat`; `stem` is a generated failed
+/// name from the listing, never input).
+fn twin(dir: &Path, stem: &str) -> Option<(PathBuf, SourceIdent)> {
+    let path = dir.join(format!("{stem}.nfo"));
+    let m = fs::symlink_metadata(&path).ok()?;
+    (m.file_type().is_file() && m.nlink() == 1).then(|| (path, SourceIdent::of(&m)))
+}
+
+/// T141 (review 54 L3): the NFO that followed an NZB into `failed/` moves on with it (retry, expiry) to exactly
+/// `<dest_stem>.nfo`; a taken name or a copy past 256 KiB leaves it where it is.
+pub(crate) fn carry_twin(src_dir: &Path, src_stem: &str, dest_dir: &Path, dest_stem: &str) -> Twin {
+    let Some((path, ident)) = twin(src_dir, src_stem) else {
+        return Twin::None;
+    };
+    let cap = u64::try_from(nzb_core::MAX_NFO_BYTES).unwrap_or(u64::MAX);
+    match move_named(
+        &path,
+        dest_dir,
+        dest_stem,
+        NFO_EXACT,
+        Some(&ident),
+        Some(cap),
+    ) {
+        Ok(_) => Twin::Done,
+        Err(e) => {
+            tracing::warn!(error = %e.kind(), "the NFO next to a failed NZB was left in place");
+            Twin::Left
+        }
+    }
+}
+
+/// T141 (review 54 L3): the explicit purge of a failed NZB takes its `<stem>.nfo` twin with it (verified unlink with
+/// the NFO trash name), so no stale NFO stays behind under a name a later NZB could get.
+pub(crate) fn remove_twin(dir: &Path, stem: &str) -> Twin {
+    let Some((path, ident)) = twin(dir, stem) else {
+        return Twin::None;
+    };
+    match remove_nfo_if_unchanged(&path, &ident) {
+        Ok(true) => Twin::Done,
+        _ => Twin::Left,
     }
 }
 
@@ -343,9 +485,12 @@ fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
 
 /// Publishes `part` under the first free name without ever replacing a file: hard link, or
 /// (filesystems without links) an exclusive-create copy. Never `exists()` + `rename()`.
-fn publish(part: &Path, dest_dir: &Path, stem: &str) -> io::Result<PathBuf> {
-    for n in 0..MAX_NAME_TRIES {
-        let dest = dest_dir.join(candidate_name(stem, n));
+fn publish(part: &Path, dest_dir: &Path, stem: &str, naming: Naming) -> io::Result<PathBuf> {
+    for n in 0..naming.tries() {
+        if !naming.usable(dest_dir, stem, n) {
+            continue;
+        }
+        let dest = dest_dir.join(candidate_name(stem, naming.ext, n));
         match fs::hard_link(part, &dest) {
             Ok(()) => return Ok(dest),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -356,7 +501,10 @@ fn publish(part: &Path, dest_dir: &Path, stem: &str) -> io::Result<PathBuf> {
             },
         }
     }
-    Err(io::Error::other("no free destination name"))
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free destination name",
+    ))
 }
 
 /// `O_EXCL` copy: fails with `AlreadyExists` instead of clobbering. A crash mid-copy leaves a
@@ -532,7 +680,7 @@ mod tests {
         fs::write(dest.join("x.nzb"), b"existing").unwrap();
         let src = d.path().join("s.nzb");
         fs::write(&src, b"payload").unwrap();
-        let p = copy_no_clobber(&src, &dest, "x", None).unwrap();
+        let p = copy_no_clobber(&src, &dest, "x", NZB_NAMING, None, None).unwrap();
         assert_eq!(p.file_name().unwrap(), "x-1.nzb");
         assert_eq!(fs::read(dest.join("x.nzb")).unwrap(), b"existing");
         assert_eq!(fs::read(p).unwrap(), b"payload");
@@ -554,7 +702,7 @@ mod tests {
         assert_eq!(fs::read(&taken).unwrap(), b"old");
         // publish() falls through to the next free name when links are unavailable/taken.
         fs::write(d.path().join("x.nzb"), b"old").unwrap();
-        let p = publish(&part, d.path(), "x").unwrap();
+        let p = publish(&part, d.path(), "x", NZB_NAMING).unwrap();
         assert_eq!(p.file_name().unwrap(), "x-1.nzb");
         assert_eq!(fs::read(d.path().join("x.nzb")).unwrap(), b"old");
     }

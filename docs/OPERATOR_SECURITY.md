@@ -34,8 +34,10 @@ What protects your instance and what you must keep safe.
 - **What is logged.** One JSON line per event on stdout (`docker compose logs nzbd`), no cookies, API keys, passwords,
   TOTP codes or CSRF tokens, no query strings on auth routes. The audit log (login, MFA, key and category changes,
   downloads, uploads, failures) is in the database and visible on `/admin`. The proxy log filter also redacts
-  `X-Api-Key`, `X-Csrf-Token`, `Cookie`, `Authorization` and the `api_key`/`key` query parameters, so error lines
-  (for example the 502 of a cut-off oversize upload) carry `REDACTED` instead.
+  `X-Api-Key`, `X-Csrf-Token`, `Cookie`, `Authorization`, `Referer` and the whole request URI, including its path
+  and query string, so error lines (for example the 502 of a cut-off oversize upload) carry `REDACTED` instead.
+  With an existing reverse proxy, configure its access and error logs to redact these fields too: the app cannot
+  remove a secret from a request that the proxy has already logged.
 - **Backups contain** the password hash, the sealed TOTP secret and key hashes: set a backup encryption key
   (RUNBOOK section 2), or encrypt them before copying off-host. Both backends strip sessions, staged credentials, open
   invitations, recovery codes and throttle rows from every backup, and mark it restore-pending.
@@ -123,6 +125,12 @@ not used and these points replace its defaults. (Project decision D34.)
   address, nzbd sees the proxy as the client of every request: the per-IP rate limits become shared by everyone, the
   login lock keyed on (account, client address) becomes per account (anyone who reaches the login can keep you locked
   out), and a container that later takes the old address is trusted. A blank answer has the same effect permanently.
+- **Body limits, idle upstream connections and logs (T143).** Allow 321 MiB on `/upload` (a UI batch) and 65 MiB on
+  `/api/v1/nzb`; with nginx also `proxy_request_buffering off;` on `/upload`. nzbd closes a keep-alive connection idle
+  for 10 s, so the proxy must drop idle upstream connections within 8 s (Traefik:
+  `serversTransport.forwardingTimeouts.idleConnTimeout: 8s`; Caddy: `transport http { keepalive 8s }`), or some
+  requests fail with a 502. Redact the request URI, `Referer`, `Cookie`, `Authorization`, `X-Api-Key` and
+  `X-Csrf-Token` in its access and error logs.
 - **Headers middlewares.** A Traefik `headers` middleware *sets* each header it defines and so replaces nzbd's
   stricter value (`Content-Security-Policy`, the second defence against hostile NZB text, `Referrer-Policy:
   no-referrer`, `X-Frame-Options: DENY`, `Permissions-Policy`, ...). The installer pre-fills the middleware your other

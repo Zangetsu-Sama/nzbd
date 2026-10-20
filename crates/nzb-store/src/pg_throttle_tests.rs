@@ -481,6 +481,7 @@ async fn sec_066_pending_session_dies_after_five_second_factor_failures() {
             code_hash: &h,
             password_hash: "new",
             session: &s,
+            replacing: None,
         },
         &crate::RegistrationProfile {
             email: crate::pg_testkit::TEST_EMAIL,
@@ -850,6 +851,7 @@ async fn enrollment_v2_counts_per_address_and_waives_the_token_for_proven_sessio
                 code_hash: &h,
                 password_hash: "pw",
                 session: &s,
+                replacing: None,
             },
             &crate::RegistrationProfile {
                 email: crate::pg_testkit::TEST_EMAIL,

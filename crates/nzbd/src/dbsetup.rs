@@ -1,4 +1,4 @@
-//! `nzbd db migrate` and `nzbd db restore <file>` (ARCHITECTURE section 9, T116).
+//! `nzbd db migrate` and `nzbd db restore <file>` (ARCHITECTURE v3 section 9, T116).
 //!
 //! On PostgreSQL both run with the OWNER role and exist for the one-shot `setup` compose service only: that service is
 //! the only container that mounts the owner secret (`/run/setup-secrets/nzbd_db_owner_password`, review 30 M4,

@@ -1,10 +1,10 @@
-//! `nzb-search` — the v3 Tantivy search index (T113, `docs/ARCHITECTURE.md` section 2).
+//! `nzb-search` — the v3 Tantivy search index (T113, `docs/v3/ARCHITECTURE.md` section 2).
 //!
 //! Layout: [`analyzer`] (the `scene` analyzer shared by indexing and queries), [`schema`] (fields, index
 //! schema version), [`doc`] (the indexer's document builder), [`query`] (hostile request -> bounded
 //! Tantivy query), [`engine`] (one index generation: reader, single writer, commit payload).
 //!
-//! # Search index contract in v3 (ARCHITECTURE 3.5; changes to the 2.x contract of `SearchIndex`)
+//! # Search index contract in v3 (ARCHITECTURE v3 3.5; changes to the 2.x contract of `SearchIndex`)
 //! 1. **Eventual consistency:** a committed release is listed after at most one indexer cycle (target <= 2 s);
 //!    a listing never *displays* a row that is not in `release` or that is hidden for the caller (hydration
 //!    re-checks existence and the current category); a crash never leaves a release permanently unfindable
@@ -50,6 +50,8 @@ pub use index::{
 mod analyzer_tests;
 #[cfg(test)]
 mod ban_probe;
+#[cfg(test)]
+mod collect_tests;
 #[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]

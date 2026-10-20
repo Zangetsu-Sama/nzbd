@@ -146,6 +146,44 @@ pub(crate) fn is_backup_name(name: &str) -> bool {
         })
 }
 
+/// The worker owns every resource until the snapshot and cleanup finish. Dropping the caller's
+/// future only detaches its join handle: `SQLx` may continue `VACUUM INTO` after an awaiting future
+/// is cancelled, so the directory lock must not belong to that future. Filesystem work and
+/// encryption also stay off the async runtime threads. Every owned key copy zeroizes on drop.
+async fn run_backup(
+    pool: SqlitePool,
+    dir: PathBuf,
+    now: i64,
+    keep: usize,
+    key: Option<BackupKey>,
+    close_pool: bool,
+) -> Result<BackupReport, StoreError> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(async move {
+            let result = backup_pool(&pool, &dir, now, keep, key.as_ref()).await;
+            if close_pool {
+                pool.close().await;
+            }
+            result
+        })
+    })
+    .await
+    .map_err(|_| StoreError::Io(std::io::Error::other("backup worker failed")))?
+}
+
+/// Exercise the real worker with a deliberately occupied private pool, independently of the
+/// request reader pool. This keeps cancellation/locking tests deterministic without a large file.
+#[cfg(test)]
+pub(crate) async fn backup_with_pool_for_test(
+    pool: SqlitePool,
+    dir: PathBuf,
+    now: i64,
+    keep: usize,
+) -> Result<BackupReport, StoreError> {
+    run_backup(pool, dir, now, keep, None, true).await
+}
+
 /// Snapshot `pool`'s database into `dir`, then rotate to `keep` files (min 1).
 async fn backup_pool(
     pool: &SqlitePool,
@@ -154,6 +192,12 @@ async fn backup_pool(
     keep: usize,
     key: Option<&BackupKey>,
 ) -> Result<BackupReport, StoreError> {
+    // The directory inode is shared by every handle/process using this destination. Hold its
+    // advisory lock through cleanup, snapshot publication and rotation: a CLI backup must not
+    // remove the in-flight temporary snapshot of the server's maintenance task (or vice versa).
+    // No lock file is created or unlinked, so there is no stale-file or lock-inode replacement race.
+    let _lock = lock_backup_dir(dir)?;
+    clean_stale_tmp(dir)?;
     let name = backup_name(now);
     let final_name = if key.is_some() {
         format!("{name}{ENC_SUFFIX}")
@@ -181,11 +225,24 @@ async fn backup_pool(
         }
     }
     res?;
-    let rotated = rotate(dir, keep)?;
+    let rotated = rotate(dir, keep, &final_name)?;
     Ok(BackupReport {
         path: dest,
         rotated,
     })
+}
+
+pub(crate) fn lock_backup_dir(dir: &Path) -> Result<File, StoreError> {
+    let file = File::open(dir)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "another backup is using this directory",
+        )
+        .into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 async fn snapshot_and_publish(
@@ -301,8 +358,8 @@ fn open_new_0600(p: &Path) -> Result<File, StoreError> {
     Ok(o.open(p)?)
 }
 
-/// Delete all but the newest `keep` (min 1) generated-name backups.
-fn rotate(dir: &Path, keep: usize) -> Result<usize, StoreError> {
+/// Keep the published backup and the newest `keep - 1` other generated-name backups (min 1 total).
+fn rotate(dir: &Path, keep: usize, published: &str) -> Result<usize, StoreError> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -310,28 +367,39 @@ fn rotate(dir: &Path, keep: usize) -> Result<usize, StoreError> {
             continue;
         };
         // Regular files only (file_type does not follow symlinks).
-        if is_backup_name(&name) && entry.file_type()?.is_file() {
+        if name != published && is_backup_name(&name) && entry.file_type()?.is_file() {
             names.push(name);
         }
     }
-    // Fixed-width UTC timestamps sort chronologically as strings.
+    // A clock rollback must not delete the snapshot we just published. The remaining fixed-width
+    // UTC timestamps sort chronologically as strings, preserving the existing retention order.
     names.sort_unstable_by(|a, b| b.cmp(a));
     let mut removed = 0;
-    for name in names.iter().skip(keep.max(1)) {
+    for name in names.iter().skip(keep.saturating_sub(1)) {
         fs::remove_file(dir.join(name))?;
         removed += 1;
     }
     Ok(removed)
 }
 
-/// Remove stale temp files of crashed runs (exact generated pattern only).
+/// Exact temporary names created by backup, including the plaintext copy's rollback journal.
+fn is_backup_tmp_name(name: &str) -> bool {
+    let (name, journal) = name
+        .strip_suffix("-journal")
+        .map_or((name, false), |base| (base, true));
+    name.strip_prefix('.')
+        .and_then(|s| s.strip_suffix(TMP_SUFFIX))
+        .is_some_and(|base| is_backup_name(base) && (!journal || !base.ends_with(ENC_SUFFIX)))
+}
+
+/// Remove stale temp files of crashed runs (exact generated pattern only). A crash during
+/// `strip_copy` can leave old credential pages in the plaintext SQLite rollback journal, even
+/// when the intended backup was encrypted. Encrypted files themselves never have a journal.
 fn clean_stale_tmp(dir: &Path) -> Result<(), StoreError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         if let Some(n) = entry.file_name().to_str()
-            && n.strip_prefix('.')
-                .and_then(|s| s.strip_suffix(TMP_SUFFIX))
-                .is_some_and(is_backup_name)
+            && is_backup_tmp_name(n)
             && entry.file_type()?.is_file()
         {
             fs::remove_file(entry.path())?;
@@ -374,13 +442,7 @@ pub async fn backup_file_with(
                 .busy_timeout(std::time::Duration::from_secs(5)),
         )
         .await?;
-    let r = async {
-        clean_stale_tmp(dir)?;
-        backup_pool(&pool, dir, now, keep, key).await
-    }
-    .await;
-    pool.close().await;
-    r
+    run_backup(pool, dir.to_path_buf(), now, keep, key.cloned(), true).await
 }
 
 impl SqliteDb {
@@ -398,6 +460,9 @@ impl SqliteDb {
     }
 
     /// [`SqliteDb::backup`] with optional at-rest encryption (`Some(key)` writes `...sqlite.enc`).
+    /// Each admitted snapshot owns a separate connection until its worker finishes. Await this
+    /// operation when its completion is required: [`SqliteDb::close`] closes the ordinary pools,
+    /// but does not join a snapshot already in progress. An already-closed handle is refused.
     ///
     /// # Errors
     /// Database, filesystem or encryption errors.
@@ -408,8 +473,24 @@ impl SqliteDb {
         keep: usize,
         key: Option<&BackupKey>,
     ) -> Result<BackupReport, StoreError> {
-        clean_stale_tmp(dir)?;
-        backup_pool(self.readers(), dir, now, keep, key).await
+        // Preserve the closed-handle contract instead of reopening a database after shutdown.
+        if self.readers().is_closed() {
+            return Err(sqlx::Error::PoolClosed.into());
+        }
+        // Keep the exact filename and connection pragmas, but not the request pool's progress
+        // handler: a maintenance snapshot must not inherit a request's statement deadline.
+        // Lazy opening transfers ownership to the worker before any connection attempt awaits.
+        let options = self
+            .readers()
+            .connect_options()
+            .as_ref()
+            .clone()
+            .read_only(true)
+            .create_if_missing(false);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(options);
+        run_backup(pool, dir.to_path_buf(), now, keep, key.cloned(), true).await
     }
 
     /// Delete sessions whose `expires_at` is at or before `now`. Returns rows removed.

@@ -12,7 +12,7 @@ use unicode_normalization::UnicodeNormalization;
 ///
 /// ZWJ (U+200D) and ZWNJ (U+200C) stay: they are required by Indic and Persian scripts and by
 /// emoji sequences, and are not usable on their own to spoof text.
-fn is_stripped(c: char) -> bool {
+pub(crate) fn is_stripped(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

@@ -62,7 +62,11 @@ async fn tamper(e: &Env, sql: &str) {
         .execute(w)
         .await
         .unwrap();
-    sqlx::raw_sql(sql).execute(w).await.unwrap();
+    // Deliberate fixture-authored tampering, including generated row ids; no application input.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
+        .execute(w)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -324,7 +328,7 @@ async fn sec_080_audit_content_is_immutable_at_the_sql_level() {
         "actor_role = 'admin'",
         "target_id = 3",
     ] {
-        let r = sqlx::query(&format!("UPDATE audit_log SET {col}"))
+        let r = sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE audit_log SET {col}")))
             .execute(e.db.writer())
             .await;
         assert!(r.is_err(), "{col} must be refused");
@@ -505,4 +509,148 @@ async fn sec_080_anchor_line_carries_heads_and_row_count_only() {
     assert_eq!(parts.len(), 3);
     assert!(parts[0].len() == "head_log=".len() + 64 && parts[1].starts_with("head_account="));
     assert_eq!(parts[2], "rows=8");
+}
+
+const CANCELLATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Pause the SQLite worker after the first state update, while the append's SQL future is pending. Dropping
+/// the sender releases the worker even if the test panics; the timeout also bounds a lost cancellation.
+async fn pause_audit_update(
+    conn: &mut sqlx::SqliteConnection,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut entered_tx = Some(entered_tx);
+    conn.lock_handle()
+        .await
+        .unwrap()
+        .set_update_hook(move |update| {
+            if update.table == "audit_chain_state"
+                && let Some(entered) = entered_tx.take()
+            {
+                let _ = entered.send(());
+                let _ = release_rx.recv_timeout(CANCELLATION_WAIT * 3);
+            }
+        });
+    (entered_rx, release_tx)
+}
+
+fn cancellation_content(detail: &str) -> AuditContent<'_> {
+    AuditContent {
+        ts: T0,
+        actor: None,
+        event: "download",
+        detail: Some(detail),
+        ip: None,
+        actor_id: None,
+        actor_kind: None,
+        actor_role: None,
+        target_id: None,
+    }
+}
+
+#[tokio::test]
+async fn cancelled_audit_append_releases_the_writer_and_preserves_the_chain() {
+    let e = env().await;
+    seed(&e, 2).await;
+    let before = walk(&e.db).await;
+    let mut conn = e.db.writer().acquire().await.unwrap();
+    // A TEMP table proves that the same connection remains usable, rather than being silently replaced.
+    sqlx::query("CREATE TEMP TABLE audit_cancellation_connection (marker INTEGER)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let (entered, release) = pause_audit_update(&mut conn).await;
+    drop(conn);
+    let db = e.db.clone();
+    let task = tokio::spawn(async move {
+        db.audit_event(T0, None, "download", Some("cancelled"), None)
+            .await
+    });
+    tokio::time::timeout(CANCELLATION_WAIT, entered)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(
+        tokio::time::timeout(CANCELLATION_WAIT, task)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
+    release.send(()).unwrap();
+
+    // The old raw SAVEPOINT leaks an open SQLite transaction with SQLx depth zero: this BEGIN fails.
+    let mut tx = tokio::time::timeout(CANCELLATION_WAIT, e.db.begin_immediate())
+        .await
+        .unwrap()
+        .expect("a cancelled audit must not poison the pooled writer");
+    tx.lock_handle().await.unwrap().remove_update_hook();
+    sqlx::query("SELECT marker FROM audit_cancellation_connection")
+        .fetch_all(&mut *tx)
+        .await
+        .expect("the original writer connection must still be reusable");
+    tx.rollback().await.unwrap();
+    let after = walk(&e.db).await;
+    assert!(after.is_ok(), "{after:?}");
+    assert_eq!((after.rows, after.heads), (before.rows, before.heads));
+
+    e.db.audit_event(T0, None, "download", Some("after cancellation"), None)
+        .await
+        .unwrap();
+    let final_chain = walk(&e.db).await;
+    assert!(final_chain.is_ok(), "{final_chain:?}");
+    assert_eq!(final_chain.rows, before.rows + 1);
+    assert!(e.db.audit_chain_quick().await.unwrap().consistent);
+}
+
+#[tokio::test]
+async fn cancelled_nested_audit_append_preserves_the_outer_transaction() {
+    let e = env().await;
+    // Production mutations use SQLx's custom BEGIN IMMEDIATE; the inner append must remain a savepoint.
+    let mut tx = e.db.begin_immediate().await.unwrap();
+    crate::audit_chain::append(&mut tx, &cancellation_content("before"))
+        .await
+        .unwrap();
+    let (entered, release) = pause_audit_update(&mut tx).await;
+    let content = cancellation_content("cancelled");
+    {
+        let pending = crate::audit_chain::append(&mut tx, &content);
+        tokio::pin!(pending);
+        tokio::select! {
+            entered = tokio::time::timeout(CANCELLATION_WAIT, entered) => {
+                entered.unwrap().unwrap();
+            }
+            result = &mut pending => panic!("append completed before cancellation: {result:?}"),
+        }
+        // Drop only the inner future. The outer transaction stays live and must keep its first append.
+    }
+    release.send(()).unwrap();
+    tokio::time::timeout(CANCELLATION_WAIT, tx.lock_handle())
+        .await
+        .unwrap()
+        .unwrap()
+        .remove_update_hook();
+    let rows: i64 = sqlx::query_scalar("SELECT rows FROM audit_chain_state WHERE class = 0")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "only the cancelled append's state must roll back");
+    crate::audit_chain::append(&mut tx, &cancellation_content("after"))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let details: Vec<String> = sqlx::query_scalar("SELECT detail FROM audit_log ORDER BY id")
+        .fetch_all(e.db.writer())
+        .await
+        .unwrap();
+    assert_eq!(details, ["before", "after"]);
+    let chain = walk(&e.db).await;
+    assert!(chain.is_ok(), "{chain:?}");
+    assert_eq!(chain.rows, 2);
+    assert!(e.db.audit_chain_quick().await.unwrap().consistent);
 }

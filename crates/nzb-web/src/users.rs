@@ -145,6 +145,9 @@ struct InviteFormPage {
     layout: Layout,
     csrf_token: String,
     alert: Option<&'static str>,
+    /// Public form choices retained after a refusal; credentials are never echoed.
+    username: String,
+    uploader: bool,
 }
 
 #[derive(Template)]
@@ -909,6 +912,8 @@ async fn get_invite_form(
             layout: Layout::for_session("Invite a user", &sess),
             csrf_token: sess.csrf_token.clone(),
             alert: None,
+            username: String::new(),
+            uploader: false,
         },
     )
 }
@@ -921,6 +926,13 @@ async fn post_invite_create(
 ) -> Response {
     let ip = ip.to_string();
     let form = csrf::parse_form(&body);
+    // The role domain over HTTP is uploader|viewer; never echo an unrecognised role.
+    let role = match csrf::form_get(&form, "role") {
+        Some("uploader") => GrantableRole::Uploader,
+        Some("viewer") => GrantableRole::Viewer,
+        _ => return ApiError::new(StatusCode::BAD_REQUEST, "BAD_REQUEST").into_response(),
+    };
+    let username = csrf::form_get(&form, "username").unwrap_or_default().trim();
     let page = |status: StatusCode, alert: Option<&'static str>| {
         render(
             status,
@@ -928,16 +940,12 @@ async fn post_invite_create(
                 layout: Layout::for_session("Invite a user", &sess),
                 csrf_token: sess.csrf_token.clone(),
                 alert,
+                // Bound the echo to the input's character limit; Askama escapes the attribute.
+                username: username.chars().take(64).collect(),
+                uploader: role == GrantableRole::Uploader,
             },
         )
     };
-    // The role domain over HTTP is uploader|viewer; `admin` (or anything else) fails here.
-    let role = match csrf::form_get(&form, "role") {
-        Some("uploader") => GrantableRole::Uploader,
-        Some("viewer") => GrantableRole::Viewer,
-        _ => return ApiError::new(StatusCode::BAD_REQUEST, "BAD_REQUEST").into_response(),
-    };
-    let username = csrf::form_get(&form, "username").unwrap_or_default().trim();
     // Input-only: a name that can never be valid does not burn the admin's TOTP step.
     if nzb_store::check_login_name(username).is_err() {
         return page(StatusCode::OK, Some(ALERT_NAME));
@@ -1077,4 +1085,203 @@ pub fn routes(auth: &AuthState) -> Router {
         .route("/admin/users/{id}/display-name", post(post_display_name))
         .route("/admin/invites/{id}/revoke", post(post_invite_revoke))
         .with_state(St { auth: auth.clone() })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+
+    use std::sync::Arc;
+
+    use axum::body::{Body, to_bytes};
+    use axum::extract::ConnectInfo;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    use super::*;
+    use crate::auth::{AuthConfig, ClientMeta, ManualWallClock};
+    use crate::totp;
+
+    fn attribute<'a>(tag: &'a str, name: &str) -> &'a str {
+        tag.split_once(&format!("{name}=\""))
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map_or("", |(value, _)| value)
+    }
+
+    fn input_value<'a>(html: &'a str, id: &str) -> &'a str {
+        let tag = html
+            .split("<input ")
+            .filter_map(|part| part.split_once('>').map(|(tag, _)| tag))
+            .find(|tag| attribute(tag, "id") == id)
+            .expect("the returned form must contain its input");
+        attribute(tag, "value")
+    }
+
+    fn selected_role(html: &str) -> &str {
+        let select = html
+            .split_once("<select id=\"role\"")
+            .unwrap()
+            .1
+            .split_once("</select>")
+            .unwrap()
+            .0;
+        let options: Vec<_> = select
+            .split("<option ")
+            .skip(1)
+            .filter_map(|part| part.split_once('>').map(|(tag, _)| tag))
+            .collect();
+        let selected = options
+            .iter()
+            .find(|tag| tag.split_whitespace().any(|part| part == "selected"))
+            .or_else(|| options.first())
+            .unwrap();
+        attribute(selected, "value")
+    }
+
+    async fn post_form(app: &Router, cookie: &str, body: String) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/users/invite")
+                    .header("host", "localhost")
+                    .header("origin", "http://localhost")
+                    .header("accept", "text/html")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("cookie", cookie)
+                    .extension(ConnectInfo(
+                        "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+                    ))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The browser retries the form returned after a refusal: its selected role must still be
+    /// the role the administrator chose, while password and TOTP inputs must be empty.
+    #[tokio::test]
+    async fn invitation_retry_preserves_public_choices_without_echoing_credentials() {
+        const NOW: i64 = 3_000;
+        const PASSWORD: &str = "Audit-Invitation-Password-47";
+        const SECRET: &[u8] = b"12345678901234567890";
+        const TOKEN: [u8; 32] = [7; 32];
+
+        let dir = tempfile::tempdir().unwrap();
+        let test_store = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        let db = test_store.store.clone();
+        let key = Arc::new(totp::TotpKey::from_slice(&[9; 32]).unwrap());
+        let config = AuthConfig {
+            multi_user: true,
+            insecure_cookies: true,
+            totp_key: Some(key.clone()),
+            ..AuthConfig::default()
+        };
+        let hash = crate::password::hash_password(PASSWORD).unwrap();
+        let uid = db
+            .create_account_operator(
+                &nzb_store::NewAccount {
+                    username: "root",
+                    password_hash: &hash,
+                    role: Some(Role::Admin),
+                },
+                config.account_policy(),
+                NOW - 60,
+            )
+            .await
+            .unwrap();
+        let sealed = totp::seal(&key, uid, SECRET).unwrap();
+        assert!(
+            db.set_enrollment_token_for(uid, &TOKEN, NOW + 600, NOW - 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.store_pending_totp(uid, &sealed, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.confirm_totp_enrollment(uid, &sealed, Some(TOKEN), Some(98), &[], None, NOW - 60)
+                .await
+                .unwrap()
+        );
+        let auth = AuthState::new(db.clone(), config, Arc::new(ManualWallClock::new(NOW)))
+            .await
+            .unwrap();
+        let (cookie, csrf) = auth
+            .start_session_full(
+                uid,
+                nzb_store::SessionStage::Active,
+                &ClientMeta::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let cookie = cookie.to_str().unwrap().split(';').next().unwrap();
+        let app = crate::router_with_auth(
+            &crate::WebConfig {
+                insecure_cookies: true,
+                ..crate::WebConfig::default()
+            },
+            &auth,
+            routes(&auth),
+        );
+        let form = |username: &str, role: &str, code: &str| {
+            format!(
+                "csrf_token={csrf}&username={}&role={role}&current_password={PASSWORD}&code={code}",
+                crate::index::pct_encode(username)
+            )
+        };
+
+        // Input validation retains an escaped public username and the allowlisted role.
+        let hostile = "bad\"><img src=x>";
+        let (status, body) = post_form(&app, cookie, form(hostile, "uploader", "not-a-code")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(ALERT_NAME));
+        assert_eq!(selected_role(&body), "uploader");
+        assert!(input_value(&body, "username").contains("img"));
+        assert!(!body.contains("<img") && !body.contains(hostile));
+        assert_eq!(input_value(&body, "current_password"), "");
+        assert_eq!(input_value(&body, "code"), "");
+        assert!(!body.contains(PASSWORD) && !body.contains("not-a-code"));
+        let (status, _) = post_form(&app, cookie, form("invitee", "admin", "not-a-code")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(db.list_open_invites(NOW).await.unwrap().len(), 0);
+
+        // A six-digit code outside the accepted window exercises real MFA refusal.
+        let wrong = (0..10)
+            .map(|n| format!("{n:06}"))
+            .find(|code| totp::matching_step(SECRET, NOW, code).is_none())
+            .unwrap();
+        let (status, body) = post_form(&app, cookie, form("invitee", "uploader", &wrong)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(ALERT_REAUTH));
+        assert_eq!(input_value(&body, "username"), "invitee");
+        assert_eq!(selected_role(&body), "uploader");
+        assert_eq!(input_value(&body, "current_password"), "");
+        assert_eq!(input_value(&body, "code"), "");
+        assert!(!body.contains(PASSWORD));
+        assert_eq!(db.list_open_invites(NOW).await.unwrap().len(), 0);
+
+        // Retry using the public choices from the returned HTML, not the initial request.
+        let code = totp::code_at(SECRET, NOW / totp::STEP_SECS).unwrap();
+        let (status, body) = post_form(
+            &app,
+            cookie,
+            form(input_value(&body, "username"), selected_role(&body), &code),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Invitation code"));
+        let invites = db.list_open_invites(NOW).await.unwrap();
+        assert_eq!(invites.len(), 1);
+        let invite = invites.first().unwrap();
+        assert_eq!(invite.username.as_deref(), Some("invitee"));
+        assert_eq!(invite.role, Some(Role::Uploader));
+    }
 }

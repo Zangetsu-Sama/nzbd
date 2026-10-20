@@ -7,7 +7,7 @@
 {% if let Some(t) = layout.csrf_token %}<meta name="csrf-token" content="{{ t }}">
 {% endif %}<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/static/app.css?v={{ layout.css_ver }}">
-{% if let Some(v) = layout.htmx_ver %}<meta name="htmx-config" content="{&quot;allowEval&quot;:false,&quot;allowScriptTags&quot;:false,&quot;includeIndicatorStyles&quot;:false,&quot;historyCacheSize&quot;:0,&quot;selfRequestsOnly&quot;:true}">
+{% if let Some(v) = layout.htmx_ver %}<meta name="htmx-config" content="{&quot;allowEval&quot;:false,&quot;allowScriptTags&quot;:false,&quot;includeIndicatorStyles&quot;:false,&quot;historyCacheSize&quot;:0,&quot;refreshOnHistoryMiss&quot;:true,&quot;selfRequestsOnly&quot;:true}">
 <script src="/static/htmx.min.js?v={{ v }}" defer></script>
 {% endif %}<script src="/static/app.js?v={{ layout.js_ver }}" defer></script>
 </head>
@@ -38,6 +38,7 @@
 <div class="content">
 <nav class="crumbs" aria-label="Breadcrumb"><a href="/">Home</a> <span aria-hidden="true">&rsaquo;</span> {% if layout.nav_label == layout.title || layout.nav_label.is_empty() %}<span aria-current="page">{{ layout.title }}</span>{% else %}<a href="{% if layout.nav == "upload" %}/upload{% else if layout.nav == "admin" %}/admin{% else if layout.nav == "cleanup" %}/admin/cleanup{% else if layout.nav == "users" %}/admin/users{% else if layout.nav == "activity" %}/admin/activity{% else if layout.nav == "account" %}/account{% else %}/{% endif %}">{{ layout.nav_label }}</a> <span aria-hidden="true">&rsaquo;</span> <span aria-current="page">{{ layout.title }}</span>{% endif %}</nav>
 {% endif %}<main id="main">
+<p id="request-notice" class="banner warn" role="alert" tabindex="-1" hidden></p>
 {% block content %}{% endblock %}
 </main>
 <div class="sitebar muted" role="contentinfo">nzbd {{ layout.version }} &middot; NZB index</div>

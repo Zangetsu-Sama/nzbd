@@ -1,4 +1,4 @@
-//! The backend matrix of the web, ingest and nzbd test suites (ARCHITECTURE 13.7, review 34 M4, SEC-104): the
+//! The backend matrix of the web, ingest and nzbd test suites (ARCHITECTURE v3 13.7, review 34 M4, SEC-104): the
 //! harnesses build their [`Store`] from `NZBD_TEST_BACKEND` (`sqlite` or `postgres`). There is **no default**: an
 //! unset or unknown value fails the harness, so a CI leg can never silently test the other backend. Each test binary
 //! prints `NZBD_TEST_BACKEND opened <backend> by <binary>` once on stderr, which `scripts/ci.sh` checks per leg and per
@@ -7,6 +7,7 @@
 //! Raw SQL of the tests goes through [`TestStore`] (full privileges: the SQLite writer, the Postgres superuser on the
 //! private test database) and is written in the dialect both accept (`true`/`false`, `count(*)`, [`TestStore::blob`]
 //! for byte literals, no parameters: test values are formatted in by the test, never input). Test-only.
+//! `AssertSqlSafe` below marks only this fixture-authored SQL; bound values in `sql_with` remain parameters.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -390,8 +391,11 @@ impl TestStore {
             match target {
                 Ok(pool) => {
                     let mut c = pool.acquire().await.unwrap();
-                    for st in &stmts {
-                        sqlx::query(st).execute(&mut *c).await.unwrap();
+                    for st in stmts {
+                        sqlx::query(sqlx::AssertSqlSafe(st))
+                            .execute(&mut *c)
+                            .await
+                            .unwrap();
                     }
                 }
                 Err(opts) => {
@@ -401,8 +405,11 @@ impl TestStore {
                         .execute(&mut c)
                         .await
                         .unwrap();
-                    for st in &stmts {
-                        sqlx::query(st).execute(&mut c).await.unwrap();
+                    for st in stmts {
+                        sqlx::query(sqlx::AssertSqlSafe(st))
+                            .execute(&mut c)
+                            .await
+                            .unwrap();
                     }
                     c.close().await.unwrap();
                 }
@@ -442,21 +449,23 @@ impl TestStore {
     /// Like [`TestStore::exec`], but returns whether it succeeded (statements a trigger or CHECK must refuse).
     pub async fn try_exec(&self, sql: &str) -> Result<(), String> {
         match (&self.store, &self.pg) {
-            (Store::Sqlite(db), _) => sqlx::raw_sql(sql)
+            (Store::Sqlite(db), _) => sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
                 .execute(db.writer())
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
             (Store::Postgres(_), Some(t)) => {
                 let mut c = t.superuser_conn().await;
-                let r = sqlx::raw_sql(&format!("SET search_path = nzbd, pg_temp; {sql}"))
-                    .execute(&mut c)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| {
-                        e.as_database_error()
-                            .map_or_else(|| e.to_string(), |d| d.message().to_owned())
-                    });
+                let r = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "SET search_path = nzbd, pg_temp; {sql}"
+                )))
+                .execute(&mut c)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    e.as_database_error()
+                        .map_or_else(|| e.to_string(), |d| d.message().to_owned())
+                });
                 let _ = c.close().await;
                 r
             }
@@ -473,7 +482,7 @@ impl TestStore {
     /// One nullable integer value.
     pub async fn opt_i64(&self, sql: &str) -> Option<i64> {
         match (&self.store, &self.pg) {
-            (Store::Sqlite(db), _) => sqlx::query_scalar(sql)
+            (Store::Sqlite(db), _) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_one(db.writer())
                 .await
                 .unwrap(),
@@ -484,7 +493,7 @@ impl TestStore {
                     .execute(&mut *tx)
                     .await
                     .unwrap();
-                let row = sqlx::query(&format!("SELECT ({sql})::bigint AS v"))
+                let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT ({sql})::bigint AS v")))
                     .fetch_one(&mut *tx)
                     .await
                     .unwrap();
@@ -498,7 +507,7 @@ impl TestStore {
     /// One nullable byte-string value.
     pub async fn opt_bytes(&self, sql: &str) -> Option<Vec<u8>> {
         match (&self.store, &self.pg) {
-            (Store::Sqlite(db), _) => sqlx::query_scalar(sql)
+            (Store::Sqlite(db), _) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_one(db.writer())
                 .await
                 .unwrap(),
@@ -509,7 +518,10 @@ impl TestStore {
                     .execute(&mut *tx)
                     .await
                     .unwrap();
-                let v: Option<Vec<u8>> = sqlx::query_scalar(sql).fetch_one(&mut *tx).await.unwrap();
+                let v: Option<Vec<u8>> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
                 tx.commit().await.unwrap();
                 v
             }
@@ -520,7 +532,7 @@ impl TestStore {
     /// Every value of a byte-string column.
     pub async fn bytes_list(&self, sql: &str) -> Vec<Vec<u8>> {
         match (&self.store, &self.pg) {
-            (Store::Sqlite(db), _) => sqlx::query_scalar(sql)
+            (Store::Sqlite(db), _) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_all(db.writer())
                 .await
                 .unwrap(),
@@ -531,7 +543,10 @@ impl TestStore {
                     .execute(&mut *tx)
                     .await
                     .unwrap();
-                let v: Vec<Vec<u8>> = sqlx::query_scalar(sql).fetch_all(&mut *tx).await.unwrap();
+                let v: Vec<Vec<u8>> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+                    .fetch_all(&mut *tx)
+                    .await
+                    .unwrap();
                 tx.commit().await.unwrap();
                 v
             }
@@ -542,7 +557,7 @@ impl TestStore {
     /// One nullable text value.
     pub async fn opt_text(&self, sql: &str) -> Option<String> {
         match (&self.store, &self.pg) {
-            (Store::Sqlite(db), _) => sqlx::query_scalar(sql)
+            (Store::Sqlite(db), _) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_one(db.writer())
                 .await
                 .unwrap(),
@@ -553,7 +568,10 @@ impl TestStore {
                     .execute(&mut *tx)
                     .await
                     .unwrap();
-                let v: Option<String> = sqlx::query_scalar(sql).fetch_one(&mut *tx).await.unwrap();
+                let v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
                 tx.commit().await.unwrap();
                 v
             }
@@ -587,10 +605,16 @@ pub mod sql {
     pub async fn exec(store: &Store, sql: &str) {
         match store {
             Store::Sqlite(db) => {
-                sqlx::raw_sql(sql).execute(db.writer()).await.unwrap();
+                sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
+                    .execute(db.writer())
+                    .await
+                    .unwrap();
             }
             Store::Postgres(db) => {
-                sqlx::raw_sql(sql).execute(db.web()).await.unwrap();
+                sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
+                    .execute(db.web())
+                    .await
+                    .unwrap();
             }
         }
     }
@@ -598,65 +622,78 @@ pub mod sql {
     /// One integer (`NULL` = 0). Postgres: the value is cast to `bigint`.
     pub async fn i64(store: &Store, sql: &str) -> i64 {
         match store {
-            Store::Sqlite(db) => sqlx::query_scalar::<_, Option<i64>>(sql)
-                .fetch_one(db.writer())
-                .await
-                .unwrap()
-                .unwrap_or(0),
-            Store::Postgres(db) => {
-                sqlx::query_scalar::<_, Option<i64>>(&format!("SELECT ({sql})::bigint"))
-                    .fetch_one(db.web())
+            Store::Sqlite(db) => {
+                sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(sql.to_owned()))
+                    .fetch_one(db.writer())
                     .await
                     .unwrap()
                     .unwrap_or(0)
             }
+            Store::Postgres(db) => sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(
+                format!("SELECT ({sql})::bigint"),
+            ))
+            .fetch_one(db.web())
+            .await
+            .unwrap()
+            .unwrap_or(0),
         }
     }
 
     /// One nullable integer. Postgres: the value is cast to `bigint`.
     pub async fn opt_i64(store: &Store, sql: &str) -> Option<i64> {
         match store {
-            Store::Sqlite(db) => sqlx::query_scalar(sql)
+            Store::Sqlite(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_one(db.writer())
                 .await
                 .unwrap(),
-            Store::Postgres(db) => sqlx::query_scalar(&format!("SELECT ({sql})::bigint"))
-                .fetch_one(db.web())
-                .await
-                .unwrap(),
+            Store::Postgres(db) => {
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT ({sql})::bigint")))
+                    .fetch_one(db.web())
+                    .await
+                    .unwrap()
+            }
         }
     }
 
     /// One nullable byte string.
     pub async fn opt_bytes(store: &Store, sql: &str) -> Option<Vec<u8>> {
         match store {
-            Store::Sqlite(db) => sqlx::query_scalar(sql)
+            Store::Sqlite(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_one(db.writer())
                 .await
                 .unwrap(),
-            Store::Postgres(db) => sqlx::query_scalar(sql).fetch_one(db.web()).await.unwrap(),
+            Store::Postgres(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+                .fetch_one(db.web())
+                .await
+                .unwrap(),
         }
     }
 
     /// Every value of a byte-string column.
     pub async fn bytes_list(store: &Store, sql: &str) -> Vec<Vec<u8>> {
         match store {
-            Store::Sqlite(db) => sqlx::query_scalar(sql)
+            Store::Sqlite(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_all(db.writer())
                 .await
                 .unwrap(),
-            Store::Postgres(db) => sqlx::query_scalar(sql).fetch_all(db.web()).await.unwrap(),
+            Store::Postgres(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+                .fetch_all(db.web())
+                .await
+                .unwrap(),
         }
     }
 
     /// One nullable text value.
     pub async fn opt_text(store: &Store, sql: &str) -> Option<String> {
         match store {
-            Store::Sqlite(db) => sqlx::query_scalar(sql)
+            Store::Sqlite(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_one(db.writer())
                 .await
                 .unwrap(),
-            Store::Postgres(db) => sqlx::query_scalar(sql).fetch_one(db.web()).await.unwrap(),
+            Store::Postgres(db) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+                .fetch_one(db.web())
+                .await
+                .unwrap(),
         }
     }
 }
@@ -768,7 +805,7 @@ pub mod sql_with {
             match store {
                 Store::Sqlite(db) => {
                     let pool = db.writer().clone();
-                    bound!(sqlx::query(&sql), &vals)
+                    bound!(sqlx::query(sqlx::AssertSqlSafe(sql)), &vals)
                         .execute(&pool)
                         .await
                         .unwrap();
@@ -776,7 +813,10 @@ pub mod sql_with {
                 Store::Postgres(db) => {
                     let t = pg_text(&sql);
                     let pool = db.web().clone();
-                    bound!(sqlx::query(&t), &vals).execute(&pool).await.unwrap();
+                    bound!(sqlx::query(sqlx::AssertSqlSafe(t)), &vals)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
                 }
             }
         })
@@ -785,13 +825,16 @@ pub mod sql_with {
     /// One nullable integer (Postgres: cast to `bigint`).
     pub async fn opt_i64(store: &Store, sql: &str, vals: &[V]) -> Option<i64> {
         match store {
-            Store::Sqlite(db) => bound!(sqlx::query_scalar(sql), vals)
-                .fetch_one(db.writer())
-                .await
-                .unwrap(),
+            Store::Sqlite(db) => bound!(
+                sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned())),
+                vals
+            )
+            .fetch_one(db.writer())
+            .await
+            .unwrap(),
             Store::Postgres(db) => {
                 let t = format!("SELECT ({})::bigint", pg_text(sql));
-                bound!(sqlx::query_scalar(&t), vals)
+                bound!(sqlx::query_scalar(sqlx::AssertSqlSafe(t)), vals)
                     .fetch_one(db.web())
                     .await
                     .unwrap()
@@ -807,13 +850,16 @@ pub mod sql_with {
     /// One nullable byte string.
     pub async fn opt_bytes(store: &Store, sql: &str, vals: &[V]) -> Option<Vec<u8>> {
         match store {
-            Store::Sqlite(db) => bound!(sqlx::query_scalar(sql), vals)
-                .fetch_one(db.writer())
-                .await
-                .unwrap(),
+            Store::Sqlite(db) => bound!(
+                sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned())),
+                vals
+            )
+            .fetch_one(db.writer())
+            .await
+            .unwrap(),
             Store::Postgres(db) => {
                 let t = pg_text(sql);
-                bound!(sqlx::query_scalar(&t), vals)
+                bound!(sqlx::query_scalar(sqlx::AssertSqlSafe(t)), vals)
                     .fetch_one(db.web())
                     .await
                     .unwrap()
@@ -824,13 +870,16 @@ pub mod sql_with {
     /// One nullable text value.
     pub async fn opt_text(store: &Store, sql: &str, vals: &[V]) -> Option<String> {
         match store {
-            Store::Sqlite(db) => bound!(sqlx::query_scalar(sql), vals)
-                .fetch_one(db.writer())
-                .await
-                .unwrap(),
+            Store::Sqlite(db) => bound!(
+                sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned())),
+                vals
+            )
+            .fetch_one(db.writer())
+            .await
+            .unwrap(),
             Store::Postgres(db) => {
                 let t = pg_text(sql);
-                bound!(sqlx::query_scalar(&t), vals)
+                bound!(sqlx::query_scalar(sqlx::AssertSqlSafe(t)), vals)
                     .fetch_one(db.web())
                     .await
                     .unwrap()

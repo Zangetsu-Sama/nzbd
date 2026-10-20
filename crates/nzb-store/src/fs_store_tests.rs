@@ -314,6 +314,47 @@ async fn sec_008_gc_does_not_lose_blob_readopted_after_the_walk() {
 }
 
 #[tokio::test]
+async fn sec_008_gc_veto_preserves_a_concurrent_repair_of_a_corrupt_blob() {
+    let (dir, s) = setup();
+    let (sha, bytes) = blob(28);
+    s.put(sha, &bytes).await.unwrap();
+    let path = s.blob_path(&sha);
+    let mut corrupt = bytes.clone();
+    corrupt[0] ^= 1;
+    fs::write(&path, &corrupt).unwrap();
+    age(&path, 7200);
+    let cutoff = SystemTime::now() - Duration::from_secs(3600);
+    let worker_store = s.clone();
+    let healthy = bytes.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let report = tokio::task::spawn_blocking(move || {
+        worker_store.gc_checked(&HashSet::new(), cutoff, false, &|_| {
+            // GC has moved the old inode away. A real put publishes a verified replacement
+            // before the last database check discovers that the digest is referenced again.
+            assert_eq!(
+                runtime.block_on(worker_store.put(sha, &healthy)).unwrap(),
+                PutOutcome::Created
+            );
+            false
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.removed.len(), 0);
+    assert_eq!(report.too_new, 1);
+    assert_eq!(s.get(&sha).await.unwrap(), bytes);
+    assert_eq!(tmp_files(&dir), 0);
+    assert_eq!(s.gc_trash_len().unwrap(), 1);
+    let quarantined = fs::read_dir(dir.path().join("store/.gc-trash"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(quarantined.path()).unwrap(), corrupt);
+}
+
+#[tokio::test]
 async fn sec_008_put_rewrites_a_truncated_existing_blob() {
     let (_d, s) = setup();
     let (sha, bytes) = blob(23);
@@ -335,6 +376,54 @@ async fn sec_008_get_refuses_content_that_does_not_match_its_address() {
 }
 
 #[tokio::test]
+async fn sec_008_put_repairs_same_size_corruption_before_acknowledging_a_duplicate() {
+    let (_d, s) = setup();
+    let (sha, bytes) = blob(27);
+    s.put(sha, &bytes).await.unwrap();
+    let mut bad = bytes.clone();
+    bad[0] ^= 1;
+    fs::write(s.blob_path(&sha), bad).unwrap();
+    assert!(matches!(s.get(&sha).await, Err(StoreError::Corrupt)));
+    assert_eq!(s.put(sha, &bytes).await.unwrap(), PutOutcome::Created);
+    assert_eq!(s.get(&sha).await.unwrap(), bytes);
+    assert_eq!(s.put(sha, &bytes).await.unwrap(), PutOutcome::AlreadyExists);
+}
+
+#[tokio::test]
+async fn sec_005_fifo_blob_never_blocks_get_or_put() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let (_d, s) = setup();
+    let (sha, bytes) = blob(28);
+    let path = s.blob_path(&sha);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Unblock a regressed blocking open before failing, so the blocking pool can still shut down.
+    let release_fifo = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap()
+    };
+    let got = tokio::time::timeout(Duration::from_secs(1), s.get(&sha)).await;
+    let unblock = got.is_err().then(release_fifo);
+    assert!(matches!(got, Ok(Err(StoreError::NotFound))));
+    drop(unblock);
+    let put = tokio::time::timeout(Duration::from_secs(1), s.put(sha, &bytes)).await;
+    let unblock = put.is_err().then(release_fifo);
+    assert!(matches!(put, Ok(Ok(PutOutcome::Created))));
+    drop(unblock);
+    assert_eq!(s.get(&sha).await.unwrap(), bytes);
+}
+
+#[tokio::test]
 async fn sec_005_symlinked_shard_directory_is_refused() {
     let (dir, s) = setup();
     let (sha, bytes) = blob(25);
@@ -344,6 +433,66 @@ async fn sec_005_symlinked_shard_directory_is_refused() {
     std::os::unix::fs::symlink(&elsewhere, dir.path().join("store").join(&hex[0..2])).unwrap();
     assert!(s.put(sha, &bytes).await.is_err());
     assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn sec_005_populated_symlinked_shards_are_never_read_refreshed_or_deleted() {
+    for level in [0, 1] {
+        let (dir, s) = setup();
+        let (sha, bytes) = blob(29);
+        let hex = sha.to_hex();
+        let elsewhere = dir.path().join("elsewhere");
+        let outside_parent = if level == 0 {
+            elsewhere.join(&hex[2..4])
+        } else {
+            elsewhere.clone()
+        };
+        fs::create_dir_all(&outside_parent).unwrap();
+        let outside_blob = outside_parent.join(format!("{hex}.nzb"));
+        fs::write(&outside_blob, &bytes).unwrap();
+        age(&outside_blob, 7200);
+        let before = fs::metadata(&outside_blob).unwrap().modified().unwrap();
+        let first = dir.path().join("store").join(&hex[..2]);
+        let link = if level == 0 {
+            first
+        } else {
+            fs::create_dir(&first).unwrap();
+            first.join(&hex[2..4])
+        };
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        assert!(matches!(s.put(sha, &bytes).await, Err(StoreError::Corrupt)));
+        assert!(matches!(s.get(&sha).await, Err(StoreError::Corrupt)));
+        assert!(matches!(
+            crate::TrashStore::trash_stage(&s, &sha).await,
+            Err(StoreError::Corrupt)
+        ));
+        assert!(!s.exists(&sha).await.unwrap());
+        assert_eq!(s.missing([sha]).unwrap(), vec![sha]);
+        assert!(matches!(s.delete(&sha).await, Err(StoreError::Corrupt)));
+        assert_eq!(fs::read(&outside_blob).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&outside_blob).unwrap().modified().unwrap(),
+            before
+        );
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+}
+
+#[tokio::test]
+async fn sec_005_operator_configured_symlinked_store_root_remains_supported() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real-store");
+    fs::create_dir(&real).unwrap();
+    let alias = dir.path().join("store");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let s = FsStore::open(&alias).unwrap();
+    let (sha, bytes) = blob(30);
+    assert_eq!(s.put(sha, &bytes).await.unwrap(), PutOutcome::Created);
+    assert_eq!(s.put(sha, &bytes).await.unwrap(), PutOutcome::AlreadyExists);
+    assert_eq!(s.get(&sha).await.unwrap(), bytes);
+    s.delete(&sha).await.unwrap();
+    assert!(!s.exists(&sha).await.unwrap());
 }
 
 #[tokio::test]
@@ -444,6 +593,43 @@ async fn t032_l1_open_restores_gc_quarantine_files_and_passive_open_leaves_tmp_a
     assert!(!trash.exists() && !bad.exists());
     assert_eq!(s3.gc_trash_len().unwrap(), 1);
     assert_eq!(s3.get(&sha).await.unwrap(), bytes);
+}
+
+/// Review 55: a GC scratch file whose shard directory is now a symlink is skipped by the startup
+/// cleanup (never restored through the link), and the store still opens.
+#[tokio::test]
+async fn sec_005_open_skips_gc_scratch_of_a_symlinked_shard() {
+    let (dir, s) = setup();
+    let (sha, bytes) = blob(46);
+    s.put(sha, &bytes).await.unwrap();
+    let hex = sha.to_hex();
+    let store = dir.path().join("store");
+    let trash = store.join(".tmp").join(format!("gc-{hex}.123.0.trash"));
+    fs::rename(s.blob_path(&sha), &trash).unwrap();
+    fs::remove_dir_all(store.join(&hex[..2])).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, store.join(&hex[..2])).unwrap();
+    let s2 = FsStore::open(&store).unwrap();
+    assert!(trash.exists(), "the scratch copy is kept, never deleted");
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    assert!(matches!(s2.get(&sha).await, Err(StoreError::Corrupt)));
+}
+
+/// Review 55: the GC "wanted" restore falls back to a rename only on a filesystem without hard links.
+#[test]
+fn gc_restore_falls_back_only_when_hard_links_are_unsupported() {
+    use crate::fs_store::hard_link_unsupported;
+    for errno in [libc::EPERM, libc::EOPNOTSUPP, libc::ENOSYS] {
+        assert!(hard_link_unsupported(&std::io::Error::from_raw_os_error(
+            errno
+        )));
+    }
+    for errno in [libc::EEXIST, libc::EACCES, libc::EIO, libc::ENOSPC] {
+        assert!(!hard_link_unsupported(&std::io::Error::from_raw_os_error(
+            errno
+        )));
+    }
 }
 
 #[tokio::test]

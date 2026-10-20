@@ -187,7 +187,7 @@ async fn t114_deferred_jobs_are_committed_by_later_groups() {
     }
 }
 
-/// ARCHITECTURE 5.2: memory is bounded by bytes. A 2 KiB budget admits at most two of these (~1 KiB) NZBs between
+/// ARCHITECTURE v3 5.2: memory is bounded by bytes. A 2 KiB budget admits at most two of these (~1 KiB) NZBs between
 /// read and finish whatever the worker count; a job larger than the whole budget takes all of it and still runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t114_inflight_bytes_stay_within_the_budget() {
@@ -229,7 +229,7 @@ async fn t114_inflight_bytes_stay_within_the_budget() {
     assert_eq!(e.pipeline.stats().inflight_bytes, 0);
 }
 
-/// SEC-092 / ARCHITECTURE 3.2: the scanner offers nothing while the outbox depth is above the limit and resumes
+/// SEC-092 / ARCHITECTURE v3 3.2: the scanner offers nothing while the outbox depth is above the limit and resumes
 /// below half of it; the files wait in the watch folder untouched. Then the store probe of `serve` on the leg's
 /// backend: rows nobody indexes yet are outbox depth.
 #[tokio::test(flavor = "multi_thread")]
@@ -283,6 +283,37 @@ async fn sec_092_scanner_pauses_at_lag_limit() {
     stop(handle, workers).await;
 }
 
+#[tokio::test]
+async fn sec_092_lag_gate_resumes_at_small_odd_and_extreme_thresholds() {
+    for limit in [1_u64, 2, 3, 5, 100, u64::MAX - 1] {
+        let depth = Arc::new(AtomicU64::new(limit + 1));
+        let probe = Arc::clone(&depth);
+        let gate = LagGate::new(
+            limit,
+            Arc::new(move || {
+                let current = probe.load(Ordering::SeqCst);
+                Box::pin(async move { Some(current) })
+            }),
+        );
+        assert!(!gate.admit().await, "pause above {limit}");
+        depth.store(limit.div_ceil(2), Ordering::SeqCst);
+        assert!(
+            !gate.admit().await,
+            "stay paused at or above half of {limit}"
+        );
+        depth.store(limit.div_ceil(2) - 1, Ordering::SeqCst);
+        assert!(gate.admit().await, "resume below half of {limit}");
+        assert!(!gate.is_paused());
+        depth.store(limit, Ordering::SeqCst);
+        assert!(
+            gate.admit().await,
+            "do not flap at the pause boundary {limit}"
+        );
+        depth.store(limit + 1, Ordering::SeqCst);
+        assert!(!gate.admit().await, "pause again above {limit}");
+    }
+}
+
 /// Review 38 L5: a group that fails as a whole (not one job: a deadlock, a lost connection, a CHECK) is committed job
 /// by job; every job ends inserted, every source goes, and each job has exactly one `ok` log row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -313,4 +344,139 @@ async fn t114_a_failed_group_is_committed_job_by_job() {
     assert!(log.iter().all(|l| l.outcome == LogOutcome::Ok));
     let shas: std::collections::HashSet<_> = log.iter().map(|l| l.sha256).collect();
     assert_eq!(shas.len(), 6, "exactly one ok row per job");
+}
+
+/// A session can expire while a failed batch waits for its individual retries. The injected
+/// clock advances only after preparation, so a retry using the original batch time is rejected
+/// by this regression even though the account itself remains enabled.
+#[tokio::test]
+async fn sec_036_upload_commit_retries_refresh_session_expiry() {
+    struct RetryClock {
+        wall: Arc<FakeWall>,
+        step: AtomicI64,
+    }
+    impl WallClock for RetryClock {
+        fn now_unix(&self) -> i64 {
+            self.wall
+                .0
+                .fetch_add(self.step.load(Ordering::SeqCst), Ordering::SeqCst)
+        }
+    }
+
+    let mut e = env(OPTS).await;
+    let clock = Arc::new(RetryClock {
+        wall: Arc::clone(&e.wall),
+        step: AtomicI64::new(0),
+    });
+    e.pipeline = Pipeline::new(
+        cfg(&e.watch, &e.failed, &e.dups, OPTS),
+        e.db.clone(),
+        e.store.clone(),
+        clock.clone(),
+    )
+    .unwrap();
+    let user_id =
+        e.db.create_account_operator(
+            &nzb_store::NewAccount {
+                username: "uploader",
+                password_hash: "unused-test-hash",
+                role: None,
+            },
+            nzb_store::AccountPolicy::default(),
+            T0,
+        )
+        .await
+        .unwrap();
+    let id_hash = [7; 32];
+    e.db.insert_session(
+        &nzb_store::NewSession {
+            id_hash,
+            user_id,
+            stage: nzb_store::SessionStage::Active,
+            csrf_token: [8; 32],
+            now: T0,
+            expires_at: T0 + 1,
+            ip: None,
+            user_agent: None,
+        },
+        5,
+    )
+    .await
+    .unwrap();
+    let mut group = Vec::new();
+    for n in 0..2 {
+        let job = Job::upload(
+            nzb_store::LogSource::UploadUi,
+            Payload::Bytes(nzb(&format!("{SHOW}.{n}"))),
+        )
+        .with_uploader(nzb_store::Uploader::Session { user_id, id_hash });
+        match e.pipeline.prepare(job).await {
+            crate::pipeline::Prepared::Ready(r) => group.push(*r),
+            crate::pipeline::Prepared::Done(r) => panic!("not prepared: {r:?}"),
+        }
+    }
+    assert_eq!(group.len(), 2);
+    assert_eq!(clock.now_unix(), T0);
+    e.pipeline.fail_next_group();
+    clock.step.store(1, Ordering::SeqCst);
+    let done = e.pipeline.commit(group, DEFAULT_WRITER_HOLD).await;
+    assert_eq!(done.len(), 2);
+    for (ready, result) in done {
+        assert!(matches!(
+            result,
+            crate::pipeline::Committed::Failed(IngestError::UploaderRefused)
+        ));
+        assert!(matches!(
+            e.pipeline.finish(ready, result).await,
+            Err(IngestError::UploaderRefused)
+        ));
+    }
+    assert_eq!(e.release_count().await, 0);
+    assert_eq!(e.db.search_outbox_lag().await.unwrap().depth, 0);
+    assert_eq!(e.db.list_ingest_log(10).await.unwrap().len(), 0);
+}
+
+/// A panic inside a group commit is contained: the group (rolled back) is committed job by job, the
+/// other jobs are inserted and only the job that panics alone fails, counted as a panic; the writer
+/// (and so the process) keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_group_commit_is_committed_job_by_job() {
+    let mut e = env(OPTS).await;
+    let _srcs = put_many(&e, 4);
+    let cands = e.candidates();
+    let mut group = Vec::new();
+    for c in cands {
+        match e.pipeline.prepare(Job::watch(c)).await {
+            crate::pipeline::Prepared::Ready(r) => group.push(*r),
+            crate::pipeline::Prepared::Done(r) => panic!("not prepared: {r:?}"),
+        }
+    }
+    assert_eq!(group.len(), 4);
+    let poison = group[1].sha256();
+    e.pipeline.panic_on_commit(poison);
+    let done = e.pipeline.commit(group, DEFAULT_WRITER_HOLD).await;
+    let (mut inserted, mut failed) = (0, 0);
+    for (ready, c) in done {
+        let sha = ready.sha256();
+        let panicked = ready.panicked();
+        match c {
+            crate::pipeline::Committed::Inserted(_) => {
+                assert_ne!(sha, poison);
+                inserted += 1;
+                e.pipeline.finish(ready, c).await.unwrap();
+            }
+            crate::pipeline::Committed::Failed(IngestError::Internal) => {
+                assert_eq!(sha, poison);
+                assert!(panicked);
+                failed += 1;
+                assert!(matches!(
+                    e.pipeline.finish(ready, c).await,
+                    Err(IngestError::Internal)
+                ));
+            }
+            _ => panic!("unexpected commit outcome"),
+        }
+    }
+    assert_eq!((inserted, failed), (3, 1));
+    assert_eq!(e.release_count().await, 3);
 }

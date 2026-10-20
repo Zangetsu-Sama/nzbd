@@ -354,3 +354,120 @@ fn sec_090_source_name_match_respects_the_exclusion_set() {
     assert_eq!(hits(&e, &b), 0);
     assert_eq!(count(&e, "secret"), 1);
 }
+
+#[test]
+fn hidden_terms_do_not_crowd_out_visible_prefix_or_fuzzy_alternatives() {
+    for (text, expand, visible, hidden) in [
+        ("par", PREFIX, "parzzvisible", ["paraaa", "parbbb"]),
+        ("matrx", FUZZY, "matrix", ["matra", "matrb"]),
+    ] {
+        let mut docs = vec![doc(1, visible)];
+        docs.extend(hidden.iter().enumerate().map(|(i, text)| {
+            let mut d = doc(i as i64 + 2, text);
+            d.category_id = 6000;
+            d.category_parent = 6000;
+            d
+        }));
+        let e = engine_with(&[docs]);
+        let mut r = req(text);
+        r.query.exclude_categories = vec![6000];
+        let b = build(
+            &e.searcher(),
+            e.fields(),
+            &r,
+            expand,
+            Budgets {
+                terms_max: 2,
+                ..Budgets::default()
+            },
+            &far(),
+        )
+        .unwrap();
+        assert_eq!(hits(&e, &b), 1, "visible {text} alternative must survive");
+        assert!(!b.narrowed, "only one visible alternative exists");
+        assert_eq!(b.stats.max_terms_per_field, 2);
+    }
+}
+
+#[test]
+fn visibility_checks_share_a_hard_budget_across_tokens_fields_and_segments() {
+    let mut first = doc(1, "alpha1 bravo1");
+    first.source_name = "alpha1 bravo1".into();
+    let mut second = doc(2, "alpha2 bravo2");
+    second.source_name = "alpha2 bravo2".into();
+    let e = engine_with(&[vec![first], vec![second]]);
+    let mut r = req("alpha bravo");
+    r.query.exclude_categories = vec![6000];
+    let b = build(
+        &e.searcher(),
+        e.fields(),
+        &r,
+        Expand {
+            prefix: true,
+            fuzzy: true,
+        },
+        Budgets {
+            visibility_postings: 3,
+            ..Budgets::default()
+        },
+        &far(),
+    )
+    .unwrap();
+    assert_eq!(b.stats.visibility_postings, 3);
+    assert!(b.narrowed);
+    assert!(b.stats.max_dict_visits <= Budgets::default().dict_entries);
+    assert!(b.stats.max_terms_per_field <= Budgets::default().terms_max);
+    // The separate posting scan must not accidentally charge or eagerly read an exact term.
+    r.query.q = Some("alpha1".into());
+    let exact = build(
+        &e.searcher(),
+        e.fields(),
+        &r,
+        PREFIX,
+        Budgets {
+            visibility_postings: 0,
+            ..Budgets::default()
+        },
+        &far(),
+    )
+    .unwrap();
+    assert_eq!(hits(&e, &exact), 1);
+    assert_eq!(exact.stats.visibility_postings, 0);
+}
+
+#[test]
+fn excluded_postings_still_count_toward_decoding_work() {
+    let mut docs = vec![doc(1, "parvisible")];
+    docs.extend((2..=20).map(|id| {
+        let mut d = doc(id, "parvisible");
+        d.category_id = 6000;
+        d.category_parent = 6000;
+        d
+    }));
+    let e = engine_with(&[docs]);
+    let mut r = req("par");
+    r.query.exclude_categories = vec![6000];
+    let b = build(
+        &e.searcher(),
+        e.fields(),
+        &r,
+        PREFIX,
+        Budgets {
+            postings: 5,
+            ..Budgets::default()
+        },
+        &far(),
+    )
+    .unwrap();
+    assert!(b.narrowed);
+    assert_eq!(
+        hits(&e, &b),
+        0,
+        "a raw 20-posting alternative exceeds the work budget"
+    );
+    assert_eq!(
+        b.stats.visibility_postings, 0,
+        "oversized postings are not scanned"
+    );
+    assert_eq!(b.stats.postings, 0);
+}

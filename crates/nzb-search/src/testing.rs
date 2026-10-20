@@ -1,6 +1,6 @@
 //! Test support for the crates that serve listings through the index (`nzb-web`, `nzbd`, the bench): a
 //! [`SettlingIndex`] over the configured [`Store`] that runs the indexer to an empty outbox before every read, so a
-//! test sees its own writes at once (production serves with ~1 s of index lag, ARCHITECTURE 3.5). Behind the
+//! test sees its own writes at once (production serves with ~1 s of index lag, ARCHITECTURE v3 3.5). Behind the
 //! `test-support` feature; never part of a release build.
 
 use std::path::Path;

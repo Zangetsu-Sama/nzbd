@@ -15,6 +15,13 @@
 //! paths. API responses carry only `{status, id, sha256}` (SEC-036); the UI results page shows
 //! the sanitized file name through askama's auto-escaping.
 //!
+//! # NFO files (T140, D41)
+//! An `.nfo` sent with the NZBs (UI: a `file` part whose name ends in `.nfo`, or an `nfo` part; API: one `nfo`
+//! part) is read into memory, at most [`nzb_core::MAX_NFO_BYTES`], never staged and never charged as an NZB. Once the
+//! NZBs of the request are processed each NFO pairs with the NZB of the same file stem (or with the only NZB of a
+//! request holding exactly one of each) and is attached by the store, which re-checks who may attach (D41 b). The
+//! bytes are display data only: never logged, never echoed, never in a header.
+//!
 //! # CSRF for the HTML form
 //! A plain `<form>` cannot set headers, so the session gate defers the check to this module
 //! ([`DeferredCsrf`]): the `csrf_token` part must arrive and match before the first file part is
@@ -35,7 +42,9 @@ use axum::routing::{MethodRouter, get, post};
 use http_body_util::BodyExt as _;
 use nzb_core::{Taxonomy, sanitize_text};
 use nzb_ingest::{IngestError, IngestHandle, IngestOutcome, Job, OutcomeKind, Payload};
-use nzb_store::{AuditRepo as _, LogSource, Store, Uploader};
+use nzb_store::{
+    AuditRepo as _, LibraryRepo as _, LogSource, NfoAttach, Store, StoreError, Uploader,
+};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -55,6 +64,8 @@ use crate::upload_guard::{
 
 /// Most files accepted in one UI request (SEC-035).
 pub const MAX_FILES_PER_REQUEST: usize = 20;
+/// Most `.nfo` parts read in one UI request (T140); further ones are reported, not read into memory.
+pub const MAX_NFO_PER_REQUEST: usize = 20;
 /// Most multipart parts of any kind accepted in one UI request (files, `csrf_token`, `category`,
 /// `source`, unknown parts): bounds CPU spent on part framing (`SECURITY_REVIEW` T051 L3).
 pub const MAX_UI_PARTS: usize = 64;
@@ -97,7 +108,8 @@ pub struct UploadDeps {
     pub slots: Arc<Semaphore>,
     /// Free-space guard (T051 M2); `None` disables it (tests, `nzb-web` stand-alone).
     pub storage: Option<Arc<StorageGuard>>,
-    /// Audit sink for `nzb_upload*` rows (T138); `None` writes none (stand-alone tests).
+    /// Audit sink for `nzb_upload*` rows (T138) and the database the NFOs are attached in (T140); `None` writes
+    /// no audit row and attaches no NFO (stand-alone tests).
     pub audit: Option<(Store, Arc<dyn WallClock>)>,
 }
 
@@ -537,15 +549,18 @@ fn clean_name(raw: &str) -> Option<String> {
 }
 
 /// Resolves a category hint through the taxonomy (empty / blank = no hint). The pipeline
-/// resolves again; doing it here refuses an unknown value before any byte is staged.
-fn resolve_hint(tax: &Taxonomy, raw: &str) -> Result<Option<String>, Rejected> {
+/// resolves again; doing it here refuses an unknown value before any byte is staged. A category
+/// hidden from the caller is as unknown as a typo (same rule as changing a release's category).
+fn resolve_hint(tax: &Taxonomy, hidden: &[u16], raw: &str) -> Result<Option<String>, Rejected> {
     let t = raw.trim();
     if t.is_empty() {
         return Ok(None);
     }
-    tax.resolve(t)
-        .map(|id| Some(id.to_string()))
-        .ok_or(INVALID_CATEGORY)
+    let id = tax.resolve(t).ok_or(INVALID_CATEGORY)?;
+    if hidden.contains(&id) {
+        return Err(INVALID_CATEGORY);
+    }
+    Ok(Some(id.to_string()))
 }
 
 /// Validates and sanitizes a free-text source label (`source` form part, `X-Source` header).
@@ -590,21 +605,267 @@ enum Mode {
     Ui {
         /// Token the `csrf_token` part must equal; `None` when the header already proved it.
         expect_csrf: Option<String>,
-        /// Per-ACCOUNT bucket key (SEC-029, T101: several sessions of one account share one
-        /// budget) and the account recorded as the uploader.
-        session: [u8; 32],
+        /// Per-account bucket key (SEC-029, T101: sessions of one account share one budget).
+        account_bucket: [u8; 32],
+        /// The actual session hash, revalidated by the ingest transaction after reading the body.
+        id_hash: [u8; 32],
         user_id: i64,
         client: Option<IpAddr>,
         /// Per-IP upload bucket; the rate-limit layer already spent the request's first token,
         /// so file 1 is covered and each further file spends one more (T083).
         ip: Option<IpUploadBucket>,
+        /// Categories hidden from this caller (instance rule plus preference).
+        hidden: Arc<[u16]>,
     },
 }
 
-/// One processed file part.
+/// One processed file part (or, with `nfo_only`, an NFO that did not pair with any NZB).
 struct Item {
     name: Option<String>,
     result: Result<IngestOutcome, (Rejected, &'static str)>,
+    /// What happened to the NFO paired with this NZB (T140).
+    nfo: Option<NfoResult>,
+    /// A row of its own for an NFO without an NZB; `result` is unused then.
+    nfo_only: bool,
+}
+
+impl Item {
+    const fn file(
+        name: Option<String>,
+        result: Result<IngestOutcome, (Rejected, &'static str)>,
+    ) -> Self {
+        Self {
+            name,
+            result,
+            nfo: None,
+            nfo_only: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// NFO (T140)
+
+/// An `.nfo` part, held in memory until the NZBs of the request are processed.
+struct NfoPart {
+    name: Option<String>,
+    /// The bytes, or the stable code of why they were not kept.
+    bytes: Result<Vec<u8>, &'static str>,
+}
+
+/// What happened to one NFO: shown on the results page and, as a code, in the API answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NfoResult {
+    Attached,
+    /// The release already has an NFO; it was kept.
+    Present,
+    /// Not attached, with a stable code.
+    Refused(&'static str),
+}
+
+impl NfoResult {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Present => "present",
+            Self::Refused(c) => c,
+        }
+    }
+
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Attached => "ok",
+            Self::Present => "info",
+            Self::Refused(_) => "bad",
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Self::Attached => "NFO attached.",
+            Self::Present => "The release already has an NFO; it was kept.",
+            Self::Refused("NFO_TOO_LARGE") => "NFO not attached: larger than 256 KiB.",
+            Self::Refused("NFO_EMPTY") => "NFO not attached: the file is empty.",
+            Self::Refused("NFO_TOO_MANY") => "NFO not attached: too many NFO files in one upload.",
+            Self::Refused("NFO_UNPAIRED") => {
+                "NFO not attached: no NZB with the same name in this upload."
+            }
+            Self::Refused("NFO_EXTRA") => {
+                "NFO not attached: another NFO already pairs with this NZB."
+            }
+            Self::Refused("NFO_NZB_REJECTED") => "NFO not attached: its NZB was not stored.",
+            Self::Refused("NFO_FORBIDDEN") => {
+                "NFO not attached: only the uploader of the release or an admin can add one."
+            }
+            Self::Refused(_) => "NFO not attached: an internal error occurred.",
+        }
+    }
+}
+
+/// Whether a submitted file name is an NFO (`*.nfo`, any case).
+fn is_nfo_name(name: &str) -> bool {
+    name.len() > 4
+        && name
+            .get(name.len().saturating_sub(4)..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".nfo"))
+}
+
+/// The pairing key of a file name: everything before the last `.`, ASCII-lower-cased.
+fn stem_key(name: &str) -> String {
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    stem.to_ascii_lowercase()
+}
+
+/// Where each NFO goes: `Ok(i)` = the NZB at index `i`, `Err(code)` = not paired. With exactly one NZB and one NFO
+/// they pair whatever their names; otherwise by stem, the first NFO of a stem winning.
+fn pair_nfos(nzbs: &[Option<&str>], nfos: &[Option<&str>]) -> Vec<Result<usize, &'static str>> {
+    if nzbs.len() == 1 && nfos.len() == 1 {
+        return vec![Ok(0)];
+    }
+    let keys: Vec<Option<String>> = nzbs.iter().map(|n| n.map(stem_key)).collect();
+    let mut taken = vec![false; nzbs.len()];
+    nfos.iter()
+        .map(|nfo| {
+            let Some(want) = nfo.map(stem_key) else {
+                return Err("NFO_UNPAIRED");
+            };
+            let Some(i) = keys
+                .iter()
+                .position(|k| k.as_deref() == Some(want.as_str()))
+            else {
+                return Err("NFO_UNPAIRED");
+            };
+            match taken.get_mut(i) {
+                Some(t) if !*t => {
+                    *t = true;
+                    Ok(i)
+                }
+                _ => Err("NFO_EXTRA"),
+            }
+        })
+        .collect()
+}
+
+/// Reads an NFO part into memory (at most [`nzb_core::MAX_NFO_BYTES`]; a larger one is drained and refused).
+async fn read_nfo(field: &mut Field<'_>, meter: &Meter, keep: bool) -> Result<NfoPart, Rejected> {
+    let name = field.file_name().and_then(clean_name);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut code: Option<&'static str> = (!keep).then_some("NFO_TOO_MANY");
+    loop {
+        match field.chunk().await {
+            Ok(Some(c)) => {
+                meter.consumed(c.len());
+                if code.is_some() {
+                    continue;
+                }
+                if buf.len().saturating_add(c.len()) > nzb_core::MAX_NFO_BYTES {
+                    code = Some("NFO_TOO_LARGE");
+                    buf = Vec::new();
+                } else {
+                    buf.extend_from_slice(&c);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(mp_err(&e, meter)),
+        }
+    }
+    let bytes = match code {
+        Some(c) => Err(c),
+        None if buf.is_empty() => Err("NFO_EMPTY"),
+        None => Ok(buf),
+    };
+    Ok(NfoPart { name, bytes })
+}
+
+/// Attaches one NFO to the release its NZB produced; the store decides who may (D41 b).
+async fn attach_nfo(
+    deps: &UploadDeps,
+    uploader: &Uploader,
+    who: Who,
+    o: &IngestOutcome,
+    bytes: &[u8],
+) -> NfoResult {
+    let Some((db, clock)) = deps.audit.as_ref() else {
+        return NfoResult::Refused("NFO_INTERNAL");
+    };
+    let ip = who.ip.map(|i| i.to_string());
+    match db
+        .attach_nfo_as(
+            uploader,
+            o.release_id,
+            &o.sha256,
+            bytes,
+            clock.now_secs(),
+            ip.as_deref(),
+        )
+        .await
+    {
+        Ok(NfoAttach::Attached) => NfoResult::Attached,
+        Ok(NfoAttach::AlreadyPresent) => NfoResult::Present,
+        Err(StoreError::Account(_)) => NfoResult::Refused("NFO_FORBIDDEN"),
+        // The release went away (deleted) between its commit and this attach.
+        Err(StoreError::NotFound) => NfoResult::Refused("NFO_NZB_REJECTED"),
+        Err(e) => {
+            tracing::error!(error = %e, "nfo attach failed");
+            NfoResult::Refused("NFO_INTERNAL")
+        }
+    }
+}
+
+/// Pairs the held NFOs with the processed NZBs and attaches them. Unpaired NFOs become rows of their own when
+/// `orphan_rows` (the UI); the API reports only the NFO of its single file.
+async fn settle_nfos(
+    deps: &UploadDeps,
+    who: Option<(Uploader, Who)>,
+    items: &mut Vec<Item>,
+    nfos: Vec<NfoPart>,
+    orphan_rows: bool,
+) {
+    if nfos.is_empty() {
+        return;
+    }
+    let pairs = {
+        let nzb_names: Vec<Option<&str>> = items.iter().map(|i| i.name.as_deref()).collect();
+        let nfo_names: Vec<Option<&str>> = nfos.iter().map(|n| n.name.as_deref()).collect();
+        pair_nfos(&nzb_names, &nfo_names)
+    };
+    let mut orphans = Vec::new();
+    for (nfo, pair) in nfos.into_iter().zip(pairs) {
+        let target = pair.ok().and_then(|i| items.get(i).map(|item| (i, item)));
+        let result = match (&nfo.bytes, target, who.as_ref()) {
+            (_, None, _) => {
+                orphans.push((
+                    nfo.name,
+                    NfoResult::Refused(pair.err().unwrap_or("NFO_UNPAIRED")),
+                ));
+                continue;
+            }
+            (Err(code), Some(_), _) => NfoResult::Refused(code),
+            (Ok(_), Some((_, item)), _) if item.result.is_err() => {
+                NfoResult::Refused("NFO_NZB_REJECTED")
+            }
+            (Ok(bytes), Some((_, item)), Some((uploader, w))) => match &item.result {
+                Ok(o) => attach_nfo(deps, uploader, *w, o, bytes).await,
+                Err(_) => NfoResult::Refused("NFO_NZB_REJECTED"),
+            },
+            (Ok(_), Some(_), None) => NfoResult::Refused("NFO_INTERNAL"),
+        };
+        if let Some((i, _)) = target
+            && let Some(item) = items.get_mut(i)
+        {
+            item.nfo = Some(result);
+        }
+    }
+    if orphan_rows {
+        for (name, r) in orphans {
+            items.push(Item {
+                name,
+                result: Err((BAD_REQUEST, r.code())),
+                nfo: Some(r),
+                nfo_only: true,
+            });
+        }
+    }
 }
 
 async fn read_small(field: &mut Field<'_>, meter: &Meter) -> Result<String, Rejected> {
@@ -678,10 +939,7 @@ fn stop_here(
     shown: &'static str,
 ) -> Result<(), Rejected> {
     if ui && !items.is_empty() {
-        items.push(Item {
-            name,
-            result: Err((r, shown)),
-        });
+        items.push(Item::file(name, Err((r, shown))));
         Ok(())
     } else {
         Err(r)
@@ -722,20 +980,37 @@ async fn read_multipart(
     deadline: Instant,
 ) -> Result<Vec<Item>, Rejected> {
     let ui = matches!(mode, Mode::Ui { .. });
-    let mut items: Vec<Item> = Vec::new();
-    match read_parts(deps, mp, meter, mode, deadline, &mut items).await {
-        Ok(()) => Ok(items),
+    let mut out = Collected::default();
+    let r = read_parts(deps, mp, meter, mode, deadline, &mut out).await;
+    let Collected {
+        mut items,
+        nfos,
+        who,
+    } = out;
+    match r {
+        Ok(()) => {
+            settle_nfos(deps, who, &mut items, nfos, ui).await;
+            Ok(items)
+        }
         // A late framing error (bad boundary, part cap, ceiling) after finished files. A refused
         // account is never folded into a results page.
         Err(r) if ui && !items.is_empty() && r != REFUSED_ACCOUNT => {
-            items.push(Item {
-                name: Some("(request)".to_owned()),
-                result: Err((r, r.code)),
-            });
+            settle_nfos(deps, who, &mut items, nfos, ui).await;
+            items.push(Item::file(Some("(request)".to_owned()), Err((r, r.code))));
             Ok(items)
         }
         Err(r) => Err(r),
     }
+}
+
+/// What [`read_parts`] collected, also when it stopped early.
+#[derive(Default)]
+struct Collected {
+    items: Vec<Item>,
+    /// NFO parts, attached once the NZBs are processed (T140).
+    nfos: Vec<NfoPart>,
+    /// Who the NFOs are attached as (the request's uploader).
+    who: Option<(Uploader, Who)>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -745,9 +1020,12 @@ async fn read_parts(
     meter: &Meter,
     mode: Mode,
     deadline: Instant,
-    items: &mut Vec<Item>,
+    out: &mut Collected,
 ) -> Result<(), Rejected> {
-    let (api, mut hint, mut label, mut csrf_pending, mut charges, ui_user, audit_user, audit_ip) =
+    let Collected { items, nfos, who } = out;
+    // Hiding categories is a UI display rule; API ingestion still accepts every taxonomy id.
+    let mut hidden: Arc<[u16]> = Arc::from(Vec::new());
+    let (api, mut hint, mut label, mut csrf_pending, mut charges, ui_actor, audit_user, audit_ip) =
         match mode {
             Mode::Api {
                 key,
@@ -758,24 +1036,29 @@ async fn read_parts(
             } => (Some(key), hint, label, None, None, None, owner, ip),
             Mode::Ui {
                 expect_csrf,
-                session,
+                account_bucket,
+                id_hash,
                 user_id,
                 client,
                 ip,
-            } => (
-                None,
-                None,
-                None,
-                expect_csrf,
-                Some(Charges {
-                    session,
-                    ip,
-                    ip_first_free: true,
-                }),
-                Some(user_id),
-                Some(user_id),
-                client,
-            ),
+                hidden: h,
+            } => {
+                hidden = h;
+                (
+                    None,
+                    None,
+                    None,
+                    expect_csrf,
+                    Some(Charges {
+                        session: account_bucket,
+                        ip,
+                        ip_first_free: true,
+                    }),
+                    Some((user_id, id_hash)),
+                    Some(user_id),
+                    client,
+                )
+            }
         };
     let ui = api.is_none();
     let source = if ui {
@@ -787,9 +1070,9 @@ async fn read_parts(
     let origin = Origin {
         source,
         key: api.flatten(),
-        uploader: match (api.flatten(), ui_user) {
+        uploader: match (api.flatten(), ui_actor) {
             (Some(k), _) => Uploader::ApiKey(k),
-            (None, Some(u)) => Uploader::Account(u),
+            (None, Some((user_id, id_hash))) => Uploader::Session { user_id, id_hash },
             (None, None) => Uploader::Unattributed,
         },
         who: Who {
@@ -798,6 +1081,7 @@ async fn read_parts(
             ui,
         },
     };
+    *who = Some((origin.uploader, origin.who));
     let mut files_seen = 0_usize;
     let mut parts_seen = 0_usize;
     // API: the single file is staged first and ingested only when the whole body parsed, so a
@@ -832,7 +1116,7 @@ async fn read_parts(
                 }
                 let text = read_small(&mut field, meter).await?;
                 // A form field overrides nothing: an `X-Category` header is the API alternative.
-                hint = resolve_hint(&deps.taxonomy, &text)?;
+                hint = resolve_hint(&deps.taxonomy, &hidden, &text)?;
             }
             "source" => {
                 // Like `category`: must precede the files; applies to every file of the request.
@@ -842,9 +1126,36 @@ async fn read_parts(
                 let text = read_small(&mut field, meter).await?;
                 label = parse_label(text.as_bytes())?;
             }
+            "nfo" => {
+                if csrf_pending.is_some() {
+                    return Err(CSRF_REJECTED);
+                }
+                // The API takes one NFO for its one file.
+                if !ui && !nfos.is_empty() {
+                    return Err(UNSUPPORTED);
+                }
+                let keep = nfos.len() < MAX_NFO_PER_REQUEST;
+                let part = read_nfo(&mut field, meter, keep).await?;
+                // The empty `nfo` input of a form without a selection.
+                if part.name.is_none() && part.bytes == Err("NFO_EMPTY") {
+                    continue;
+                }
+                nfos.push(part);
+            }
             "file" => {
                 if csrf_pending.is_some() {
                     return Err(CSRF_REJECTED);
+                }
+                // An `.nfo` chosen in the form's file input with its NZB (T140): held, not ingested.
+                if ui
+                    && field
+                        .file_name()
+                        .and_then(clean_name)
+                        .is_some_and(|n| is_nfo_name(&n))
+                {
+                    let keep = nfos.len() < MAX_NFO_PER_REQUEST;
+                    nfos.push(read_nfo(&mut field, meter, keep).await?);
+                    continue;
                 }
                 if files_seen >= MAX_FILES_PER_REQUEST || (!ui && files_seen >= 1) {
                     return Err(if ui { BAD_REQUEST } else { UNSUPPORTED });
@@ -908,7 +1219,7 @@ async fn read_parts(
                     if matches!(&result, Err((_, code)) if *code == "UNAUTHORIZED") {
                         return Err(REFUSED_ACCOUNT);
                     }
-                    items.push(Item { name, result });
+                    items.push(Item::file(name, result));
                 } else {
                     pending = Some((staged, name));
                 }
@@ -921,7 +1232,7 @@ async fn read_parts(
     }
     if let Some((staged, name)) = pending {
         let result = run_ingest(deps, deadline, staged, origin, name.clone(), hint, label).await;
-        items.push(Item { name, result });
+        items.push(Item::file(name, result));
     }
     Ok(())
 }
@@ -939,8 +1250,9 @@ fn json(status: StatusCode, body: String) -> Response {
     r
 }
 
-/// `{status,id,sha256}` and nothing else (SEC-036). All values are server-generated.
-fn outcome_json(o: &IngestOutcome) -> Response {
+/// `{status,id,sha256}` and, when the request carried an NFO, its stable `nfo` code (SEC-036 as amended by T140).
+/// All values are server-generated.
+fn outcome_json(o: &IngestOutcome, nfo: Option<NfoResult>) -> Response {
     let (status, label) = match o.kind {
         OutcomeKind::Ingested => (StatusCode::CREATED, "created"),
         OutcomeKind::Duplicate => (StatusCode::OK, "duplicate"),
@@ -948,9 +1260,10 @@ fn outcome_json(o: &IngestOutcome) -> Response {
     json(
         status,
         format!(
-            "{{\"status\":\"{label}\",\"id\":{},\"sha256\":\"{}\"}}",
+            "{{\"status\":\"{label}\",\"id\":{},\"sha256\":\"{}\"{}}}",
             o.release_id,
-            o.sha256.to_hex()
+            o.sha256.to_hex(),
+            nfo.map_or_else(String::new, |n| format!(",\"nfo\":\"{}\"", n.code()))
         ),
     )
 }
@@ -1010,7 +1323,7 @@ async fn api_inner(
     let hint = match req.headers().get("x-category") {
         None => None,
         Some(v) => match v.to_str() {
-            Ok(t) => resolve_hint(&deps.taxonomy, t).map_err(reject)?,
+            Ok(t) => resolve_hint(&deps.taxonomy, &[], t).map_err(reject)?,
             Err(_) => return Err(reject(INVALID_CATEGORY)),
         },
     };
@@ -1044,7 +1357,7 @@ async fn api_inner(
             .map_err(reject)?;
             match (items.pop(), items.is_empty()) {
                 (Some(item), true) => match item.result {
-                    Ok(o) => Ok(outcome_json(&o)),
+                    Ok(o) => Ok(outcome_json(&o, item.nfo)),
                     Err((r, _)) => Err(reject(r)),
                 },
                 // No `file` part at all.
@@ -1090,7 +1403,7 @@ async fn api_inner(
                 },
             };
             match run_ingest(deps, deadline, staged, origin, name, hint, label).await {
-                Ok(o) => Ok(outcome_json(&o)),
+                Ok(o) => Ok(outcome_json(&o, None)),
                 Err((r, _)) => Err(reject(r)),
             }
         }
@@ -1119,6 +1432,10 @@ struct ResultRow {
     release_id: Option<i64>,
     code: &'static str,
     reason: &'static str,
+    /// The NFO note of the row (T140); empty when the row had none.
+    nfo: &'static str,
+    /// Closed-set badge class of the NFO note: `ok`, `info` or `bad`.
+    nfo_class: &'static str,
 }
 
 #[derive(Template)]
@@ -1174,6 +1491,19 @@ fn reason_for(code: &str) -> &'static str {
 
 fn row(item: Item, sess: &SessionCtx) -> ResultRow {
     let name = item.name.unwrap_or_else(|| "(unnamed)".to_owned());
+    let (nfo, nfo_class) = item.nfo.map_or(("", ""), |n| (n.text(), n.class()));
+    if item.nfo_only {
+        return ResultRow {
+            name,
+            status: "NFO not attached",
+            status_class: "bad",
+            release_id: None,
+            code: item.nfo.map_or("", NfoResult::code),
+            reason: nfo,
+            nfo: "",
+            nfo_class: "",
+        };
+    }
     match item.result {
         Ok(o) => ResultRow {
             name,
@@ -1194,6 +1524,8 @@ fn row(item: Item, sess: &SessionCtx) -> ResultRow {
             } else {
                 ""
             },
+            nfo,
+            nfo_class,
         },
         Err((r, shown)) => {
             // Stop rows have their own code and wording; everything else maps the HTTP-level code.
@@ -1212,6 +1544,8 @@ fn row(item: Item, sess: &SessionCtx) -> ResultRow {
                 release_id: None,
                 code: shown,
                 reason: reason_for(if stop { shown } else { r.code }),
+                nfo,
+                nfo_class,
             }
         }
     }
@@ -1243,10 +1577,12 @@ async fn ui_post(
     };
     let mode = Mode::Ui {
         expect_csrf,
-        session: account_key(sess.user_id),
+        account_bucket: account_key(sess.user_id),
+        id_hash: sess.id_hash,
         user_id: sess.user_id,
         client: client_ip,
         ip,
+        hidden: Arc::clone(&sess.hidden_categories),
     };
     let items = match read_multipart(&deps, mp, &meter, mode, deadline).await {
         Ok(i) => i,
@@ -1261,6 +1597,343 @@ async fn ui_post(
         Err(e) => {
             tracing::error!(error = %e, "upload result render failed");
             INTERNAL.response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod nfo_pairing_tests {
+    use super::{is_nfo_name, pair_nfos, stem_key};
+
+    #[test]
+    fn nfo_names_and_stems() {
+        assert!(is_nfo_name("a.nfo") && is_nfo_name("A.NFO") && is_nfo_name("x.y.Nfo"));
+        assert!(
+            !is_nfo_name(".nfo")
+                && !is_nfo_name("a.nzb")
+                && !is_nfo_name("nfo")
+                && !is_nfo_name("a.nfo.nzb")
+        );
+        assert_eq!(stem_key("Show.S01E01.NZB"), "show.s01e01");
+        assert_eq!(stem_key("noext"), "noext");
+    }
+
+    #[test]
+    fn one_of_each_pairs_whatever_the_names() {
+        assert_eq!(pair_nfos(&[Some("a.nzb")], &[Some("b.nfo")]), vec![Ok(0)]);
+        assert_eq!(pair_nfos(&[None], &[None]), vec![Ok(0)]);
+    }
+
+    #[test]
+    fn several_pair_by_stem_first_wins() {
+        let nzbs = [Some("A.nzb"), Some("B.nzb"), None];
+        let nfos = [
+            Some("b.nfo"),
+            Some("a.NFO"),
+            Some("B.nfo"),
+            Some("c.nfo"),
+            None,
+        ];
+        assert_eq!(
+            pair_nfos(&nzbs, &nfos),
+            vec![
+                Ok(1),
+                Ok(0),
+                Err("NFO_EXTRA"),
+                Err("NFO_UNPAIRED"),
+                Err("NFO_UNPAIRED")
+            ]
+        );
+        // No NZB at all: nothing pairs.
+        assert_eq!(pair_nfos(&[], &[Some("a.nfo")]), vec![Err("NFO_UNPAIRED")]);
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::resolve_hint;
+    use nzb_core::{Taxonomy, XXX_CATEGORY};
+
+    #[test]
+    fn a_hidden_category_is_refused_as_a_hint_like_an_unknown_one() {
+        let tax = Taxonomy::builtin().unwrap_or_else(|e| panic!("{e}"));
+        let hidden = tax.subtree_ids(XXX_CATEGORY);
+        assert!(resolve_hint(&tax, &[], "6000").is_ok_and(|h| h.as_deref() == Some("6000")));
+        assert!(resolve_hint(&tax, &hidden, "6000").is_err());
+        assert!(resolve_hint(&tax, &hidden, "6010").is_err());
+        assert!(resolve_hint(&tax, &hidden, "nope").is_err());
+        assert!(resolve_hint(&tax, &hidden, "  ").is_ok_and(|h| h.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::too_many_lines)]
+
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use axum::http::Request;
+    use futures_util::{StreamExt as _, stream};
+    use nzb_ingest::{DuplicatesAction, Pipeline, PipelineConfig};
+    use nzb_store::prelude::*;
+    use nzb_store::{AccountPolicy, FsStore, NewAccount, SessionStage};
+    use nzb_testkit::{FileSpec, NzbBuilder};
+    use tokio::sync::oneshot;
+    use tower::ServiceExt as _;
+
+    use crate::auth::{AuthConfig, AuthState, ClientMeta, ManualWallClock};
+
+    struct IngestClock(Arc<ManualWallClock>);
+
+    impl nzb_ingest::WallClock for IngestClock {
+        fn now_unix(&self) -> i64 {
+            self.0.now_secs()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum DuringBody {
+        Logout,
+        Expire,
+        KeepSession,
+        ApiAfterLogout,
+    }
+
+    /// The first body chunk has passed the real session/CSRF gate before `waiting` fires. The
+    /// complete NZB and closing boundary remain unavailable until the caller explicitly resumes.
+    fn suspended_body(bytes: &[u8]) -> (Body, oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let middle = bytes.len() / 2;
+        let mut head = b"--upload-test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n".to_vec();
+        head.extend_from_slice(&bytes[..middle]);
+        let mut tail = bytes[middle..].to_vec();
+        tail.extend_from_slice(b"\r\n--upload-test--\r\n");
+        let (waiting, reached) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        let first = stream::iter([Ok::<_, std::io::Error>(Bytes::from(head))]);
+        let rest = stream::once(async move {
+            let _ = waiting.send(());
+            paused
+                .await
+                .map_err(|_| std::io::Error::other("upload test cancelled"))?;
+            Ok::<_, std::io::Error>(Bytes::from(tail))
+        });
+        (Body::from_stream(first.chain(rest)), reached, resume)
+    }
+
+    fn authenticated_request(path: &str, cookie: &str, csrf: &str) -> axum::http::request::Builder {
+        Request::post(path)
+            .header(header::HOST, "localhost")
+            .header(header::ORIGIN, "http://localhost")
+            .header(header::COOKIE, cookie)
+            .header("x-csrf-token", csrf)
+    }
+
+    #[tokio::test]
+    async fn sec_036_ui_upload_rechecks_session_after_suspended_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_store = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        let db = test_store.store.clone();
+        let user_id = db
+            .create_account_operator(
+                &NewAccount {
+                    username: "uploader",
+                    password_hash: "unused-test-hash",
+                    role: None,
+                },
+                AccountPolicy::default(),
+                1_700_000_000,
+            )
+            .await
+            .unwrap();
+        let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+        let auth = AuthState::new(
+            db.clone(),
+            AuthConfig {
+                idle_secs: 10,
+                insecure_cookies: true,
+                ..AuthConfig::default()
+            },
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let mkdir = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        let staging = mkdir("tmp");
+        let pipeline = Pipeline::new(
+            PipelineConfig {
+                limits: nzb_core::Limits::default(),
+                watch_dir: mkdir("watch"),
+                failed_dir: mkdir("failed"),
+                duplicates_dir: mkdir("duplicates"),
+                duplicates_action: DuplicatesAction::Move,
+                category_from_subfolder: false,
+                failed_uploads_max_files: 0,
+                failed_uploads_max_bytes: 0,
+            },
+            db.clone(),
+            Arc::new(FsStore::open(mkdir("store")).unwrap()),
+            Arc::new(IngestClock(Arc::clone(&clock))),
+        )
+        .unwrap();
+        let (handle, workers) = pipeline.spawn_workers(1);
+        let deps = UploadDeps::new(
+            handle,
+            Arc::new(Taxonomy::builtin().unwrap()),
+            staging.clone(),
+            64 * 1024,
+        )
+        .with_audit(db.clone(), clock.clone());
+        let app = crate::router_with_upload(
+            &crate::WebConfig {
+                insecure_cookies: true,
+                ..crate::WebConfig::default()
+            },
+            &auth,
+            ui_routes(deps.clone()),
+            Some(api_route(deps)),
+        );
+        let (_, api_key) = crate::apikey::issue(
+            &db,
+            "upload control",
+            clock.now_secs(),
+            nzb_store::Actor {
+                name: "cli",
+                ip: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut accepted = 0;
+        for (n, action) in [
+            DuringBody::Logout,
+            DuringBody::Expire,
+            DuringBody::KeepSession,
+            DuringBody::ApiAfterLogout,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (set_cookie, csrf) = auth
+                .start_session_full(user_id, SessionStage::Active, &ClientMeta::default(), None)
+                .await
+                .unwrap();
+            let cookie = set_cookie.to_str().unwrap().split(';').next().unwrap();
+            let api = matches!(action, DuringBody::ApiAfterLogout);
+            let bytes = NzbBuilder::new()
+                .file(FileSpec::new(&format!("\"upload.{n}.mkv\" yEnc (1/2)")).segments(2))
+                .build();
+            let sha = crate::crypto::hex(&crate::crypto::sha256(&bytes));
+            let (body, reached, resume) = suspended_body(&bytes);
+            let mut request =
+                authenticated_request(if api { "/api/v1/nzb" } else { "/upload" }, cookie, &csrf)
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=upload-test",
+                    );
+            if api {
+                request = request.header("x-api-key", api_key.secret.as_str());
+            }
+            let router = app.clone();
+            let request = request.body(body).unwrap();
+            let upload = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+            tokio::time::timeout(Duration::from_secs(5), reached)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !upload.is_finished(),
+                "the incomplete body must still be pending"
+            );
+            assert!(db.get_release_by_sha(&sha).await.unwrap().is_none());
+            match action {
+                DuringBody::Logout | DuringBody::ApiAfterLogout => {
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            authenticated_request("/logout", cookie, &csrf)
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+                    assert!(auth.peek_session(&headers).await.unwrap().is_none());
+                }
+                DuringBody::Expire => clock.advance(10),
+                DuringBody::KeepSession => {}
+            }
+            resume.send(()).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(10), upload)
+                .await
+                .unwrap()
+                .unwrap();
+            let refused = matches!(action, DuringBody::Logout | DuringBody::Expire);
+            assert_eq!(
+                response.status(),
+                if refused {
+                    StatusCode::NOT_FOUND
+                } else if api {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                "case {n}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(!body.contains(api_key.secret.as_str()));
+            let row = db.get_release_by_sha(&sha).await.unwrap();
+            if refused {
+                assert!(row.is_none(), "a refused upload must not publish a release");
+            } else {
+                accepted += 1;
+                let attribution = db
+                    .release_attribution(row.unwrap().id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(attribution.added_by, Some(user_id));
+            }
+            assert_eq!(
+                test_store.i64("SELECT count(*) FROM release").await,
+                accepted
+            );
+            assert_eq!(
+                test_store
+                    .i64("SELECT count(*) FROM release WHERE added_by IS NOT NULL")
+                    .await,
+                accepted
+            );
+            assert_eq!(
+                test_store.i64("SELECT count(*) FROM search_outbox").await,
+                accepted
+            );
+            assert_eq!(
+                test_store.i64("SELECT count(*) FROM ingest_log").await,
+                accepted
+            );
+            assert_eq!(
+                test_store
+                    .i64("SELECT count(*) FROM audit_log WHERE event = 'nzb_upload'")
+                    .await,
+                accepted
+            );
+            assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+        }
+        drop(app);
+        for worker in workers {
+            tokio::time::timeout(Duration::from_secs(5), worker)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 }

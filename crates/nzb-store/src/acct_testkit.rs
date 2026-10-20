@@ -97,6 +97,7 @@ impl Env {
             display_name: a.handle(),
             stage: SessionStage::Active,
             prefs: crate::UserPrefs::default(),
+            session: None,
         }
     }
 
@@ -162,10 +163,12 @@ impl Env {
 
     pub(crate) async fn count(&self, table: &str, filter: &str) -> i64 {
         // Test-only: `table` and `filter` are literals in the callers.
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE {filter}"))
-            .fetch_one(self.db.writer())
-            .await
-            .unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {table} WHERE {filter}"
+        )))
+        .fetch_one(self.db.writer())
+        .await
+        .unwrap()
     }
 }
 

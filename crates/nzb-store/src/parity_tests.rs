@@ -1,4 +1,4 @@
-//! Schema parity (ARCHITECTURE 13.4, review 35 L1): both schemas carry the same tables, columns and `CHECK`-ed
+//! Schema parity (ARCHITECTURE v3 13.4, review 35 L1): both schemas carry the same tables, columns and `CHECK`-ed
 //! columns, except the intended differences listed here with their reason.
 #![allow(
     clippy::unwrap_used,

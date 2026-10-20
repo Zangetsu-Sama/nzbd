@@ -1,4 +1,4 @@
-//! The `scene` analyzer (`docs/DATA_MODEL.md` 5.2): the same code tokenizes documents at index time
+//! The `scene` analyzer (`docs/v3/DATA_MODEL.md` 5.2): the same code tokenizes documents at index time
 //! and query text at search time, so both sides always agree.
 //!
 //! 1. **Split** on every character that is not Unicode alphanumeric (`char::is_alphanumeric`), the 2.x

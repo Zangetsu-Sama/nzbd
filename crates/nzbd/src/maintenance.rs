@@ -1,5 +1,5 @@
 //! In-process maintenance task of `serve` (T061 L-3): the daily database backup (keep-N rotation)
-//! plus the log and API-key purges, so a plain `docker compose up` does not accumulate log rows
+//! plus PostgreSQL partition upkeep and the log and API-key purges, so a plain `docker compose up` does not accumulate log rows
 //! forever and the health dashboard's "Database backups" row has something to report.
 //!
 //! It reuses the store functions the `nzbd backup` CLI uses. Everything is async (sqlx runs the SQL
@@ -54,9 +54,15 @@ pub struct Report {
     pub errors: Vec<String>,
 }
 
-/// Runs backup then the purges once, at unix time `now`.
+/// Runs PostgreSQL partition upkeep, backup and the purges once, at unix time `now`.
+/// Partition months and retention cutoffs use the database clock, not `now`.
 pub async fn run_once(db: &nzb_store::Store, p: &Params, now: i64) -> Report {
     let mut r = Report::default();
+    if let nzb_store::Store::Postgres(pg) = db
+        && let Err(e) = pg.partition_upkeep().await
+    {
+        r.errors.push(format!("partition upkeep: {e}"));
+    }
     match db
         .backup(&p.backups_dir, now, p.keep, p.backup_key.as_deref())
         .await
@@ -289,5 +295,128 @@ mod tests {
             .await
             .expect("task stops on shutdown")
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod upkeep_regressions {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use nzb_store::pg::testing::TestDb;
+
+    const DAY: i64 = 86_400;
+    // 2027-03-15 12:00:00 UTC.
+    const NOW: i64 = 1_805_112_000;
+
+    fn params(dir: &std::path::Path) -> Params {
+        let backups_dir = dir.join("backups");
+        std::fs::create_dir(&backups_dir).unwrap();
+        Params {
+            first_delay: Duration::ZERO,
+            interval: Duration::from_hours(24),
+            backups_dir,
+            keep: 2,
+            backup_key: None,
+        }
+    }
+
+    async fn partitions(t: &TestDb) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid \
+             WHERE i.inhparent = 'nzbd.ingest_log'::regclass ORDER BY 1",
+        )
+        .fetch_all(&mut t.app_conn().await)
+        .await
+        .unwrap()
+    }
+
+    async fn insert_target(t: &TestDb, ts: i64) -> String {
+        sqlx::query_scalar(
+            "INSERT INTO ingest_log (ts, source, outcome) VALUES ($1, 'watch', 'ok') \
+             RETURNING tableoid::regclass::text",
+        )
+        .bind(ts)
+        .fetch_one(&mut t.app_conn().await)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_once_prepares_log_partitions_and_tracks_database_months() {
+        let t = TestDb::new().await;
+        t.set_db_clock(NOW).await;
+        let dir = tempfile::tempdir().unwrap();
+        let p = params(dir.path());
+        let db = nzb_store::Store::Postgres(t.db.clone());
+        assert_eq!(partitions(&t).await, ["ingest_log_default"]);
+
+        // Deliberately use a different caller clock: partition ranges belong to the database clock.
+        let first = run_once(&db, &p, NOW - 10 * DAY).await;
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(first.backup_file.is_some());
+        assert_eq!(
+            partitions(&t).await,
+            [
+                "ingest_log_default",
+                "ingest_log_y2027m03",
+                "ingest_log_y2027m04",
+                "ingest_log_y2027m05"
+            ],
+            "daily maintenance must prepare the database's current and next two log months"
+        );
+        assert_eq!(insert_target(&t, NOW).await, "ingest_log_y2027m03");
+
+        // 92 days later is June 15: a subsequent real maintenance run prepares June-August.
+        let june = NOW + 92 * DAY;
+        t.set_db_clock(june).await;
+        let second = run_once(&db, &p, NOW - 10 * DAY + 1).await;
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(second.backup_file.is_some());
+        let names = partitions(&t).await;
+        for month in [
+            "ingest_log_y2027m06",
+            "ingest_log_y2027m07",
+            "ingest_log_y2027m08",
+        ] {
+            assert!(names.iter().any(|name| name == month), "missing {month}");
+        }
+        assert_eq!(insert_target(&t, june).await, "ingest_log_y2027m06");
+        assert_eq!(
+            second.ingest_rows, 1,
+            "ordinary retention still removes the aged March row"
+        );
+    }
+
+    #[tokio::test]
+    async fn upkeep_failure_is_reported_without_skipping_backup_or_purges() {
+        let t = TestDb::new().await;
+        t.set_db_clock(NOW).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = nzb_store::Store::Postgres(t.db.clone());
+        db.audit_event(NOW - 100 * DAY, None, "login_ok", None, None)
+            .await
+            .unwrap();
+        sqlx::query("REVOKE EXECUTE ON FUNCTION nzbd.ensure_log_partitions() FROM nzbd_app")
+            .execute(&mut t.owner_conn().await)
+            .await
+            .unwrap();
+
+        let report = run_once(&db, &params(dir.path()), NOW).await;
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.starts_with("partition upkeep:")),
+            "partition upkeep failure must be reported by maintenance"
+        );
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            report.backup_file.is_some(),
+            "backup remains independent of upkeep"
+        );
+        assert_eq!(report.audit_rows, 1, "purges still run after failed upkeep");
+        assert_eq!(partitions(&t).await, ["ingest_log_default"]);
+        assert_eq!(insert_target(&t, NOW).await, "ingest_log_default");
     }
 }

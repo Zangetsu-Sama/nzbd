@@ -1,4 +1,4 @@
-//! The v3 search index in `nzbd` (T122; ARCHITECTURE 3.2-3.4): the single indexer task of `serve` and the
+//! The v3 search index in `nzbd` (T122; ARCHITECTURE v3 3.2-3.4): the single indexer task of `serve` and the
 //! `nzbd search status|verify|rebuild` commands. The index is derived data in `search.index_dir`; the database (either
 //! backend) stays the source of truth, read through the `IndexSource` adapter on [`Store`].
 //!

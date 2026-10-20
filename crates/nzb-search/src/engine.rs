@@ -1,5 +1,5 @@
 //! One opened index generation: Tantivy index + reader + the single writer, and the commit payload
-//! that binds it to a database (ARCHITECTURE 3.2-3.3, SEC-091).
+//! that binds it to a database (ARCHITECTURE v3 3.2-3.3, SEC-091).
 //!
 //! Layout of `search.index_dir` (from config only, never derived from input; 0700):
 //! ```text
@@ -49,8 +49,8 @@ const MAX_PAYLOAD_BYTES: usize = 1024;
 /// Tantivy's minimum indexing arena per thread (about 15 MB).
 const MIN_HEAP_PER_THREAD: usize = 15_000_000;
 /// Doc-store cache blocks of the search readers: 0, so tantivy never constructs its `LruCache` for a
-/// searcher (`NonZeroUsize::new(0)` is `None`). There are no stored fields to cache, and this keeps the
-/// RUSTSEC-2026-0253 code (lru `pop()`) out of the request path entirely (review 32 L1).
+/// searcher (`NonZeroUsize::new(0)` is `None`). There are no stored fields to cache (review 32 L1; the
+/// RUSTSEC-2026-0253 lru fix arrived with tantivy 0.27, T143, but there is still nothing to cache).
 pub const DOC_STORE_CACHE_BLOCKS: usize = 0;
 
 /// Name of the file naming the active generation.

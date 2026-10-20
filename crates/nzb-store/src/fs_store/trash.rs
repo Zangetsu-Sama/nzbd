@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use nzb_core::Sha256;
@@ -150,7 +150,7 @@ impl FsStore {
     }
 
     fn trash_stage_blocking(&self, sha: &Sha256) -> Result<(), StoreError> {
-        let live = self.blob_path(sha);
+        let live = self.checked_blob_path(sha)?;
         let Some(mut src) = open_regular_nofollow(&live, false)? else {
             return Err(StoreError::NotFound);
         };
@@ -201,7 +201,7 @@ impl FsStore {
         started_at: SystemTime,
         still_unreferenced: &(dyn Fn(&Sha256) -> bool + Send + Sync),
     ) -> Result<TrashFinish, StoreError> {
-        let live = self.blob_path(sha);
+        let live = self.checked_blob_path(sha)?;
         let tpath = self.trash_path(sha);
         // The trash copy must exist and be a regular file before the live name may go.
         let tmeta = match fs::symlink_metadata(&tpath) {
@@ -317,9 +317,13 @@ impl FsStore {
             // other extra link keeps the refusal.
             Plain::Linked(m) => {
                 let live_same = m.nlink() == 2
-                    && fs::symlink_metadata(self.blob_path(sha)).is_ok_and(|l| {
-                        l.file_type().is_file() && l.dev() == m.dev() && l.ino() == m.ino()
-                    });
+                    && self
+                        .checked_blob_path(sha)
+                        .ok()
+                        .and_then(|p| fs::symlink_metadata(p).ok())
+                        .is_some_and(|l| {
+                            l.file_type().is_file() && l.dev() == m.dev() && l.ino() == m.ino()
+                        });
                 if live_same && self.remove_verified(&path, &m, sha, true)? {
                     Ok(TrashPurge::Removed { bytes: m.len() })
                 } else {
@@ -387,13 +391,29 @@ impl FsStore {
         Ok((items, foreign))
     }
 
-    fn quarantine_purge_blocking(&self, older_than: i64) -> Result<QuarantinePurge, StoreError> {
+    fn quarantine_purge_blocking(
+        &self,
+        older_than: i64,
+        deadline: Option<Instant>,
+        gate: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Result<QuarantinePurge, StoreError> {
         let (items, foreign) = self.quarantine_entries(MAX_ENTRIES)?;
         let mut rep = QuarantinePurge {
             skipped: foreign,
             ..QuarantinePurge::default()
         };
+        let mut handled = 0_u64;
         for (item, path) in items {
+            if rep.aborted || deadline.is_some_and(|d| Instant::now() >= d) {
+                rep.remaining = rep.remaining.saturating_add(1);
+                continue;
+            }
+            if handled.is_multiple_of(QuarantinePurge::BATCH_SIZE) && gate.is_some_and(|g| !g()) {
+                rep.aborted = true;
+                rep.remaining = rep.remaining.saturating_add(1);
+                continue;
+            }
+            handled = handled.saturating_add(1);
             if item.quarantined_at >= older_than {
                 rep.kept_recent = rep.kept_recent.saturating_add(1);
                 continue;
@@ -402,6 +422,11 @@ impl FsStore {
                 Plain::Absent => {}
                 Plain::Refused | Plain::Linked(_) => rep.skipped = rep.skipped.saturating_add(1),
                 Plain::File(m) => {
+                    // The gate or filesystem checks may have taken the rest of the budget.
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        rep.remaining = rep.remaining.saturating_add(1);
+                        continue;
+                    }
                     if self.remove_verified(&path, &m, &item.sha, false)? {
                         rep.removed = rep.removed.saturating_add(1);
                         rep.bytes = rep.bytes.saturating_add(m.len());
@@ -472,10 +497,17 @@ impl TrashStore for FsStore {
         .map_err(|e| join_err(&e))?
     }
 
-    async fn quarantine_purge(&self, older_than: i64) -> Result<QuarantinePurge, StoreError> {
+    async fn quarantine_purge_checked(
+        &self,
+        older_than: i64,
+        deadline: Option<Instant>,
+        gate: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<QuarantinePurge, StoreError> {
         let this = self.clone();
-        tokio::task::spawn_blocking(move || this.quarantine_purge_blocking(older_than))
-            .await
-            .map_err(|e| join_err(&e))?
+        tokio::task::spawn_blocking(move || {
+            this.quarantine_purge_blocking(older_than, deadline, gate.as_deref())
+        })
+        .await
+        .map_err(|e| join_err(&e))?
     }
 }

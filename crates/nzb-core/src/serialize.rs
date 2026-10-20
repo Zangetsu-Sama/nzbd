@@ -23,7 +23,8 @@
 //! - XML 1.0 cannot carry U+FFFE or U+FFFF in any form; the sanitizer keeps them, so the
 //!   serializer writes U+FFFD instead ([`xml_safe_text`]). Every other character the sanitizer
 //!   lets through is legal XML.
-//! - The parser caps the *raw* (escaped) length of the `subject` and `poster` attributes. Because
+//! - The parser caps the *raw* (escaped) length of the `subject`, `poster` and `<meta type>`
+//!   attributes (the last one by `max_meta_value_bytes`, before it is sanitized to 64 bytes). Because
 //!   the escaping above is never longer than the source's, an attribute value equal to its
 //!   unescaped source always fits again. The only value that can exceed the cap is one the
 //!   sanitizer made longer than its source (NFC normalization expands a few characters) while the

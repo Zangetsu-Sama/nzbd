@@ -371,6 +371,7 @@ pub(crate) fn retry_with(
                 }
                 let _ = fs::remove_file(failed_dir.join(sidecar_name(&entry.name)));
                 fsync_dir(failed_dir);
+                retry_nfo(failed_dir, watch_dir, stem, &dest);
                 rep.moved.push((entry.name.clone(), new_name));
             }
             Err(e) => rep
@@ -379,6 +380,22 @@ pub(crate) fn retry_with(
         }
     }
     Ok(rep)
+}
+
+/// T141: the NFO sidecar that followed a watch NZB into `failed/` (`<stem>.nfo`, `stem` from the listing) goes back
+/// with it, exactly under the retried NZB's new stem (the NZB move never picks a stem whose `.nfo` is taken), so the
+/// next ingest pairs them again. Any problem leaves it where it is.
+fn retry_nfo(failed_dir: &Path, watch_dir: &Path, stem: &str, nzb_dest: &Path) {
+    if let Some(new_stem) = nzb_dest.file_stem().and_then(|s| s.to_str()) {
+        let _ = crate::fsops::carry_twin(failed_dir, stem, watch_dir, new_stem);
+    }
+}
+
+/// `<generated failed stem>.nfo`: the NFO sidecar that followed its watch NZB into `failed/` (T141).
+#[must_use]
+pub fn is_failed_nfo_name(name: &str) -> bool {
+    name.strip_suffix(".nfo")
+        .is_some_and(|stem| is_failed_name(&format!("{stem}.nzb")))
 }
 
 /// Sub-directory of `failed/` that receives expired files. Never listed, rotated or expired
@@ -484,6 +501,10 @@ pub fn apply_retention(dir: &Path, days: u32, now: i64) -> RetentionReport {
         };
         if let Some(n) = dest.file_name().and_then(|n| n.to_str()) {
             let _ = fs::rename(dir.join(sidecar_name(&e.name)), xd.join(sidecar_name(n)));
+            // T141: its NFO goes along, exactly under the new stem.
+            if let Some(new_stem) = n.strip_suffix(".nzb") {
+                let _ = crate::fsops::carry_twin(dir, stem, xd, new_stem);
+            }
         }
         rep.expired = rep.expired.saturating_add(1);
     }

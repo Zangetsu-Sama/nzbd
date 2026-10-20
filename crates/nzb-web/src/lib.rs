@@ -37,6 +37,7 @@ mod login;
 pub mod metrics;
 mod mfa;
 mod middleware;
+mod nfo;
 pub mod page_size;
 pub mod password;
 pub mod ratelimit;
@@ -99,7 +100,10 @@ pub struct WebConfig {
     pub max_connections_per_ip: usize,
     /// Connections reserved for loopback peers (container healthcheck).
     pub loopback_reserved_connections: usize,
-    /// Absolute time to receive one complete request head (slowloris defence).
+    /// Absolute time to receive one complete request head, including the wait between
+    /// keep-alive requests (slowloris defence; enforced by [`listener::serve`]). A reverse proxy
+    /// must drop its idle upstream connections sooner than this (the bundled Caddy uses 8 s),
+    /// or a request sent on a connection nzbd is closing fails with a 502.
     pub header_read_timeout: Duration,
     /// Per-IP budgets per minute.
     pub rate_limits: RateLimits,
@@ -141,8 +145,8 @@ impl Default for WebConfig {
 }
 
 impl WebConfig {
-    /// Wraps a listener with the connection caps, idle timeout, request-head deadline and
-    /// head size cap (SEC-032).
+    /// Wraps a listener with connection caps and an idle timeout (SEC-032). Pass the wrapper
+    /// to [`listener::serve`] to enforce request-head deadlines and size caps in the HTTP parser.
     pub fn limit_listener<L>(&self, inner: L) -> listener::LimitedListener<L> {
         listener::LimitedListener::new(
             inner,
@@ -280,3 +284,6 @@ pub fn router_with_upload(
         .then(|| auth.config().invite_path.clone());
     harden_with(app, cfg, invite)
 }
+
+#[cfg(test)]
+mod log_visibility_tests;

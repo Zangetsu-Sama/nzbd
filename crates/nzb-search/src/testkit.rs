@@ -436,6 +436,8 @@ pub(crate) struct MemDb {
     pub scan_calls: Vec<i64>,
     /// `(ids asked, text bytes returned)` of every `load` call.
     pub load_calls: Vec<(usize, usize)>,
+    /// Loading a chunk containing this id fails with a store timeout (zero returned bytes).
+    pub load_error_for: Option<i64>,
     /// Text bytes returned by every `scan` call.
     pub scan_bytes: Vec<usize>,
 }
@@ -518,6 +520,14 @@ impl crate::indexer::IndexSource for MemSource {
 
     async fn load(&self, ids: &[i64]) -> Result<Vec<IndexDoc>, crate::SearchError> {
         let mut db = self.db();
+        if db.load_error_for.is_some_and(|id| ids.contains(&id)) {
+            db.load_calls.push((ids.len(), 0));
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "injected source timeout",
+            ))
+            .into());
+        }
         let docs: Vec<IndexDoc> = ids.iter().filter_map(|id| db.load_one(*id)).collect();
         let bytes = docs.iter().map(doc_text_bytes).sum();
         db.load_calls.push((ids.len(), bytes));

@@ -1,4 +1,4 @@
-//! `[db]` settings of v3 and their validation (ARCHITECTURE section 7, `SECURITY_DELTA` 2.1, SEC-086/087).
+//! `[db]` settings of v3 and their validation (ARCHITECTURE v3 section 7, `SECURITY_DELTA` 2.1, SEC-086/087).
 //!
 //! The only outbound connection nzbd ever opens is to the Postgres server named here (D33 d). Everything that could
 //! make that connection go somewhere else, or carry extra startup parameters, is refused before a socket is opened:
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-/// Pool size bounds `(min, default, max)` per pool (ARCHITECTURE section 4).
+/// Pool size bounds `(min, default, max)` per pool (ARCHITECTURE v3 section 4).
 pub const POOL_WEB: (u32, u32, u32) = (1, 16, 64);
 /// See [`POOL_WEB`].
 pub const POOL_INGEST: (u32, u32, u32) = (2, 4, 16);
@@ -344,7 +344,7 @@ pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>, PgConfigErro
     Ok(Zeroizing::new(text.to_owned()))
 }
 
-/// The documented location of the owner secret in the `setup` service (ARCHITECTURE section 7).
+/// The documented location of the owner secret in the `setup` service (ARCHITECTURE v3 section 7).
 pub const OWNER_SECRET_PATH: &str = "/run/setup-secrets/nzbd_db_owner_password";
 
 /// `serve` refuses to start when an owner secret is readable by the service uid (review M4, SEC-087): the owner

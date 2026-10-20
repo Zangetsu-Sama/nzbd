@@ -141,14 +141,20 @@ pub(crate) async fn post<S: SearchIndexV3>(
         // One column only (review 48 L1): a preference saved at the same time elsewhere is never reverted.
         if let Err(e) = st
             .db
-            .set_page_size(
-                sess.user_id,
+            .set_page_size_as(
+                &sess.actor(),
                 size,
                 Some(&ip.to_string()),
                 st.clock.now_secs(),
             )
             .await
         {
+            if matches!(
+                e,
+                nzb_store::StoreError::Account(nzb_store::AccountError::Forbidden)
+            ) {
+                return fail(StatusCode::NOT_FOUND, "NOT_FOUND");
+            }
             tracing::error!(error = %e, "page size change failed");
             return fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL");
         }

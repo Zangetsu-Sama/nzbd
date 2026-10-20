@@ -179,7 +179,10 @@ pub fn parse_since(s: &str) -> Result<i64, String> {
         m.parse().map_err(|_| bad())?,
         d.parse().map_err(|_| bad())?,
     );
-    if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if !(1970..=9999).contains(&y)
+        || !(1..=12).contains(&m)
+        || !(1..=days_in_month(y, m)).contains(&d)
+    {
         return Err(bad());
     }
     let secs = match time {
@@ -203,6 +206,15 @@ pub fn parse_since(s: &str) -> Result<i64, String> {
         }
     };
     Ok(days_from_civil(y, m, d) * 86_400 + secs)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// Howard Hinnant's `days_from_civil` (inputs range-checked by the caller).
@@ -409,5 +421,94 @@ mod tests {
             summary(&bad),
             "audit chain BROKEN: first_broken_id=42 kind=gap problems=2 rows=3"
         );
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::parse_since;
+
+    #[test]
+    fn since_rejects_days_outside_their_month() {
+        for date in [
+            "2026-04-31",
+            "2026-06-31",
+            "2026-09-31",
+            "2026-11-31",
+            "2024-02-30",
+            "2024-02-31",
+        ] {
+            for value in [date.to_owned(), format!("{date}T12:34:56Z")] {
+                assert!(
+                    parse_since(&value).is_err(),
+                    "impossible calendar date was accepted: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn since_rejects_non_leap_february_29() {
+        for year in [2023, 1970, 2001, 2100, 2200, 2300, 9999] {
+            let date = format!("{year}-02-29");
+            for value in [date.clone(), format!("{date}T23:59:59Z")] {
+                assert!(
+                    parse_since(&value).is_err(),
+                    "non-leap February 29 was accepted: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn since_preserves_valid_dates_times_and_unix_seconds() {
+        for (value, expected) in [
+            ("0", 0),
+            ("1700000000", 1_700_000_000),
+            ("9223372036854775807", i64::MAX),
+            ("1970-01-01", 0),
+            ("1970-01-01T00:00:01Z", 1),
+            ("2000-02-29", 951_782_400),
+            ("2024-02-29", 1_709_164_800),
+            ("2100-02-28", 4_107_456_000),
+            ("2100-03-01", 4_107_542_400),
+            ("2400-02-29", 13_574_563_200),
+            ("9999-12-31T23:59:59Z", 253_402_300_799),
+        ] {
+            assert_eq!(parse_since(value), Ok(expected), "{value}");
+        }
+        for date in [
+            "2026-01-31",
+            "2026-02-28",
+            "2026-03-31",
+            "2026-04-30",
+            "2026-05-31",
+            "2026-06-30",
+            "2026-07-31",
+            "2026-08-31",
+            "2026-09-30",
+            "2026-10-31",
+            "2026-11-30",
+            "2026-12-31",
+        ] {
+            assert!(parse_since(date).is_ok(), "{date}");
+            let timestamp = format!("{date}T23:59:59Z");
+            assert!(parse_since(&timestamp).is_ok(), "{timestamp}");
+        }
+        for invalid in [
+            "-1",
+            "9223372036854775808",
+            "1969-12-31",
+            "10000-01-01",
+            "2026-01-00",
+            "2026-00-01",
+            "2026-13-01",
+            "2024-02-29T24:00:00Z",
+            "2024-02-29T23:60:00Z",
+            "2024-02-29T23:59:60Z",
+            "2024-02-29T23:59:59",
+        ] {
+            assert!(parse_since(invalid).is_err(), "{invalid}");
+        }
     }
 }

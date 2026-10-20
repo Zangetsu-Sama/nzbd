@@ -41,6 +41,9 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "download_bulk",
     "category_override",
     "source_label_edit",
+    // T140 (review 49 I4).
+    "nfo_attach",
+    "nfo_remove",
     "bulk_edit_category",
     "bulk_edit_source",
     "bulk_delete",

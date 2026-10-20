@@ -9,11 +9,12 @@
 //! (advisory next to a cursor, authoritative without one) and the jump-to-page / last-page path, which
 //! is an offset query. A malformed cursor is a `400 BAD_QUERY` like any other bad parameter.
 //!
-//! v3 search contract (T123, ARCHITECTURE 3.5): the listing goes through [`SearchIndexV3`] with prefix matching
+//! v3 search contract (T123, ARCHITECTURE v3 3.5): the listing goes through [`SearchIndexV3`] with prefix matching
 //! on the last word and the fuzzy fallback for a text query without an exact hit (D35 Q5), totals that may be a
 //! lower bound ("more than n", Q1), numbered (offset) pages capped by the engine at 100,000 rows (Q2: a page beyond
-//! the cap that is not near the end is the uniform `400 BAD_QUERY`; keyset Next/Previous and Last are unaffected),
-//! and, while no index generation is servable, the bounded degraded browse. Every condition is a fixed English
+//! the cap that is not near the end is the uniform `400 BAD_QUERY`; keyset neighbours avoid that offset cap).
+//! Page numbers remain bounded by [`MAX_PAGE`], so Last is unavailable when the real last page exceeds it.
+//! While no index generation is servable, the bounded degraded browse is used. Every condition is a fixed English
 //! notice; expanded or approximate terms are never shown (review 30 I2).
 //!
 //! Every query parameter is untrusted. [`parse_params`] turns the raw query into an
@@ -62,7 +63,20 @@ const MAX_MIB: u64 = 1 << 30;
 /// Longest original file name shown under a title.
 pub const MAX_SOURCE_NAME_BYTES: usize = 255;
 
-pub(crate) const FAMILIES: &[&str] = &["tv", "anime", "movie", "music"];
+pub(crate) const FAMILIES: &[&str] = &["tv", "anime", "movie", "music", "game"];
+
+/// The one display label of a scene family (dropdown, filter chip, badges, release page, statistics): `tv` is an
+/// acronym. Values, query parameters and stored data stay lowercase; an unknown family is shown as stored.
+pub(crate) fn family_label(v: &str) -> String {
+    match v {
+        "tv" => "TV".to_owned(),
+        "anime" => "Anime".to_owned(),
+        "movie" => "Movie".to_owned(),
+        "music" => "Music".to_owned(),
+        "game" => "Game".to_owned(),
+        other => other.to_owned(),
+    }
+}
 pub(crate) const RESOLUTIONS: &[&str] = &["480p", "576p", "720p", "1080p", "2160p"];
 pub(crate) const SOURCES: &[&str] = &[
     "CAM",
@@ -527,7 +541,7 @@ impl IndexParams {
             add(format!("Category: {}", cat.name), &|c| c.category = None);
         }
         if let Some(v) = self.family {
-            add(format!("Family: {v}"), &|c| c.family = None);
+            add(format!("Family: {}", family_label(v)), &|c| c.family = None);
         }
         if let Some(v) = self.resolution {
             add(format!("Resolution: {v}"), &|c| c.resolution = None);
@@ -783,6 +797,17 @@ pub(crate) struct Choice {
     pub(crate) selected: bool,
 }
 
+fn family_choices(current: Option<&str>) -> Vec<Choice> {
+    FAMILIES
+        .iter()
+        .map(|v| Choice {
+            value: (*v).to_owned(),
+            label: family_label(v),
+            selected: current == Some(*v),
+        })
+        .collect()
+}
+
 fn choices(list: &[&str], current: Option<&str>) -> Vec<Choice> {
     list.iter()
         .map(|v| Choice {
@@ -818,6 +843,8 @@ struct Row {
     size: String,
     files: u32,
     flags: Vec<FlagView>,
+    /// The release has a live NFO (T144): an "NFO" badge; filled by one page-wide lookup, not per row.
+    has_nfo: bool,
     scene: Vec<String>,
     /// Media source from scene info (`WEB`, `BluRay`, ...); display data.
     scene_source: Option<String>,
@@ -856,17 +883,11 @@ fn top_level_slug(tax: &Taxonomy, cat: Option<u16>) -> String {
     cur.map(|c| c.slug.clone()).unwrap_or_default()
 }
 
-/// Top-level taxonomy id of `cat` (itself when it has no parent); `None` for an unknown id.
-fn top_level_id(tax: &Taxonomy, cat: u16) -> Option<u16> {
-    let mut cur = tax.get(cat)?;
-    // Depth is tiny (parents precede children); bound the walk anyway.
-    for _ in 0..8 {
-        match cur.parent.and_then(|p| tax.get(p)) {
-            Some(parent) => cur = parent,
-            None => break,
-        }
-    }
-    Some(cur.id)
+/// Slug of the selected category itself (empty for none / unknown id).
+fn selected_slug(tax: &Taxonomy, cat: Option<u16>) -> String {
+    cat.and_then(|c| tax.get(c))
+        .map(|c| c.slug.clone())
+        .unwrap_or_default()
 }
 
 /// Releases per top-level category for the sidebar (T124 U14), from the exact per-category totals the store keeps
@@ -885,9 +906,13 @@ pub(crate) fn browse_counts(
         if hidden.contains(&id) {
             continue;
         }
-        if let Some(top) = top_level_id(tax, id) {
-            let slot = out.entry(top).or_insert(0_u64);
+        // The count of a category covers its whole subtree, so a release counts for itself and every ancestor.
+        let mut cur = tax.get(id);
+        for _ in 0..8 {
+            let Some(c) = cur else { break };
+            let slot = out.entry(c.id).or_insert(0_u64);
             *slot = slot.saturating_add(*n);
+            cur = c.parent.and_then(|p| tax.get(p));
         }
     }
     out
@@ -967,7 +992,12 @@ pub(crate) fn category_source_label(s: CategorySource) -> &'static str {
 /// come from untrusted file names (`docs/UI_SPEC.md`).
 pub(crate) fn flag_labels(r: &ReleaseRow, health: bool) -> Vec<String> {
     let mut out = Vec::new();
-    let f = r.flags;
+    let mut f = r.flags;
+    // T148: a manual category is the owner's choice, so a stale fallback bit (rows overridden before
+    // the store cleared it) must not show "Uncategorized".
+    if r.category_overridden || r.category_source == CategorySource::Manual {
+        f = ReleaseFlags::from_bits_truncate(f.bits() & !ReleaseFlags::UNCATEGORIZED.bits());
+    }
     // Incomplete/Repairability derive from gaps in the NZB's own numbering, not from a news
     // server check; hidden until `SEGMENT_HEALTH_CHECK_AVAILABLE` (the stored flag is untouched).
     if health && f.contains(ReleaseFlags::INCOMPLETE) {
@@ -1001,7 +1031,7 @@ fn scene_parts(r: &ReleaseRow) -> Vec<String> {
     let s = &r.scene;
     let mut v = Vec::new();
     if let Some(x) = &s.family {
-        v.push(x.clone());
+        v.push(family_label(x));
     }
     if let Some(x) = &s.resolution {
         v.push(x.clone());
@@ -1010,7 +1040,7 @@ fn scene_parts(r: &ReleaseRow) -> Vec<String> {
         v.push(x.to_string());
     }
     if let Some(x) = &s.group {
-        v.push(format!("group {x}"));
+        v.push(format!("Group {x}"));
     }
     v
 }
@@ -1082,6 +1112,7 @@ fn to_row(r: &ReleaseRow, tax: &Taxonomy, now: i64, health: bool) -> Row {
         size: human_bytes(r.total_bytes),
         files: r.file_count,
         flags: flag_views(flag_labels(r, health)),
+        has_nfo: false,
         scene: scene_parts(r),
         scene_source: r.scene.source.clone().filter(|x| !x.is_empty()),
         source_label,
@@ -1119,7 +1150,7 @@ struct IndexPage {
     prev_href: Option<String>,
     next_href: Option<String>,
     first_href: String,
-    last_href: String,
+    last_href: Option<String>,
     clear_href: String,
     sort_value: &'static str,
     chips: Vec<Chip>,
@@ -1133,7 +1164,7 @@ struct IndexPage {
     /// The total is a lower bound (the count stopped at `search.count_budget_ms`): "more than n", no
     /// page count and no Last link (T123, D35 Q1).
     approx: bool,
-    /// The page count is known (exact total, not degraded): "page N of M" and the Last link.
+    /// The page count is known (exact total, not degraded): "page N of M". Last also needs a supported page number.
     pages_known: bool,
     /// The total with thousands separators (the status line).
     total_text: String,
@@ -1168,9 +1199,13 @@ impl Notice {
 /// expanded terms are never shown (review 30 I2).
 pub const NOTICE_NARROWED: &str = "Search narrowed: a word matched too many index terms, so only part \
 of them was searched. Type more of the word for complete results.";
+/// With exclusions, a shared dictionary's actual cap event must not become a hidden-content signal.
+/// This describes the request's bounded matching policy without claiming a truncation occurred.
+pub const NOTICE_BOUNDED: &str = "Prefix and approximate matches use a limited set of alternatives. \
+Use more specific search terms if a result is missing.";
 /// The fuzzy fallback produced the page (no exact hit, D35 Q5). The approximate terms are never shown.
 pub const NOTICE_APPROXIMATE: &str = "No exact matches. Showing approximate matches.";
-/// Degraded browse (ARCHITECTURE 3.3).
+/// Degraded browse (ARCHITECTURE v3 3.3).
 pub const NOTICE_DEGRADED: &str = "The search index is being rebuilt. Until it is ready this list shows \
 the newest releases only; search, sorting and filters other than category are not available.";
 /// Degraded browse with a search, sort or filter other than category.
@@ -1180,6 +1215,8 @@ pub const NOTICE_DEGRADED_FILTERS: &str =
 pub const NOTICE_DEGRADED_CATEGORY: &str = "This category is available after the rebuild.";
 /// Degraded browse that stopped at its row budget.
 pub const NOTICE_DEGRADED_MORE: &str = "More releases are listed after the rebuild.";
+/// An exact total can exceed the range of page numbers accepted by the UI.
+const NOTICE_PAGE_LIMIT: &str = "The last page is beyond the supported page range. Narrow your search or filters to reach the end of the results.";
 
 /// "More than n" notice (D35 Q1): `n` is the engine's lower bound, formatted with separators.
 fn notice_more_than(n: u64) -> String {
@@ -1322,8 +1359,8 @@ pub(crate) fn category_choices(
     current: Option<u16>,
     hidden: &[u16],
 ) -> Vec<Choice> {
-    tax.entries()
-        .iter()
+    tax.display_order()
+        .into_iter()
         .filter(|c| !hidden.contains(&c.id))
         .map(|c| Choice {
             value: c.slug.clone(),
@@ -1416,7 +1453,9 @@ async fn search_listing<S: SearchIndexV3>(
     if page.fuzzy_fallback && !page.items.is_empty() {
         notices.push(Notice::info(NOTICE_APPROXIMATE));
     }
-    if page.narrowed {
+    if !req.query.exclude_categories.is_empty() && page.expansion_bounded {
+        notices.push(Notice::info(NOTICE_BOUNDED));
+    } else if req.query.exclude_categories.is_empty() && page.narrowed {
         notices.push(Notice::info(NOTICE_NARROWED));
     }
     if approx {
@@ -1433,7 +1472,7 @@ async fn search_listing<S: SearchIndexV3>(
     })
 }
 
-/// The bounded degraded browse (ARCHITECTURE 3.3, review L5): newest first, category only.
+/// The bounded degraded browse (ARCHITECTURE v3 3.3, review L5): newest first, category only.
 async fn degraded_listing(
     db: &Store,
     tax: &Taxonomy,
@@ -1542,7 +1581,7 @@ async fn index<S: SearchIndexV3>(
         Err(ListError::BadQuery) => return bad_query(),
         Err(ListError::Failed(e)) => Err(e),
     };
-    let listing = match listed {
+    let mut listing = match listed {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(error = %e, "index search failed");
@@ -1550,16 +1589,33 @@ async fn index<S: SearchIndexV3>(
         }
     };
     let now = st.clock.now_secs();
-    let rows: Vec<Row> = listing
+    let mut rows: Vec<Row> = listing
         .items
         .iter()
         .map(|r| to_row(r, tax, now, SEGMENT_HEALTH_CHECK_AVAILABLE))
         .collect();
+    // NFO badges (T144): one lookup for the whole page (search, keyset and degraded paths alike). The ids are the
+    // rows this caller may already see; a failed lookup only drops the badges, never the page.
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    match st.db.releases_with_nfo(&ids).await {
+        Ok(with) => {
+            for r in &mut rows {
+                r.has_nfo = with.contains(&r.id);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "nfo badge lookup failed"),
+    }
     let pages_known = !listing.approx && !listing.degraded;
     let mut pages = listing.total.div_ceil(u64::from(per_page));
     if p.cursor.is_some() || listing.degraded {
         // A cursor page's number is advisory: after concurrent deletes it can exceed the page count.
         pages = pages.max(u64::from(p.page));
+    }
+    let last_page = u32::try_from(pages.max(1))
+        .ok()
+        .filter(|page| *page <= MAX_PAGE);
+    if pages_known && last_page.is_none() {
+        listing.notices.push(Notice::info(NOTICE_PAGE_LIMIT));
     }
     // A degraded page is numbered by the page parameter (advisory, like a cursor page).
     let start = if listing.degraded {
@@ -1602,7 +1658,12 @@ async fn index<S: SearchIndexV3>(
         size: human_bytes(s.bytes),
         incomplete: s.incomplete.to_string(),
     });
-    let ticks = st.ticks(&hidden).await;
+    // Filtered listings do not show the timeline, so do not query the ingest log for them.
+    let ticks = if p.is_filtered() {
+        Vec::new()
+    } else {
+        st.ticks(&hidden).await
+    };
     // Sidebar counts (T124 U14): one O(categories) read; a failure only drops the numbers, never the page.
     let counts = st
         .db
@@ -1618,6 +1679,7 @@ async fn index<S: SearchIndexV3>(
         layout: {
             let mut l = Layout::for_session("Index", &sess);
             l.browse_cur = top_level_slug(tax, p.category);
+            l.browse_sel = selected_slug(tax, p.category);
             if let Some(c) = &counts {
                 l.with_browse_counts(|id| compact_count_exact(c.get(&id).copied().unwrap_or(0)));
             }
@@ -1629,7 +1691,7 @@ async fn index<S: SearchIndexV3>(
         per_page_choices: crate::page_size::choices(nzb_store::ReleasePageSize::CHOICES, per_page),
         filtered: p.is_filtered(),
         categories: category_choices(tax, p.category, &sess.hidden_categories),
-        families: choices(FAMILIES, p.family),
+        families: family_choices(p.family),
         resolutions: choices(RESOLUTIONS, p.resolution),
         sources: choices(SOURCES, p.source),
         title_head: head(
@@ -1651,12 +1713,7 @@ async fn index<S: SearchIndexV3>(
         prev_href,
         next_href,
         first_href: p.href(tax, p.sort, 1, true),
-        last_href: p.href(
-            tax,
-            p.sort,
-            u32::try_from(pages.max(1)).unwrap_or(MAX_PAGE),
-            true,
-        ),
+        last_href: last_page.map(|page| p.href(tax, p.sort, page, true)),
         show_incomplete: SEGMENT_HEALTH_CHECK_AVAILABLE,
         chips: p.chips(tax),
         more_open: p.any_secondary(),
@@ -1851,6 +1908,21 @@ mod tests {
     }
 
     #[test]
+    fn t148_uncategorized_badge_only_for_the_untouched_fallback() {
+        let mut r = damaged_row();
+        r.flags = ReleaseFlags::UNCATEGORIZED;
+        assert_eq!(flag_labels(&r, false), vec!["Uncategorized".to_owned()]);
+        r.category_overridden = true;
+        r.category_source = CategorySource::Manual;
+        assert_eq!(flag_labels(&r, false).len(), 0);
+        r.category_overridden = false;
+        assert_eq!(flag_labels(&r, false).len(), 0);
+        r.category_source = CategorySource::Fallback;
+        r.category_overridden = true;
+        assert_eq!(flag_labels(&r, false).len(), 0);
+    }
+
+    #[test]
     fn health_switch_controls_gap_derived_badges_and_meter() {
         let r = damaged_row();
         // Switch on: the original behaviour.
@@ -1867,5 +1939,356 @@ mod tests {
         assert_eq!(row.meter_state, "ok");
         assert!(row.flags.is_empty());
         assert_eq!(r.missing_segment_count, 3);
+    }
+}
+
+#[cfg(test)]
+mod hb6_regressions {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use nzb_search::request::SearchPage;
+    use nzb_store::{KeysetPage, Page, SearchDoc, SearchIndex};
+    use tower::ServiceExt as _;
+
+    const LIMIT_NOTICE: &str = "The last page is beyond the supported page range.";
+
+    /// Only the search seam is synthetic: real routing, extraction, view assembly and Askama rendering
+    /// consume a large total with at most one page of rows. This also runs against the unfixed handler.
+    #[derive(Clone)]
+    struct LargeListing {
+        total: Total,
+        seen: Arc<std::sync::Mutex<Vec<SearchQuery>>>,
+        narrowed: bool,
+        expansion_bounded: bool,
+    }
+
+    impl LargeListing {
+        fn page(&self, req: &SearchRequest) -> SearchPage {
+            self.seen.lock().unwrap().push(req.query.clone());
+            let count = self
+                .total
+                .value()
+                .saturating_sub(u64::from(req.query.offset))
+                .min(u64::from(req.query.limit));
+            let items = (0..count)
+                .map(|i| ReleaseRow {
+                    id: i64::from(req.query.offset) + i64::try_from(i).unwrap() + 1,
+                    sha256: nzb_core::Sha256([0; 32]),
+                    title: format!("Listing fixture {i}"),
+                    category_id: 5040,
+                    category_overridden: false,
+                    category_source: CategorySource::Fallback,
+                    posted_at: Some(1_700_000_000),
+                    ingested_at: 1_700_000_000,
+                    total_bytes: 2 << 20,
+                    poster: None,
+                    file_count: 1,
+                    segment_count: 1,
+                    missing_segment_count: 0,
+                    par2_blocks: 0,
+                    flags: ReleaseFlags::EMPTY,
+                    nzb_size_bytes: 100,
+                    source_name: None,
+                    source_label: None,
+                    origin: None,
+                    meta_json: None,
+                    scene: nzb_store::SceneColumns::default(),
+                })
+                .collect();
+            SearchPage {
+                items,
+                total: self.total,
+                has_more: u64::from(req.query.offset).saturating_add(count) < self.total.value(),
+                limit: req.query.limit,
+                facets: Vec::new(),
+                narrowed: self.narrowed,
+                expansion_bounded: self.expansion_bounded,
+                fuzzy_fallback: false,
+                dropped: 0,
+            }
+        }
+    }
+
+    impl SearchIndex for LargeListing {
+        fn search(
+            &self,
+            _: &SearchQuery,
+        ) -> impl Future<Output = Result<Page<ReleaseRow>, StoreError>> {
+            std::future::ready(Err(StoreError::OutOfRange("unexpected legacy search")))
+        }
+
+        fn search_keyset(
+            &self,
+            _: &SearchQuery,
+            _: SeekDir,
+            _: &PageCursor,
+        ) -> impl Future<Output = Result<KeysetPage, StoreError>> {
+            std::future::ready(Err(StoreError::OutOfRange("unexpected legacy search")))
+        }
+
+        fn count(&self, _: &SearchQuery) -> impl Future<Output = Result<u64, StoreError>> {
+            std::future::ready(Ok(self.total.value()))
+        }
+
+        fn upsert(&self, _: &SearchDoc<'_>) -> impl Future<Output = Result<(), StoreError>> {
+            std::future::ready(Err(StoreError::OutOfRange("read-only listing fixture")))
+        }
+
+        fn remove(&self, _: i64) -> impl Future<Output = Result<(), StoreError>> {
+            std::future::ready(Err(StoreError::OutOfRange("read-only listing fixture")))
+        }
+    }
+
+    impl SearchIndexV3 for LargeListing {
+        fn search_page(
+            &self,
+            req: &SearchRequest,
+        ) -> impl Future<Output = Result<SearchPage, SearchError>> {
+            std::future::ready(Ok(self.page(req)))
+        }
+
+        fn search_keyset_page(
+            &self,
+            req: &SearchRequest,
+            _: SeekDir,
+            _: &PageCursor,
+        ) -> impl Future<Output = Result<SearchPage, SearchError>> {
+            std::future::ready(Ok(self.page(req)))
+        }
+
+        fn count_total(
+            &self,
+            _: &SearchRequest,
+        ) -> impl Future<Output = Result<Total, SearchError>> {
+            std::future::ready(Ok(self.total))
+        }
+    }
+
+    fn listing_app(db: Store, search: LargeListing, per_page: u32) -> Router {
+        let sess = SessionCtx {
+            user_id: 1,
+            stage: nzb_store::SessionStage::Active,
+            csrf_token: String::new(),
+            hidden_categories: Arc::from([]),
+            prefs: nzb_store::UserPrefs {
+                page_size_releases: nzb_store::ReleasePageSize::new(per_page).unwrap(),
+                ..nzb_store::UserPrefs::default()
+            },
+            role: nzb_store::Role::Viewer,
+            username: "listing-reader".to_owned(),
+            display_name: "Listing reader".to_owned(),
+            enroll_proven: false,
+            multi_user: false,
+            id_hash: [0; 32],
+            last_seen_at: 0,
+            created_at: 0,
+            library_gen: Arc::default(),
+        };
+        routes_with_clock(
+            db,
+            search,
+            Arc::new(Taxonomy::builtin().unwrap()),
+            Arc::new(crate::auth::ManualWallClock::new(1_700_000_001)),
+        )
+        .layer(Extension(sess))
+    }
+
+    async fn html(app: &Router, uri: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "listing URI: {uri}");
+        String::from_utf8(
+            to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// Read the actual navigation links, not the view's private fields. Returned URLs can be followed
+    /// as an ordinary browser would, without needing JavaScript or generating a large search index.
+    fn pager_links_in(body: &str) -> Vec<(&str, String)> {
+        let pager = body
+            .split_once("<nav class=\"pager\"")
+            .and_then(|(_, rest)| rest.split_once("</nav>"))
+            .map_or("", |(nav, _)| nav);
+        pager
+            .split("<a ")
+            .skip(1)
+            .filter_map(|link| {
+                let (attrs, rest) = link.split_once('>')?;
+                let (label, _) = rest.split_once("</a>")?;
+                let href = attrs.split_once("href=\"")?.1.split_once('"')?.0;
+                // Askama escapes ampersands numerically; a browser decodes both forms.
+                Some((label, href.replace("&#38;", "&").replace("&amp;", "&")))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hidden_search_notices_do_not_disclose_dictionary_cap_events() {
+        for narrowed in [false, true] {
+            let mut search = LargeListing {
+                total: Total::Exact(0),
+                seen: Arc::default(),
+                narrowed,
+                expansion_bounded: true,
+            };
+            let mut req = SearchRequest {
+                query: SearchQuery {
+                    q: Some("par".into()),
+                    exclude_categories: vec![6000],
+                    ..SearchQuery::default()
+                },
+                match_mode: MatchMode::Prefix,
+                ..SearchRequest::default()
+            };
+            let listing = search_listing(&search, &req, None).await.ok().unwrap();
+            assert_eq!(listing.items.len(), 0);
+            assert_eq!(
+                listing
+                    .notices
+                    .iter()
+                    .map(|n| n.text.as_str())
+                    .collect::<Vec<_>>(),
+                [NOTICE_BOUNDED]
+            );
+            // Ordinary unfiltered searches retain the actual truncation notice.
+            req.query.exclude_categories.clear();
+            let listing = search_listing(&search, &req, None).await.ok().unwrap();
+            assert_eq!(listing.notices.len(), usize::from(narrowed));
+            assert!(listing.notices.iter().all(|n| n.text == NOTICE_NARROWED));
+            // The engine's corpus-independent flag is false for exact/no-text/off queries.
+            req.query.exclude_categories = vec![6000];
+            search.expansion_bounded = false;
+            search.narrowed = false;
+            for (q, mode) in [(None, MatchMode::Prefix), (Some("par"), MatchMode::Exact)] {
+                req.query.q = q.map(str::to_owned);
+                req.match_mode = mode;
+                let listing = search_listing(&search, &req, None).await.ok().unwrap();
+                assert!(listing.notices.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn last_page_outside_the_accepted_range_is_not_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        let tax = Taxonomy::builtin().unwrap();
+        for per_page in nzb_store::ReleasePageSize::CHOICES {
+            for total in [u64::from(MAX_PAGE) * u64::from(*per_page) + 1, u64::MAX] {
+                let search = LargeListing {
+                    total: Total::Exact(total),
+                    seen: Arc::default(),
+                    narrowed: false,
+                    expansion_bounded: false,
+                };
+                let app = listing_app(db.store.clone(), search, *per_page);
+                let body = html(&app, "/?q=alpha&sort=size_asc&min_mib=1").await;
+                let links = pager_links_in(&body);
+                assert!(
+                    links.iter().all(|(label, _)| *label != "Last"),
+                    "Last must not link to an unsupported page: total={total}, size={per_page}"
+                );
+                assert!(body.contains(LIMIT_NOTICE));
+                assert!(body.contains("Narrow your search or filters"));
+                assert!(body.contains(&compact_count_exact(total)));
+                let (_, next) = links.iter().find(|(label, _)| *label == "Next").unwrap();
+                let p = parse_params(next.split_once('?').map(|(_, q)| q), &tax).unwrap();
+                assert_eq!(p.q.as_deref(), Some("alpha"));
+                assert_eq!(p.sort, SortKey::SizeAsc);
+                assert_eq!(p.min_mib, Some(1));
+                assert_eq!(p.page, 2);
+                assert!(
+                    p.cursor.is_some(),
+                    "Next must retain its bounded keyset path"
+                );
+                let next_body = html(&app, next).await;
+                assert!(
+                    pager_links_in(&next_body)
+                        .iter()
+                        .any(|(label, _)| *label == "Previous")
+                );
+                assert!(next_body.contains(LIMIT_NOTICE));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn last_page_at_the_limit_still_roundtrips_with_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        for per_page in nzb_store::ReleasePageSize::CHOICES {
+            let search = LargeListing {
+                total: Total::Exact(u64::from(MAX_PAGE) * u64::from(*per_page)),
+                seen: Arc::default(),
+                narrowed: false,
+                expansion_bounded: false,
+            };
+            let seen = Arc::clone(&search.seen);
+            let app = listing_app(db.store.clone(), search, *per_page);
+            let body = html(
+                &app,
+                "/?cat=tv.hd&from=2020-01-01&to=2024-02-29&sort=size_desc&max_mib=8",
+            )
+            .await;
+            assert!(!body.contains(LIMIT_NOTICE));
+            let links = pager_links_in(&body);
+            let (_, last) = links.iter().find(|(label, _)| *label == "Last").unwrap();
+            let body = html(&app, last).await;
+            assert!(body.contains("Page 100000 of 100000"));
+            assert!(
+                !pager_links_in(&body)
+                    .iter()
+                    .any(|(label, _)| matches!(*label, "Last" | "Next"))
+            );
+            let requests = seen.lock().unwrap();
+            let first = requests.first().unwrap();
+            let last = requests.last().unwrap();
+            assert_eq!(last.offset, (MAX_PAGE - 1) * per_page);
+            assert_eq!(last.limit, *per_page);
+            assert_eq!(last.categories, first.categories);
+            assert_eq!(last.since, first.since);
+            assert_eq!(last.until, first.until);
+            assert_eq!(last.sort, first.sort);
+            assert_eq!(last.max_bytes, first.max_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn inexact_or_empty_listings_do_not_claim_an_unreachable_last_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = nzb_store::test_backend::TestStore::open(dir.path()).await;
+        for total in [Total::AtLeast(u64::MAX), Total::Exact(0)] {
+            let app = listing_app(
+                db.store.clone(),
+                LargeListing {
+                    total,
+                    seen: Arc::default(),
+                    narrowed: false,
+                    expansion_bounded: false,
+                },
+                25,
+            );
+            let body = html(&app, "/").await;
+            assert!(!body.contains(LIMIT_NOTICE));
+            assert!(
+                !pager_links_in(&body)
+                    .iter()
+                    .any(|(label, _)| *label == "Last")
+            );
+            assert_eq!(
+                body.contains("more than"),
+                matches!(total, Total::AtLeast(_))
+            );
+        }
     }
 }

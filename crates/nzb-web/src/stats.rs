@@ -447,8 +447,14 @@ fn category_rows(tax: &Taxonomy, rows: &[CategoryTotals]) -> Vec<CatRow> {
             parents.push(((c.id, n, b), children));
         }
     }
-    parents.sort_by(|x, y| y.0.1.cmp(&x.0.1).then(x.0.0.cmp(&y.0.0)));
-    let max = parents.first().map_or(0, |p| p.0.1);
+    // XXX is listed last whatever its size (T146); the others stay by releases, then id.
+    parents.sort_by(|x, y| {
+        (x.0.0 == nzb_core::XXX_CATEGORY)
+            .cmp(&(y.0.0 == nzb_core::XXX_CATEGORY))
+            .then(y.0.1.cmp(&x.0.1))
+            .then(x.0.0.cmp(&y.0.0))
+    });
+    let max = parents.iter().map(|p| p.0.1).max().unwrap_or(0);
     let row = |id: u16, n: u64, b: u64, child: bool| CatRow {
         name_parts: tax
             .get(id)
@@ -502,14 +508,10 @@ fn group_list(tax: &Taxonomy, g: &Ranked) -> BarList {
     bars(items)
 }
 
-fn family_label(v: &str) -> Option<&'static str> {
-    match v {
-        "tv" => Some("TV"),
-        "movie" => Some("Movie"),
-        "music" => Some("Music"),
-        "anime" => Some("Anime"),
-        _ => None,
-    }
+fn family_label(v: &str) -> Option<String> {
+    crate::index::FAMILIES
+        .contains(&v)
+        .then(|| crate::index::family_label(v))
 }
 
 fn ranked_list(
@@ -553,7 +555,7 @@ fn quality_lists(tax: &Taxonomy, q: Option<&QualityStats>) -> Vec<QualityList> {
             ranked_list(
                 tax,
                 &q.family,
-                |v| family_label(v).map_or_else(|| v.to_owned(), str::to_owned),
+                |v| family_label(v).unwrap_or_else(|| v.to_owned()),
                 |p, v| {
                     p.family = Some(pick(crate::index::FAMILIES, v)?);
                     Some(())
@@ -769,16 +771,17 @@ name = "Other/Misc"
     /// Review 47 I3: a grandchild is summed into its top-level category and listed under it, never lost.
     #[test]
     fn category_tree_keeps_grandchildren() {
+        // T146: XXX is listed last whatever its size.
         let tax = deep_taxonomy();
         let rows = [totals(6010, 2), totals(6011, 3), totals(8010, 1)];
         assert_eq!(
             names(&category_rows(&tax, &rows)),
             vec![
+                ("Other".to_owned(), "1".to_owned(), false),
+                ("Other/Misc".to_owned(), "1".to_owned(), true),
                 ("XXX".to_owned(), "5".to_owned(), false),
                 ("XXX/DVD/Old".to_owned(), "3".to_owned(), true),
                 ("XXX/DVD".to_owned(), "2".to_owned(), true),
-                ("Other".to_owned(), "1".to_owned(), false),
-                ("Other/Misc".to_owned(), "1".to_owned(), true),
             ]
         );
         // The built-in taxonomy has two levels (the case the page is laid out for).

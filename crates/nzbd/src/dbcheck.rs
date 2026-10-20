@@ -698,9 +698,27 @@ mod tests {
         // `restore-finish`; both the dry run and the real run fail and the bytes stay identical.
         let d = tempfile::tempdir().unwrap();
         let c = cfg(d.path());
-        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/v2.0.0/nzbd.sqlite");
-        std::fs::copy(&fx, &c.paths.db).unwrap();
+        // The production bundle contains the old migrations, but no binary test fixtures.
+        // Build the real legacy schema locally so this regression works from a fresh checkout.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use sqlx::Connection as _;
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&c.paths.db)
+                .create_if_missing(true);
+            let mut conn = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .unwrap();
+            sqlx::migrate!("../../migrations")
+                .run(&mut conn)
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+        });
+        drop(rt);
         let before = std::fs::read(&c.paths.db).unwrap();
         for (yes, dry_run) in [(false, true), (true, false)] {
             let r = run_db(

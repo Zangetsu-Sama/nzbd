@@ -505,6 +505,38 @@ pub(crate) async fn degraded_browse_reads_the_store(store: &Store) {
     assert_eq!(totals, [(5040, 1), (8010, 5)]);
 }
 
+/// D41 (owner decision 2026-10-19, T142 abandoned): NFO text is display data only, never indexed or searchable. A
+/// word that appears only in an attached NFO finds nothing; the release's own title still finds it.
+pub(crate) async fn t142_nfo_text_is_never_searchable(store: &Store) {
+    use nzb_store::{NfoAttach, SearchIndex as _, SearchQuery};
+    let d = tempfile::tempdir().unwrap();
+    let id = Spec::new(1, "Plain Title GRP", 10, Some(1), 8010)
+        .insert_into(store)
+        .await;
+    let sha = crate::testkit::sha(1);
+    assert_eq!(
+        store
+            .attach_watch_nfo(id, &sha, b"zqxnfoonlyword greetings Plain", 1_700_000_000)
+            .await
+            .unwrap(),
+        NfoAttach::Attached
+    );
+    let index = crate::testing::SettlingIndex::open(store, d.path()).await;
+    index.settle().await.unwrap();
+    let q = |text: &str| SearchQuery {
+        q: Some(text.to_owned()),
+        limit: 10,
+        ..SearchQuery::default()
+    };
+    let hit = index.search(&q("Title")).await.unwrap();
+    assert_eq!(hit.items.iter().map(|r| r.id).collect::<Vec<_>>(), [id]);
+    for word in ["zqxnfoonlyword", "greetings"] {
+        let miss = index.search(&q(word)).await.unwrap();
+        assert_eq!(miss.total, 0, "{word}");
+        assert!(miss.items.is_empty(), "{word}");
+    }
+}
+
 macro_rules! store_suite {
     ($open:path; $($name:ident),* $(,)?) => {
         $(
@@ -536,4 +568,5 @@ both!(
     sec_095_indexer_batch_memory_is_bounded,
     hydrator_rechecks_existence_and_category,
     degraded_browse_reads_the_store,
+    t142_nfo_text_is_never_searchable,
 );

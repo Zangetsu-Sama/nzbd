@@ -15,7 +15,8 @@
 //! * cost control: the cheap checks run at most once per [`CACHE_SECS`] behind a single-flight
 //!   lock (an owned task, so a cancelled request cannot start a second collection); the
 //!   deep check is a separate `POST` (session + CSRF + Origin through the shared gate, login
-//!   rate class), runs in an owned task holding a one-permit semaphore under a deadline, and
+//!   rate class), runs in an owned task holding a one-permit semaphore until work ends even
+//!   after the response deadline, and
 //!   its result is shown for [`DEEP_TTL_SECS`].
 
 use std::future::Future;
@@ -46,9 +47,9 @@ pub const DEEP_TTL_SECS: i64 = 600;
 /// Minimum seconds between two deep runs (the rate limiter is per minute; this also guards
 /// repeated clicks from different sessions).
 pub const DEEP_COOLDOWN_SECS: i64 = 30;
-/// Hard deadline of one deep run.
+/// Deadline for publishing a deep result; unfinished work retains its permit.
 pub const DEEP_DEADLINE: Duration = Duration::from_secs(60);
-/// Deadline of one cheap collection.
+/// Deadline for answering one cheap-check request.
 pub const CHEAP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Outcome of one check. Always rendered as text; colour is only a second cue.
@@ -295,43 +296,44 @@ impl HealthState {
         *self.deep.lock().unwrap_or_else(PoisonError::into_inner) = s;
     }
 
-    /// Cheap checks, reused for [`CACHE_SECS`]. The refresh runs in an owned task that holds
-    /// the cache lock until done (single flight; a disconnecting client cannot start a second
-    /// collection) and is bounded by [`CHEAP_DEADLINE`].
+    /// Cache acquisition and the response wait are bounded, but the single owned collector
+    /// keeps its cache lock until its real work ends. Dropping a blocking task's `JoinHandle`
+    /// does not stop that task, so a response deadline must not cancel the collector itself.
     async fn cheap(&self, now: i64) -> Arc<Vec<Check>> {
-        let this = self.clone();
-        let job = tokio::spawn(async move {
-            let mut guard = this.cache.lock().await;
+        let collect = async {
+            // Waiters do not create background tasks. Cancelling one only removes its lock
+            // request; a running collector remains the sole owner of the cache guard.
+            let mut guard = Arc::clone(&self.cache).lock_owned().await;
             if let Some((at, checks)) = guard.as_ref()
-                && (0..CACHE_SECS).contains(&now.saturating_sub(*at))
+                && (0..CACHE_SECS).contains(&self.deps.clock.now_secs().saturating_sub(*at))
             {
-                return Arc::clone(checks);
+                return Ok(Arc::clone(checks));
             }
-            let fut = (this.deps.cheap)(now);
-            let checks = tokio::time::timeout(CHEAP_DEADLINE, fut)
-                .await
-                .unwrap_or_else(|_| {
-                    vec![Check::new(
-                        Group::App,
-                        "Health collection",
-                        Status::Fail,
-                        "timed out",
-                        "A probe is hanging, usually a stuck disk or network mount. Check the host.",
-                    )]
-                });
-            let checks = Arc::new(checks);
-            *guard = Some((now, Arc::clone(&checks)));
-            checks
-        });
-        job.await.unwrap_or_else(|_| {
-            Arc::new(vec![Check::new(
+            let this = self.clone();
+            tokio::spawn(async move {
+                let checks = Arc::new((this.deps.cheap)(now).await);
+                *guard = Some((this.deps.clock.now_secs(), Arc::clone(&checks)));
+                checks
+            })
+            .await
+        };
+        match tokio::time::timeout(CHEAP_DEADLINE, collect).await {
+            Ok(Ok(checks)) => checks,
+            Ok(Err(_)) => Arc::new(vec![Check::new(
                 Group::App,
                 "Health collection",
                 Status::Fail,
                 "failed internally",
                 "See the server log.",
-            )])
-        })
+            )]),
+            Err(_) => Arc::new(vec![Check::new(
+                Group::App,
+                "Health collection",
+                Status::Fail,
+                "timed out",
+                "A probe is hanging, usually a stuck disk or network mount. Check the host.",
+            )]),
+        }
     }
 }
 
@@ -504,16 +506,24 @@ async fn run_deep(State(st): State<HealthState>) -> Response {
     }
     st.set_deep(DeepState::Running { since: now });
     let deadline = st.deps.deep_deadline;
-    // Owned task: it keeps the permit until the work is done even if the client disconnects,
-    // and the permit is released when the task ends by any path (panic included).
+    // An owned monitor publishes the result even if the client disconnects. Its inner
+    // worker retains the permit until the collector ends, including after a timeout.
     tokio::spawn(async move {
-        let _permit = permit;
+        // Both tasks retain ownership: normal completion/panic cannot release the permit
+        // before the monitor publishes Done, and timeout cannot release it before I/O ends.
+        let permit = Arc::new(permit);
         let mut guard = RunGuard {
             st: st.clone(),
             armed: true,
         };
-        let checks = match tokio::time::timeout(deadline, deep(now)).await {
-            Ok(c) => c,
+        let worker_permit = Arc::clone(&permit);
+        let job = tokio::spawn(async move {
+            let _permit = worker_permit;
+            deep(now).await
+        });
+        let checks = match tokio::time::timeout(deadline, job).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(_)) => vec![aborted()],
             Err(_) => vec![Check::new(
                 Group::Deep,
                 "Deep check",
@@ -589,5 +599,201 @@ mod tests {
         assert_eq!(notice(Some("deep=<script>")), "");
         assert!(notice(Some("deep=started")).contains("started"));
         assert_eq!(notice(None), "");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod worker_lifetime_tests {
+    use std::sync::Condvar;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::auth::ManualWallClock;
+
+    const NOW: i64 = 1_800_000_000;
+
+    struct ProbeState {
+        gate: (Mutex<bool>, Condvar),
+        started: Semaphore,
+        calls: AtomicUsize,
+    }
+
+    /// A real blocking worker, released on every exit path (including a failed assertion).
+    struct BlockingProbe(Arc<ProbeState>);
+
+    impl BlockingProbe {
+        fn new() -> Self {
+            Self(Arc::new(ProbeState {
+                gate: (Mutex::new(false), Condvar::new()),
+                started: Semaphore::new(0),
+                calls: AtomicUsize::new(0),
+            }))
+        }
+
+        fn collector(&self) -> CollectFn {
+            let probe = Arc::clone(&self.0);
+            Arc::new(move |_| {
+                let probe = Arc::clone(&probe);
+                Box::pin(async move {
+                    tokio::task::spawn_blocking(move || {
+                        probe.calls.fetch_add(1, Ordering::SeqCst);
+                        probe.started.add_permits(1);
+                        let (lock, ready) = &probe.gate;
+                        let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                        let _guard = ready
+                            .wait_while(guard, |released| !*released)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        vec![Check::new(
+                            Group::Storage,
+                            "Filesystem probe",
+                            Status::Ok,
+                            "finished",
+                            "",
+                        )]
+                    })
+                    .await
+                    .unwrap()
+                })
+            })
+        }
+
+        async fn started(&self) {
+            tokio::time::timeout(Duration::from_secs(2), self.0.started.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+        }
+
+        fn release(&self) {
+            let (lock, ready) = &self.0.gate;
+            *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            ready.notify_all();
+        }
+    }
+
+    impl Drop for BlockingProbe {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn state(probe: &BlockingProbe, clock: Arc<ManualWallClock>) -> HealthState {
+        let collect = probe.collector();
+        let mut deps = HealthDeps::new(clock, Arc::clone(&collect), Some(collect));
+        deps.deep_deadline = Duration::from_millis(20);
+        HealthState {
+            deps,
+            cache: Arc::new(AsyncMutex::new(None)),
+            deep: Arc::new(Mutex::new(DeepState::Idle)),
+            permit: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    async fn cheap_worker_remains_owned(cancel_client: bool) {
+        let probe = BlockingProbe::new();
+        let clock = Arc::new(ManualWallClock::new(NOW));
+        let st = state(&probe, Arc::clone(&clock));
+        let caller = {
+            let st = st.clone();
+            tokio::spawn(async move { st.cheap(NOW).await })
+        };
+        probe.started().await;
+        if cancel_client {
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            tokio::time::sleep(CHEAP_DEADLINE + Duration::from_millis(100)).await;
+        } else {
+            let checks = tokio::time::timeout(CHEAP_DEADLINE + Duration::from_secs(2), caller)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(checks.iter().any(|c| c.value == "timed out"));
+        }
+        clock.advance(CACHE_SECS + 1);
+        let next = {
+            let st = st.clone();
+            let now = clock.now_secs();
+            tokio::spawn(async move { st.cheap(now).await })
+        };
+        // The first worker is still parked. A second started worker is a real concurrency breach,
+        // not a spawn queued on the blocking pool. Wait long enough to observe that breach.
+        let overlap = tokio::time::timeout(Duration::from_secs(2), probe.0.started.acquire())
+            .await
+            .is_ok();
+        // This request began before the preceding collector completed. Cache age must be
+        // evaluated after obtaining the lock, against the current clock.
+        clock.advance(1);
+        probe.release();
+        let checks = tokio::time::timeout(Duration::from_secs(2), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !overlap,
+            "health timeout released single-flight while filesystem work was still running"
+        );
+        assert!(checks.iter().any(|c| c.value == "finished"));
+        assert_eq!(probe.0.calls.load(Ordering::SeqCst), 1);
+        // Late completion starts the cache TTL; a waiting request reuses the same result.
+        st.cheap(clock.now_secs()).await;
+        assert_eq!(probe.0.calls.load(Ordering::SeqCst), 1);
+        clock.advance(CACHE_SECS + 1);
+        st.cheap(clock.now_secs()).await;
+        assert_eq!(probe.0.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cheap_timeout_retains_started_filesystem_worker() {
+        cheap_worker_remains_owned(false).await;
+    }
+
+    #[tokio::test]
+    async fn cheap_client_cancellation_retains_started_filesystem_worker() {
+        cheap_worker_remains_owned(true).await;
+    }
+
+    #[tokio::test]
+    async fn deep_timeout_retains_started_filesystem_worker() {
+        let probe = BlockingProbe::new();
+        let clock = Arc::new(ManualWallClock::new(NOW));
+        let st = state(&probe, Arc::clone(&clock));
+        let first = run_deep(State(st.clone())).await;
+        assert_eq!(
+            first.headers().get("location").unwrap(),
+            "/admin/health?deep=started"
+        );
+        probe.started().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(st.deep_state(), DeepState::Done { .. }) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        clock.advance(DEEP_COOLDOWN_SECS + 1);
+        let next = run_deep(State(st.clone())).await;
+        probe.release();
+        assert_eq!(
+            next.headers().get("location").unwrap(),
+            "/admin/health?deep=busy",
+            "deep timeout released the permit while filesystem work was still running"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while st.permit.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(probe.0.calls.load(Ordering::SeqCst), 1);
+        let again = run_deep(State(st.clone())).await;
+        assert_eq!(
+            again.headers().get("location").unwrap(),
+            "/admin/health?deep=started"
+        );
+        probe.started().await;
+        assert_eq!(probe.0.calls.load(Ordering::SeqCst), 2);
     }
 }

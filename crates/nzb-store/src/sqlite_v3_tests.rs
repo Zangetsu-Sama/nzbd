@@ -1,4 +1,4 @@
-//! The 3.x SQLite line (migrations 0015+, T122; `DATA_MODEL` v3 section 8, ARCHITECTURE 13.2-13.4): the blob refusal
+//! The 3.x SQLite line (migrations 0015+, T122; `DATA_MODEL` v3 section 8, ARCHITECTURE v3 13.2-13.4): the blob refusal
 //! before any v3 migration (D36 a, review 34 L6), the post-migration checks (M1 b), the outbox and totals triggers, the
 //! retention floors (SEC-103), the library identity row and `synchronous = FULL`. SQLite-only (one-line reason each).
 #![allow(

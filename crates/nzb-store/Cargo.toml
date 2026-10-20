@@ -16,11 +16,13 @@ workspace = true
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 hmac = "0.12"
 zeroize = "1"
-nzb-core = { path = "../nzb-core", version = "0.5.1" }
+nzb-core = { path = "../nzb-core", version = "0.6.0" }
 # SQLite driver with bundled libsqlite3 (includes FTS5): the SQLite store. `postgres` (D33): the PostgreSQL store; pure-Rust driver (no libpq),
 # SCRAM-SHA-256, arrays, COPY. No `tls-*` feature at all (review M5, owner question Q10): nzbd sets
-# `PgSslMode::Disable` explicitly and links no TLS stack.
-sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite"] }
+# `PgSslMode::Disable` explicitly and links no TLS stack. sqlx 0.9 (T143): `sqlite-bundled` + `sqlite-unlock-notify` are
+# the 0.8 `sqlite` surface; the 0.9 `sqlite` umbrella would also compile extension loading and `deserialize`, which
+# nzbd never uses (review 55). Every crate's sqlx dev-dependency uses the same pair.
+sqlx = { version = "0.9", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite-bundled", "sqlite-unlock-notify"] }
 # NzbStore must be object-safe (FsStore now, DbStore later) with async methods; maintained, tiny.
 async-trait = "0.1"
 serde_json = "1"

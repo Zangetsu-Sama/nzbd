@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>NFO</h1>
+<p class="muted"><a href="/release/{{ id }}">{{ title }}</a></p>
+<p class="actions"><a class="button" href="/release/{{ id }}/nfo/download" download>Download .nfo</a> <a href="/release/{{ id }}/nfo?enc={{ other_enc }}">Show as {{ other_label }}</a> <span class="muted">Shown as {{ nfo.encoding }} · {{ nfo.lines }} lines · {{ nfo.columns }} columns</span></p>
+<div class="nfowrap full" tabindex="0" role="region" aria-label="NFO text"><pre class="nfo">{{ nfo.text }}</pre></div>
+{% if can_delete %}<form method="post" action="/release/{{ id }}/nfo/delete" class="inline">
+{% if let Some(t) = layout.csrf_token %}<input type="hidden" name="csrf_token" value="{{ t }}">{% endif %}
+<button type="submit" class="danger">Remove NFO</button> <span class="muted">Removes the NFO from this release; you can upload another one with its NZB.</span>
+</form>{% endif %}
+{% endblock %}

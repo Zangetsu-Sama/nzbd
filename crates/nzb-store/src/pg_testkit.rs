@@ -97,6 +97,7 @@ impl Env {
             display_name: a.handle(),
             stage: SessionStage::Active,
             prefs: crate::UserPrefs::default(),
+            session: None,
         }
     }
 
@@ -162,20 +163,24 @@ impl Env {
 
     /// `count(*)` of `table` under `filter` (test-only: both are literals in the callers).
     pub(crate) async fn count(&self, table: &str, filter: &str) -> i64 {
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE {filter}"))
-            .fetch_one(self.db.web())
-            .await
-            .unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {table} WHERE {filter}"
+        )))
+        .fetch_one(self.db.web())
+        .await
+        .unwrap()
     }
 
     /// Runs one statement as the superuser of the private database (tests that must bypass the app role, e.g. to
     /// stage a hostile row the application would never write).
     pub(crate) async fn superuser_exec(&self, sql: &str) {
         let mut c = self.t.superuser_conn().await;
-        sqlx::raw_sql(&format!("SET search_path = nzbd, pg_temp; {sql}"))
-            .execute(&mut c)
-            .await
-            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET search_path = nzbd, pg_temp; {sql}"
+        )))
+        .execute(&mut c)
+        .await
+        .unwrap();
     }
 }
 

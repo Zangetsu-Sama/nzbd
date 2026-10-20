@@ -1,16 +1,17 @@
-target/
-.git/
-data/
-secrets/
-.DS_Store
-deploy/.env
-deploy/data/
-deploy/secrets/
-.claude/
-fuzz/target/
-fuzz/corpus/
-fuzz/artifacts/
-dist/
-.env
-*.key
-*.sqlite*
+# Allow-list: the build context of deploy/Dockerfile is the repository root, and only what it compiles
+# may enter it. Everything else stays out, above all deploy/ (the storage folder with the keys, the CA,
+# the databases and the NZBs, the installer's .env and generated config) wherever it is placed.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!config/
+!crates/
+!migrations/
+!static/
+!templates/
+# Build output and stray host files inside the allowed folders.
+**/target/
+**/.DS_Store
+**/*.key
+**/*.sqlite*

@@ -77,6 +77,7 @@ async fn redeem_p(
             code_hash: &h,
             password_hash: PHC,
             session: &s,
+            replacing: None,
         },
         &RegistrationProfile {
             email,
@@ -430,6 +431,7 @@ async fn sec_085_invalid_code_never_reaches_name_check() {
                 code_hash: &zero,
                 password_hash: PHC,
                 session: &s,
+                replacing: None,
             },
             &RegistrationProfile {
                 email: "x",

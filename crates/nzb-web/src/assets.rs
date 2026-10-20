@@ -36,13 +36,13 @@ pub const ASSETS: &[Asset] = &[
         name: "app.css",
         mime: "text/css; charset=utf-8",
         bytes: include_bytes!("../../../static/app.css"),
-        sha256: "0145a7e6e04ca369e942a3fab98ad283d28d335e7066eb423774337bb1a13825",
+        sha256: "540586aa53addf91097ccb6f4a96d4a041fe7af97dc3cfa2fbbf92334e3987c8",
     },
     Asset {
         name: "app.js",
         mime: "text/javascript; charset=utf-8",
         bytes: include_bytes!("../../../static/app.js"),
-        sha256: "9980b6990e86203ba1e996790885019584dc867ab167953a7645621b6114d825",
+        sha256: "230e3587485987aa9196b42a8e1aec20567d4d52d72caaacaf2f8152075f0178",
     },
     Asset {
         name: "htmx.min.js",
@@ -115,6 +115,9 @@ pub struct Layout {
     /// Slug of the top-level category whose filter is active on the index (`aria-current`);
     /// empty otherwise. Always a taxonomy slug, never request data.
     pub browse_cur: String,
+    /// Slug of the exact category selected on the index (a top-level one or a sub-category); empty otherwise.
+    /// Marks the active sidebar entry (`aria-current`). Always a taxonomy slug, never request data.
+    pub browse_sel: String,
     /// The caller's own display name (never the login name; escaped by askama). Empty on
     /// unauthenticated pages.
     pub who: String,
@@ -160,6 +163,10 @@ pub struct BrowseLink {
     /// Releases in this category and its children, with thousands separators (T124 U14). Empty when not known:
     /// only the index page reads the per-category totals, every other page shows the plain link.
     pub count: String,
+    /// Sub-categories (T146), shown under this entry only while it or one of them is the selection.
+    pub children: Vec<BrowseLink>,
+    /// Short display name of a sub-category (`HD` for `Movies/HD`); the full name for a top-level entry.
+    pub short: String,
 }
 
 /// Top-level categories of the built-in taxonomy (the only taxonomy the app loads).
@@ -168,14 +175,27 @@ fn browse_links() -> &'static [BrowseLink] {
     LINKS.get_or_init(|| {
         nzb_core::Taxonomy::builtin()
             .map(|t| {
-                t.entries()
+                let link = |c: &nzb_core::Category| BrowseLink {
+                    id: c.id,
+                    slug: c.slug.clone(),
+                    name: c.name.clone(),
+                    count: String::new(),
+                    children: Vec::new(),
+                    short: c.name.rsplit('/').next().unwrap_or(&c.name).to_owned(),
+                };
+                // Display order puts XXX last; sub-categories keep tree order under their top-level entry.
+                let ordered = t.display_order();
+                ordered
                     .iter()
                     .filter(|c| c.parent.is_none())
-                    .map(|c| BrowseLink {
-                        id: c.id,
-                        slug: c.slug.clone(),
-                        name: c.name.clone(),
-                        count: String::new(),
+                    .map(|top| {
+                        let mut l = link(top);
+                        l.children = ordered
+                            .iter()
+                            .filter(|c| c.id != top.id && t.subtree_ids(top.id).contains(&c.id))
+                            .map(|c| link(c))
+                            .collect();
+                        l
                     })
                     .collect()
             })
@@ -232,6 +252,7 @@ impl Layout {
             version: env!("CARGO_PKG_VERSION"),
             browse: browse_links().to_vec(),
             browse_cur: String::new(),
+            browse_sel: String::new(),
             who: String::new(),
             role_label: "",
             can_upload: false,
@@ -269,6 +290,9 @@ impl Layout {
     pub fn with_browse_counts(&mut self, count_of: impl Fn(u16) -> String) {
         for b in &mut self.browse {
             b.count = count_of(b.id);
+            for ch in &mut b.children {
+                ch.count = count_of(ch.id);
+            }
         }
     }
 
@@ -276,6 +300,9 @@ impl Layout {
     #[must_use]
     pub fn hiding(mut self, hidden: &[u16]) -> Self {
         self.browse.retain(|b| !hidden.contains(&b.id));
+        for b in &mut self.browse {
+            b.children.retain(|c| !hidden.contains(&c.id));
+        }
         self
     }
 

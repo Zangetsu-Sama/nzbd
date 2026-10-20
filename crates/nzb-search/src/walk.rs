@@ -1,4 +1,4 @@
-//! The sorted walk (PERFORMANCE section 1): for listings without text, walk each segment's sidecar
+//! The sorted walk (PERFORMANCE v3 section 1): for listings without text, walk each segment's sidecar
 //! permutation in the sort order from the start, the end or a keyset cursor (binary search), test each
 //! document against the filters on fast-field columns, and k-way merge the segments. A page costs about
 //! `segments x (log n + k / selectivity)` column reads instead of a pass over every match.

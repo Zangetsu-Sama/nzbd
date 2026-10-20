@@ -15,7 +15,7 @@ use crate::account::{AccountActor, AuditActor, Role};
 use crate::bulk::{BulkItem, MAX_BULK_IDS};
 use crate::pg::PgDb;
 use crate::pg::account::write_audit;
-use crate::pg::release::{StatDelta, apply_stats, enqueue_outbox, require_actor_share};
+use crate::pg::release::{StatDelta, apply_stats, enqueue_outbox, require_session_actor_share};
 use crate::{StoreError, clean_source_label};
 
 /// Sorted, de-duplicated copy of `ids`; `None` when empty, oversized or with a non-positive id.
@@ -136,7 +136,7 @@ impl PgDb {
         let category = i32::try_from(category_id).map_err(|_| StoreError::UnknownCategory)?;
         let ids = normalize(ids).ok_or(StoreError::NotFound)?;
         let mut tx = self.web().begin().await?;
-        let a = require_actor_share(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor_share(&mut tx, actor, Role::Admin, now).await?;
         let items = load_visible(&mut tx, &ids, hidden, true).await?;
         let known: i64 = sqlx::query_scalar("SELECT count(*) FROM category WHERE id = $1")
             .bind(category)
@@ -146,7 +146,7 @@ impl PgDb {
             return Err(StoreError::UnknownCategory);
         }
         sqlx::query(
-            "UPDATE release SET category_id = $1, category_overridden = true, category_source = 'manual', \
+            "UPDATE release SET category_id = $1, category_overridden = true, category_source = 'manual', flags = flags & ~512, \
              index_version = index_version + 1 WHERE id = ANY($2)",
         )
         .bind(category)
@@ -225,7 +225,7 @@ impl PgDb {
         let ids = normalize(ids).ok_or(StoreError::NotFound)?;
         let clean = clean_source_label(label);
         let mut tx = self.web().begin().await?;
-        let a = require_actor_share(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor_share(&mut tx, actor, Role::Admin, now).await?;
         let items = load_visible(&mut tx, &ids, hidden, true).await?;
         sqlx::query(
             "UPDATE release SET source_label = $1, index_version = index_version + 1 WHERE id = ANY($2)",

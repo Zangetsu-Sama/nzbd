@@ -7,8 +7,8 @@ Getting NZBs in, searching, exploring a release, and the admin pages.
 | Way | How | Notes |
 |---|---|---|
 | Watch folder | Copy or move `*.nzb` into `data/watch/` | Picked up after a stability check; the file is moved into the store, never left behind. Duplicates (same SHA-256) go to `duplicates/`, unreadable or hostile files to `failed/` with a `reason.json`. The operator can add **watch-folder rules**: a sub-folder or a file-name pattern gives new releases a category and/or a source label (for example everything dropped into `data/watch/From Seedbox/` is labelled `seedbox`). Rules never apply to the upload form or the API, and never relabel a release that is already indexed. |
-| Upload form | **Upload** in the sidebar | Several files at once, optional category (default: Scene-name rules) and a free-text **Source** label applied to every file. Per-file result list. |
-| API | `POST /api/v1/nzb` with `X-Api-Key` (create keys on the Account page or `nzbd apikey create`) | Upload only; nothing can be read back through the API. Behind the proxy you also send the proxy credentials. |
+| Upload form | **Upload** in the sidebar | Several files at once, optional category (default: Scene-name rules) and a free-text **Source** label applied to every file. Per-file result list. Add each release's `.nfo` to the same selection to attach it (see below). |
+| API | `POST /api/v1/nzb` with `X-Api-Key` (create keys on the Account page or `nzbd apikey create`) | Upload only; nothing can be read back through the API. Behind the proxy you also send the proxy credentials. A multipart upload may carry the NFO as a part named `nfo`. |
 | Bulk import (operator) | `nzbd import <dir>` on the host (RUNBOOK section 5) | Fills a new library from a directory of NZB files, for example the `data/store/` of an earlier install. The directory is only read: nothing in it is moved or deleted. Run it again at any time; files already in the library are skipped. |
 
 **Release titles** come from the `.nzb` file name when it looks like a real name: an NZB dropped or uploaded as
@@ -16,6 +16,27 @@ Getting NZBs in, searching, exploring a release, and the admin pages.
 that say nothing (`download.nzb`, `download (1).nzb`, `12345.nzb`, a hash such as `d41d8cd98f00b204e9800998ecf8427e.nzb`)
 are skipped and the title comes from the NZB metadata, else from the inner file names. Uploading the same NZB again under
 another name keeps the first title.
+
+**NFO files.** Select the `.nfo` together with its `.nzb` in the upload form (`Show.S01E01.nzb` and
+`Show.S01E01.nfo`; the case of the names does not matter, and with one NZB and one NFO the names do not matter at
+all). The Family filter lists TV, Anime, Movie, Music and Game (no release is classified as Game yet). Releases with an NFO carry an **NFO** badge in the index. The NFO is hidden on the release page until you press **Show NFO** (**Hide NFO** closes it again); it is then shown as the classic DOS art (code page 437, the "true" NFO view), with a full
+view, a UTF-8 switch for the few NFOs written in UTF-8, and a **Download .nfo** link. Up to 256 KiB per NFO. Only the
+uploader of a release or an administrator can add its NFO, and only while it has none; an administrator can remove it
+(**Remove NFO**) so a better one can be uploaded with the NZB again. With the API:
+`curl -H "X-Api-Key: $KEY" -F file=@Show.S01E01.nzb -F nfo=@Show.S01E01.nfo https://nzbd.lan/api/v1/nzb`.
+**NFO in the watch folder.** Put the NFO next to its NZB with exactly the same name: `Foo.Bar-GRP.nzb` and
+`Foo.Bar-GRP.nfo` (the `.nfo` extension may be in any case, `.NFO` works too; the rest of the name must match letter
+for letter). When the NZB is ingested the NFO is attached to its release (only if the release has none yet, also when
+the NZB was already in the library) and leaves the watch folder with the NZB: removed once it is stored, or moved next
+to the NZB into `failed/` or `duplicates/` under the same name with `.nfo`; `nzbd failed retry` brings it back
+together with the NZB, expiry moves it to `failed/expired/` with it, and purging that failed item removes both. An NFO
+that cannot be attached (empty, larger than 256 KiB, or the release already has another one) is never deleted: you find
+it in `failed/` (or `duplicates/`) as `<date>-<hash>.nfo`; the log says why (`NFO_EMPTY`, `NFO_TOO_LARGE`, `NFO_EXISTS`,
+...) and names that file. Symbolic links, hard-linked files, two NFOs whose names differ only by case, two NZBs whose
+names differ only by case (`Foo.nzb` and `Foo.NZB` while both are there), and an NFO whose target name is already taken
+are left untouched where they are. Drop the NFO together with or before the NZB: an NFO that arrives after its NZB was
+ingested, or one without an NZB, simply stays in the watch folder (an NFO is never ingested on its own); drop the
+NZB again next to it, or upload both in the upload form. NFO text is never searchable.
 
 ## The index
 
@@ -27,7 +48,7 @@ hover for the exact time), size, file count, source and status badges. Each row 
 - the original file name appears under the title only when it differs from the title (it is usually the title plus
   `.nzb`);
 - the category badge appears only for **Fallback** (no rule matched) and **Manual** (someone chose it); the release page
-  shows how every category was decided;
+  shows how every category was decided; the **Uncategorized** status badge goes away once a category is set by hand;
 - the **Source** cell is one line: your source label if the release has one, otherwise how it arrived (*Watch folder*,
   *Upload*, *API*) in grey; a long label ends in "..." and the full text (with how it arrived) shows when you hover;
 - a completeness bar appears only for a release with missing segments (none today: nzbd does not check a news server
@@ -36,7 +57,8 @@ hover for the exact time), size, file count, source and status badges. Each row 
   page (every role).
 
 A line next to the page title sums up the library ("68 releases · 1,578 segments · 1.0 GiB"), and the sidebar shows
-how many releases each top-level category holds (on the index page; hidden categories are never counted). On a phone
+how many releases each top-level category holds (click a category to open its sub-categories, for example Movies >
+HD, PC > Games, Mac > MacGames or Console > Nintendo; XXX, when shown, is always last) (on the index page; hidden categories are never counted). On a phone
 the navigation folds into a **Menu** button in the top bar, so the search box is on the first screen.
 
 - **Search** matches words in the title, the inner file names, the poster, the original `.nzb` file name and the
@@ -49,6 +71,9 @@ the navigation folds into a **Menu** button in the top bar, so the search box is
   the Last link are left out, Next still works), and *The search index is being rebuilt* (after a restore or an index
   repair: the list shows the newest releases only, with the category filter; search, sorting and the other filters come
   back when the rebuild is done).
+- With hidden categories, prefix and approximate searches show a fixed notice that they use a limited set of
+  alternatives. It does not reveal whether hidden words exhausted a budget. Results remain approximate at the
+  dictionary, posting or time limits; use more specific terms to find additional matches.
 - New uploads and edits appear in the list and in search within a few seconds (the search index trails the database
   slightly); the release page itself is always current.
 - **Filters**: the search row has the text, the category (children indented) and the **Search** button; **More filters**
@@ -125,6 +150,7 @@ those files only. Here you can:
   stored NZB is never changed. One partial download runs at a time (others get "Busy, try again shortly"), and a
   selection whose NZB would exceed the NZB size limit is refused ("Selection too large");
 - **Edit** the category and the source label (administrators; audited);
+- read the **NFO** when one was uploaded with the NZB (full view, UTF-8 switch, **Download .nfo**; admins can remove it);
 - open **Raw** to see the NZB head and meta (the only place an NZB password would appear);
 - **Delete** the release (admins, from the **Danger zone** at the bottom of the Edit panel, away from Download):
   typed confirmation plus password and a fresh TOTP code; the NZB goes to a trash area.

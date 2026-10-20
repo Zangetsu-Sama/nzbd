@@ -18,12 +18,12 @@ dev-tools = []
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1"] }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "std"] }
-nzb-core = { version = "0.5.1", path = "../nzb-core" }
-nzb-ingest = { version = "0.5.1", path = "../nzb-ingest" }
+nzb-core = { version = "0.6.0", path = "../nzb-core" }
+nzb-ingest = { version = "0.6.0", path = "../nzb-ingest" }
 # The search index for both backends: the indexer task in `serve` and `nzbd search ...`.
-nzb-search = { version = "0.5.1", path = "../nzb-search" }
-nzb-store = { version = "0.5.1", path = "../nzb-store" }
-nzb-web = { version = "0.5.1", path = "../nzb-web" }
+nzb-search = { version = "0.6.0", path = "../nzb-search" }
+nzb-store = { version = "0.6.0", path = "../nzb-store" }
+nzb-web = { version = "0.6.0", path = "../nzb-web" }
 # No-echo TTY password prompt (needs termios; std has none and unsafe is forbidden here).
 rpassword = "7"
 # Safe `statvfs`/`access` for the health page's free-space and writability checks, and `geteuid` for the root
@@ -39,9 +39,11 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zeroize = "1.9.1"
 
 [dev-dependencies]
+# Generate the legacy SQLite fixture from its committed migrations during tests.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "sqlite-unlock-notify", "migrate"] }
 # Digests of the NZB fixtures written by the `nzbd import` test (already in the lockfile via nzb-ingest).
 sha2 = "0.10"
 # The Postgres test harness (`nzb_store::pg::testing`): library identity and backend tests on both backends (T122).
-nzb-store = { version = "0.5.1", path = "../nzb-store", features = ["pg-test-support"] }
+nzb-store = { version = "0.6.0", path = "../nzb-store", features = ["pg-test-support"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros"] }

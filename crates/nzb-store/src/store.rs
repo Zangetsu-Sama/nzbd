@@ -1,4 +1,4 @@
-//! The configured backend as one value (ARCHITECTURE 13.1, T122). Production code (`nzb-web`,
+//! The configured backend as one value (ARCHITECTURE v3 13.1, T122). Production code (`nzb-web`,
 //! `nzb-ingest`, `nzbd` outside its wiring) holds a [`Store`] and calls the repository traits of
 //! [`crate::repo`]; only `nzbd`'s open/migrate/CLI wiring matches on the variants for operations that exist on
 //! one backend only.

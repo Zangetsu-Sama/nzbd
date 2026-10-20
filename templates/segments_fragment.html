@@ -1,4 +1,4 @@
-<div id="segments">
+<div id="segments" tabindex="-1" hx-sync="this:replace">
 {% if rows.is_empty() %}<p class="muted" role="status">No segments in this range ({{ total }} in this file).</p>{% else %}
 <p class="muted" role="status">Segments {{ first }}-{{ last }} of {{ total }}.</p>
 <div tabindex="0" class="tablewrap">
@@ -12,8 +12,8 @@
 </table>
 </div>
 {% endif %}
-<nav class="pager" aria-label="Segments pagination" hx-boost="true" hx-target="#segments" hx-swap="outerHTML">
-{% if let Some(h) = prev_href %}<a rel="prev" href="{{ h }}">Previous</a>{% else %}<span class="muted">Previous</span>{% endif %}
-{% if let Some(h) = next_href %}<a rel="next" href="{{ h }}">Next</a>{% else %}<span class="muted">Next</span>{% endif %}
+<nav id="segments-pagination" class="pager" tabindex="-1" aria-label="Segments pagination" hx-boost="true" hx-target="#segments" hx-swap="outerHTML">
+{% if let Some(h) = prev_href %}<a id="segments-page-previous" rel="prev" href="{{ h }}">Previous</a>{% else %}<span class="muted">Previous</span>{% endif %}
+{% if let Some(h) = next_href %}<a id="segments-page-next" rel="next" href="{{ h }}">Next</a>{% else %}<span class="muted">Next</span>{% endif %}
 </nav>
 </div>

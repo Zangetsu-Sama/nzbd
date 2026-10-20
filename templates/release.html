@@ -26,6 +26,19 @@
 <p class="muted">NZB header meta (including any password) is shown in the <a href="/release/{{ id }}/raw">raw view</a>.</p>
 </section>
 
+{% if let Some(n) = nfo %}<section class="card" aria-labelledby="nfo-h">
+<h2 id="nfo-h">NFO</h2>
+<p class="actions"><a href="/release/{{ id }}/nfo">Full view</a> <a href="/release/{{ id }}/nfo/download" download>Download .nfo</a> <span class="muted">{{ n.encoding }} · {{ n.lines }} lines</span></p>
+<details class="nfo-toggle">
+<summary class="btn"><span class="when-closed">Show NFO</span><span class="when-open">Hide NFO</span></summary>
+<div class="nfowrap" tabindex="0" role="region" aria-label="NFO text"><pre class="nfo">{{ n.text }}</pre></div>
+</details>
+{% if can_edit %}<form method="post" action="/release/{{ id }}/nfo/delete" class="inline">
+{% if let Some(t) = layout.csrf_token %}<input type="hidden" name="csrf_token" value="{{ t }}">{% endif %}
+<button type="submit" class="danger">Remove NFO</button>
+</form>{% endif %}
+</section>{% endif %}
+
 {% if can_edit || can_delete %}<section class="card" aria-labelledby="cat-h">
 <h2 id="cat-h">Edit</h2>
 {% if can_edit %}<form method="post" action="/release/{{ id }}/source" class="inline">
@@ -53,9 +66,9 @@
 <section aria-labelledby="files-h">
 <h2 id="files-h">Files</h2>
 {% if files.is_empty() %}<p class="muted" role="status">No files.</p>{% else %}
-<div id="files" hx-target="#files" hx-select="#files" hx-swap="outerHTML">
+<div id="files" tabindex="-1" hx-target="#files" hx-select="#files" hx-swap="outerHTML" hx-sync="this:replace">
 <p class="muted" role="status">Showing {{ first }}-{{ last }} of {{ total_files }} files (page {{ page }} of {{ pages }}).</p>
-<form method="post" action="/release/{{ id }}/download/selected" id="selfiles" aria-label="Download selected files">
+<form method="post" action="/release/{{ id }}/download/selected" id="selfiles" class="selection-form" aria-label="Download selected files" aria-describedby="files-selection-help">
 {% if let Some(t) = layout.csrf_token %}<input type="hidden" name="csrf_token" value="{{ t }}">
 {% endif %}<div tabindex="0" class="tablewrap">
 <table>
@@ -75,13 +88,13 @@
 {% endfor %}</tbody>
 </table>
 </div>
-<p class="actions selbar"><button type="submit">Download selected</button> <span class="muted">An NZB with only the files ticked on this page.</span></p>
+<p class="actions selbar"><button type="submit">Download selected</button> <span id="files-selection-help" class="muted">Select at least one file above. Downloads an NZB with only the files ticked on this page.</span></p>
 </form>
 <div class="pagerbar">
-<nav class="pager" aria-label="Files pagination" hx-boost="true">
-{% if let Some(h) = prev_href %}<a rel="prev" href="{{ h }}">Previous</a>{% else %}<span class="muted">Previous</span>{% endif %}
+<nav id="files-pagination" class="pager" tabindex="-1" aria-label="Files pagination" hx-boost="true">
+{% if let Some(h) = prev_href %}<a id="files-page-previous" rel="prev" href="{{ h }}">Previous</a>{% else %}<span class="muted">Previous</span>{% endif %}
 <span>Page {{ page }} of {{ pages }}</span>
-{% if let Some(h) = next_href %}<a rel="next" href="{{ h }}">Next</a>{% else %}<span class="muted">Next</span>{% endif %}
+{% if let Some(h) = next_href %}<a id="files-page-next" rel="next" href="{{ h }}">Next</a>{% else %}<span class="muted">Next</span>{% endif %}
 </nav>
 <form method="post" action="/page-size" class="perpage" aria-label="Files per page">
 {% if let Some(t) = layout.csrf_token %}<input type="hidden" name="csrf_token" value="{{ t }}">

@@ -1,4 +1,4 @@
-//! Hostile request -> Tantivy [`Query`], built by our code only (SEC-089, `docs/DATA_MODEL.md` 5.3).
+//! Hostile request -> Tantivy [`Query`], built by our code only (SEC-089, `docs/v3/DATA_MODEL.md` 5.3).
 //!
 //! * Text is cut to [`MAX_Q_CHARS`] characters and analyzed by the indexing analyzer; at most
 //!   [`MAX_Q_TOKENS`] tokens are kept. Every operator or syntax character is a separator, so no input
@@ -13,7 +13,11 @@
 //!   `expansion_postings_budget`, else the token falls back to its exact term and the page says
 //!   "search narrowed". The result is a term set of bounded posting volume; no automaton is handed to
 //!   Tantivy. The deadline is checked per segment. Expanded terms never leave this module except as
-//!   counts (review I2: dictionaries still hold terms of trashed and hidden releases).
+//!   counts (review I2: dictionaries still hold terms of trashed and hidden releases). With category
+//!   exclusions, bounded posting checks admit only terms occurring in live, visible documents and
+//!   rank them by visible frequency. Raw posting frequencies still bound decoding work. Dictionary
+//!   and visibility-check caps may omit alternatives; the UI uses a corpus-independent notice for
+//!   excluded-category searches rather than exposing which hidden dictionary caused a cap.
 //! * Filters are typed: category ids (a parent also matches its direct children), the exclusion set as
 //!   `MustNot` (hidden categories never count anywhere, SEC-090), ranges on fast fields, raw terms.
 
@@ -24,7 +28,7 @@ use std::sync::OnceLock;
 use levenshtein_automata::{DFA, Distance, LevenshteinAutomatonBuilder, SINK_STATE};
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery, TermSetQuery};
 use tantivy::schema::{Field, IndexRecordOption};
-use tantivy::{Searcher, Term};
+use tantivy::{DocSet, Searcher, SegmentReader, TERMINATED, Term};
 use tantivy_fst::Automaton;
 
 use crate::analyzer::{analyze, cap_bytes, nocase};
@@ -36,7 +40,12 @@ use crate::config::{
 use crate::doc::{MAX_KEYWORD_BYTES, flag_terms};
 use crate::error::SearchError;
 use crate::request::SearchRequest;
-use crate::schema::{Fields, UNDATED};
+use crate::schema::{Fields, UNDATED, col};
+
+/// Posting visits allowed when checking expansion visibility, across all fields and tokens.
+/// The caller shares this budget with a possible fuzzy fallback; ordinary searches without
+/// exclusions do not need this additional scan.
+pub const MAX_VISIBILITY_POSTINGS: u64 = 1_000_000;
 
 /// Which expansions a build may run (decided by the caller from the match mode and `[search]`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -56,6 +65,8 @@ pub struct Budgets {
     pub postings: u64,
     /// Dictionary entries visited per token, field and segment.
     pub dict_entries: usize,
+    /// Posting visits for category visibility across the whole build, including all fields/tokens.
+    pub visibility_postings: u64,
 }
 
 impl Default for Budgets {
@@ -64,6 +75,7 @@ impl Default for Budgets {
             terms_max: crate::config::MAX_EXPANSION_TERMS,
             postings: 5_000_000,
             dict_entries: MAX_DICT_ENTRIES_PER_SEGMENT,
+            visibility_postings: MAX_VISIBILITY_POSTINGS,
         }
     }
 }
@@ -106,6 +118,8 @@ pub struct ExpansionStats {
     pub max_terms_per_field: usize,
     /// Summed document frequency of the expansions kept.
     pub postings: u64,
+    /// Posting visits used to check live-document category visibility (not a public UI counter).
+    pub visibility_postings: u64,
 }
 
 /// The analyzed tokens of the request text (capped).
@@ -138,6 +152,17 @@ pub fn build(
         ..ExpansionStats::default()
     };
     let mut narrowed = false;
+    let visibility_limit = budgets
+        .visibility_postings
+        .min(MAX_VISIBILITY_POSTINGS)
+        .min(budgets.postings);
+    let mut expansion = ExpansionContext {
+        searcher,
+        budgets,
+        deadline,
+        exclude: &req.query.exclude_categories,
+        visibility_left: visibility_limit,
+    };
     #[cfg(test)]
     let mut expanded_terms = Vec::new();
 
@@ -161,32 +186,20 @@ pub fn build(
             for field in text_fields {
                 let mut cands = Candidates::default();
                 if want_prefix {
-                    collect_candidates(
-                        searcher,
-                        field,
-                        tok,
-                        Kind::Prefix,
-                        budgets,
-                        deadline,
-                        &mut cands,
-                    )?;
+                    collect_candidates(&mut expansion, field, tok, Kind::Prefix, &mut cands)?;
                 }
                 if want_fuzzy {
-                    collect_candidates(
-                        searcher,
-                        field,
-                        tok,
-                        Kind::Fuzzy,
-                        budgets,
-                        deadline,
-                        &mut cands,
-                    )?;
+                    collect_candidates(&mut expansion, field, tok, Kind::Fuzzy, &mut cands)?;
                 }
                 stats.max_dict_visits = stats.max_dict_visits.max(cands.max_visits);
                 let (chosen, over) = select(cands.terms, tok, budgets.terms_max);
                 cut |= over || cands.truncated;
-                token_cost =
-                    token_cost.saturating_add(chosen.iter().map(|(_, df)| *df).sum::<u64>());
+                let cost = if expansion.exclude.is_empty() {
+                    chosen.iter().map(|(_, df)| *df).sum::<u64>()
+                } else {
+                    raw_posting_cost(searcher, field, &chosen, deadline)?
+                };
+                token_cost = token_cost.saturating_add(cost);
                 per_field.push((field, chosen.into_iter().map(|(t, _)| t).collect()));
             }
             if used_postings.saturating_add(token_cost) > budgets.postings {
@@ -203,6 +216,7 @@ pub fn build(
         expanded_terms.push(per_field);
     }
     stats.postings = used_postings;
+    stats.visibility_postings = visibility_limit.saturating_sub(expansion.visibility_left);
 
     push_filters(f, req, &mut must, &mut must_not);
 
@@ -391,6 +405,15 @@ struct Candidates {
     max_visits: usize,
 }
 
+/// One request-wide allowance; never replenish it for another token, field or segment.
+struct ExpansionContext<'a> {
+    searcher: &'a Searcher,
+    budgets: Budgets,
+    deadline: &'a Deadline,
+    exclude: &'a [u32],
+    visibility_left: u64,
+}
+
 fn levenshtein() -> &'static LevenshteinAutomatonBuilder {
     static BUILDER: OnceLock<LevenshteinAutomatonBuilder> = OnceLock::new();
     BUILDER.get_or_init(|| LevenshteinAutomatonBuilder::new(1, true))
@@ -420,18 +443,20 @@ impl Automaton for Dfa {
 }
 
 fn collect_candidates(
-    searcher: &Searcher,
+    ctx: &mut ExpansionContext<'_>,
     field: Field,
     token: &str,
     kind: Kind,
-    budgets: Budgets,
-    deadline: &Deadline,
     out: &mut Candidates,
 ) -> Result<(), SearchError> {
+    let searcher = ctx.searcher;
     for seg in searcher.segment_readers() {
-        deadline.check()?;
+        ctx.deadline.check()?;
         let inverted = seg.inverted_index(field)?;
         let dict = inverted.terms();
+        let categories = (!ctx.exclude.is_empty())
+            .then(|| seg.fast_fields().u64(col::CAT))
+            .transpose()?;
         let mut visits = 0usize;
         let mut stream = match kind {
             Kind::Prefix => Stream::Range(dict.range().ge(token.as_bytes()).into_stream()?),
@@ -444,17 +469,110 @@ fn collect_candidates(
             if kind == Kind::Prefix && !key.starts_with(token.as_bytes()) {
                 break;
             }
-            if visits >= budgets.dict_entries {
+            if visits >= ctx.budgets.dict_entries {
                 out.truncated = true;
                 break;
             }
             visits = visits.saturating_add(1);
+            if visits.is_multiple_of(1024) {
+                ctx.deadline.check()?;
+            }
+            // The exact term stays lazy and must never spend the expansion work budget.
+            if key == token.as_bytes() {
+                continue;
+            }
+            let df = if let Some(categories) = &categories {
+                let Some(df) = visible_frequency(ctx, seg, categories, field, key, df)? else {
+                    out.truncated = true;
+                    continue;
+                };
+                df
+            } else {
+                u64::from(df)
+            };
+            if df == 0 {
+                continue;
+            }
             let e = out.terms.entry(key.to_vec()).or_insert(0);
-            *e = e.saturating_add(u64::from(df));
+            *e = e.saturating_add(df);
         }
         out.max_visits = out.max_visits.max(visits);
     }
     Ok(())
+}
+
+/// Count only live, visible postings, admitting a complete term scan only when the remaining
+/// allowance covers its raw frequency. Oversized terms are skipped, never scanned without a bound.
+fn visible_frequency(
+    ctx: &mut ExpansionContext<'_>,
+    seg: &SegmentReader,
+    categories: &tantivy::columnar::Column<u64>,
+    field: Field,
+    key: &[u8],
+    raw_df: u32,
+) -> Result<Option<u64>, SearchError> {
+    if u64::from(raw_df) > ctx.visibility_left {
+        return Ok(None);
+    }
+    let Ok(text) = std::str::from_utf8(key) else {
+        return Ok(Some(0));
+    };
+    let term = Term::from_field_text(field, text);
+    let Some(mut postings) = seg
+        .inverted_index(field)?
+        .read_postings(&term, IndexRecordOption::Basic)?
+    else {
+        return Ok(Some(0));
+    };
+    let alive = seg.alive_bitset();
+    let mut visible = 0u64;
+    let mut doc = postings.doc();
+    while doc != TERMINATED {
+        // Also enforce the bound while reading: do not rely solely on dictionary metadata.
+        if ctx.visibility_left == 0 {
+            return Ok(None);
+        }
+        ctx.visibility_left -= 1;
+        if ctx.visibility_left.is_multiple_of(1024) {
+            ctx.deadline.check()?;
+        }
+        if alive.is_none_or(|a| a.is_alive(doc))
+            && categories
+                .first(doc)
+                .and_then(|c| u32::try_from(c).ok())
+                .is_some_and(|c| !ctx.exclude.contains(&c))
+        {
+            visible = visible.saturating_add(1);
+        }
+        doc = postings.advance();
+    }
+    Ok(Some(visible))
+}
+
+/// A selected term can also occur in excluded documents or beyond a dictionary visit cap. Its raw
+/// frequency across every segment, rather than its visible frequency, bounds term-set decoding.
+fn raw_posting_cost(
+    searcher: &Searcher,
+    field: Field,
+    chosen: &[(Vec<u8>, u64)],
+    deadline: &Deadline,
+) -> Result<u64, SearchError> {
+    if chosen.is_empty() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for seg in searcher.segment_readers() {
+        deadline.check()?;
+        let inverted = seg.inverted_index(field)?;
+        for (key, _) in chosen {
+            if let Ok(text) = std::str::from_utf8(key) {
+                total = total.saturating_add(u64::from(
+                    inverted.doc_freq(&Term::from_field_text(field, text))?,
+                ));
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// The two dictionary walks behind one `next`.

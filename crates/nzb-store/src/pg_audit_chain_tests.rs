@@ -359,7 +359,7 @@ async fn sec_080_audit_content_is_immutable_at_the_sql_level() {
         "actor_role = 'admin'",
         "target_id = 3",
     ] {
-        let r = sqlx::query(&format!("UPDATE audit_log SET {col}"))
+        let r = sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE audit_log SET {col}")))
             .execute(e.db.web())
             .await;
         assert!(r.is_err(), "{col} must be refused");

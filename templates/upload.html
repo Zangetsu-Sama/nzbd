@@ -3,6 +3,7 @@
 <section class="card narrow wide">
 <h1>Upload NZB files</h1>
 <p class="muted">Up to {{ max_files }} files per request, each up to {{ max_mib }} MiB. Files go through the same checks as the watch folder.</p>
+<p class="muted">You can add each release's <code>.nfo</code> (up to 256 KiB) in the same selection: it is attached to the NZB with the same name (<code>Show.S01E01.nzb</code> + <code>Show.S01E01.nfo</code>), or to the only NZB when you upload one of each.</p>
 <form method="post" action="/upload" enctype="multipart/form-data">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <p>
@@ -17,8 +18,8 @@
 </p>
 <p class="muted">Optional. Shown in the Source column of the index for every file in this upload. Not used to decide the category.</p>
 <p>
-<label for="files">NZB files</label>
-<input id="files" class="drop" type="file" name="file" accept=".nzb,application/x-nzb,application/xml,text/xml" multiple required>
+<label for="files">NZB files (and their NFO files)</label>
+<input id="files" class="drop" type="file" name="file" accept=".nzb,.nfo,application/x-nzb,application/xml,text/xml" multiple required>
 </p>
 <button type="submit">Upload</button>
 </form>

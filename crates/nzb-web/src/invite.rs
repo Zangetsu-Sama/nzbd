@@ -177,20 +177,19 @@ async fn get_invite(State(auth): State<AuthState>, headers: HeaderMap) -> Respon
 
 /// Argon2id hash of the chosen password on the `/invite` queue (1 permit, 2 waiters).
 async fn hash_on_invite_queue(auth: &AuthState, pw: String) -> Result<String, AuthError> {
-    let waiting = &auth.0.invite_waiting;
-    if waiting.fetch_add(1, Ordering::AcqRel) >= MAX_INVITE_WAITERS {
-        waiting.fetch_sub(1, Ordering::AcqRel);
-        return Err(AuthError::Busy);
-    }
-    let permit = auth.0.invite_slots.acquire().await;
-    waiting.fetch_sub(1, Ordering::AcqRel);
-    let _permit = permit.map_err(|_| AuthError::Task)?;
-    let hashed = tokio::task::spawn_blocking(move || password::hash_password(&pw))
-        .await
-        .map_err(|_| AuthError::Task)?
-        .map_err(AuthError::from);
-    auth.0.verify_runs.fetch_add(1, Ordering::Relaxed);
-    hashed
+    let state = auth.clone();
+    crate::login::password_work(
+        &auth.0.invite_slots,
+        &auth.0.invite_waiting,
+        MAX_INVITE_WAITERS,
+        move || {
+            let hashed = password::hash_password(&pw);
+            state.0.verify_runs.fetch_add(1, Ordering::Relaxed);
+            hashed
+        },
+    )
+    .await?
+    .map_err(AuthError::from)
 }
 
 fn is_urlencoded_form(headers: &HeaderMap) -> bool {
@@ -307,6 +306,9 @@ async fn post_invite(
         }
     };
     let ip_text = ip.to_string();
+    let replacing = auth
+        .presented_id(&headers)
+        .map(|old| crypto::sha256(old.as_bytes()));
     let redeemed = auth
         .db()
         .redeem_code_with_profile(
@@ -314,6 +316,7 @@ async fn post_invite(
                 code_hash: &code_hash,
                 password_hash: &phc,
                 session: &session,
+                replacing: replacing.as_ref(),
             },
             &RegistrationProfile {
                 email,

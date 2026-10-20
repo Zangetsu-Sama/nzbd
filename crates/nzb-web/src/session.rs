@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use nzb_store::SessionStage;
@@ -52,6 +52,34 @@ pub(crate) fn see_other(location: &'static str, cookie: Option<HeaderValue>) -> 
     resp
 }
 
+/// A session transition must replace the whole document, including when navigation was
+/// enhanced by HTMX. A 303 is followed by `XMLHttpRequest` before HTMX can read its headers,
+/// which otherwise tries to select the old page's fragment from the login document.
+///
+/// Only an HTMX `GET` gets `200` + `HX-Redirect`. Any other method keeps a non-2xx answer
+/// (review 55, SEC-028: a state-changing request without a usable session never reads as a
+/// success): an HTMX one gets `401` + `HX-Redirect` (htmx follows `HX-Redirect` before it looks
+/// at the status), a plain one the usual `303`.
+fn session_redirect(
+    method: &Method,
+    headers: &HeaderMap,
+    location: &'static str,
+    cookie: Option<HeaderValue>,
+) -> Response {
+    let mut resp = see_other(location, cookie);
+    if headers.get("hx-request").is_some_and(|v| v == "true") {
+        *resp.status_mut() = if *method == Method::GET {
+            StatusCode::OK
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        resp.headers_mut().remove(header::LOCATION);
+        resp.headers_mut()
+            .insert("hx-redirect", HeaderValue::from_static(location));
+    }
+    resp
+}
+
 pub(crate) fn csrf_rejected() -> Response {
     ApiError::new(StatusCode::FORBIDDEN, "CSRF_REJECTED").into_response()
 }
@@ -77,7 +105,7 @@ pub(crate) async fn require_active_session(mut req: Request, _next: Next) -> Res
     if let Err(resp) = charge_gated(&mut req, &pattern) {
         return resp;
     }
-    see_other("/login", None)
+    session_redirect(req.method(), req.headers(), "/login", None)
 }
 
 /// Host-header allowlist for every route that handles credentials or sessions.
@@ -253,10 +281,17 @@ pub(crate) async fn active_gate(State(gate): State<Gate>, req: Request, next: Ne
         }
     };
     let s = match sess {
-        None => return see_other("/login", had_cookie.then(|| auth.clear_cookie())),
+        None => {
+            return session_redirect(
+                req.method(),
+                req.headers(),
+                "/login",
+                had_cookie.then(|| auth.clear_cookie()),
+            );
+        }
         Some(s) if s.stage == SessionStage::PendingMfa => {
             return match pending_target(auth, &s).await {
-                Ok(target) => see_other(target, None),
+                Ok(target) => session_redirect(req.method(), req.headers(), target, None),
                 Err(()) => internal(),
             };
         }
@@ -321,8 +356,15 @@ pub(crate) async fn pending_gate(
         }
     };
     match sess {
-        None => see_other("/login", had_cookie.then(|| auth.clear_cookie())),
-        Some(s) if s.stage == SessionStage::Active => see_other("/", None),
+        None => session_redirect(
+            req.method(),
+            req.headers(),
+            "/login",
+            had_cookie.then(|| auth.clear_cookie()),
+        ),
+        Some(s) if s.stage == SessionStage::Active => {
+            session_redirect(req.method(), req.headers(), "/", None)
+        }
         Some(s) => {
             let mut req = match enforce_csrf(&s, req, !auth.config().insecure_cookies).await {
                 Ok(r) => r,
@@ -330,6 +372,78 @@ pub(crate) async fn pending_gate(
             };
             req.extensions_mut().insert(s);
             next.run(req).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_transitions_navigate_the_whole_document_for_htmx() {
+        for location in ["/login", "/login/mfa", "/mfa/enroll", "/"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("hx-request", HeaderValue::from_static("true"));
+            let cookie = HeaderValue::from_static("session=; Max-Age=0; HttpOnly");
+            let response = session_redirect(&Method::GET, &headers, location, Some(cookie.clone()));
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("hx-redirect")
+                    .and_then(|v| v.to_str().ok()),
+                Some(location)
+            );
+            assert!(!response.headers().contains_key(header::LOCATION));
+            assert_eq!(response.headers().get(header::SET_COOKIE), Some(&cookie));
+        }
+    }
+
+    #[test]
+    fn ordinary_navigation_keeps_the_http_redirect() {
+        for hx in [None, Some("false"), Some("unexpected")] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = hx {
+                headers.insert("hx-request", HeaderValue::from_static(value));
+            }
+            for method in [Method::GET, Method::POST] {
+                let response = session_redirect(&method, &headers, "/login", None);
+                assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::LOCATION)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("/login")
+                );
+                assert!(!response.headers().contains_key("hx-redirect"));
+            }
+        }
+    }
+
+    /// Review 55 / SEC-028: an HTMX write without a usable session is never a 2xx.
+    #[test]
+    fn sec_028_htmx_writes_without_a_session_stay_non_2xx() {
+        let mut headers = HeaderMap::new();
+        headers.insert("hx-request", HeaderValue::from_static("true"));
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::HEAD,
+        ] {
+            let response = session_redirect(&method, &headers, "/login", None);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("hx-redirect")
+                    .and_then(|v| v.to_str().ok()),
+                Some("/login")
+            );
+            assert!(!response.headers().contains_key(header::LOCATION));
         }
     }
 }

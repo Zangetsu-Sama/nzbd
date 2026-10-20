@@ -10,7 +10,14 @@
 use sqlx::Row;
 
 use crate::auth::bump_failure;
-use crate::{SqliteDb, StoreError};
+use crate::{NewSession, SessionStage, SqliteDb, StoreError};
+
+/// Session and proof re-read together before an enrollment secret is accessed.
+pub(crate) struct PendingEnrollment<'a> {
+    pub(crate) session_hash: &'a [u8; 32],
+    pub(crate) token_hash: Option<[u8; 32]>,
+    pub(crate) now: i64,
+}
 
 /// Stored MFA state of a user (the sealed secret is opaque here).
 #[derive(Clone, PartialEq, Eq)]
@@ -96,7 +103,8 @@ pub(crate) fn ct_eq32(a: &[u8], b: &[u8; 32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Arms the enrollment token of one account (only while MFA is not enabled).
+/// Arms the enrollment token of one account (only while MFA is not enabled). The pending secret
+/// is dropped, so a new token always starts with a new secret.
 async fn arm_enrollment_token(
     conn: &mut sqlx::SqliteConnection,
     id: i64,
@@ -105,8 +113,8 @@ async fn arm_enrollment_token(
     now: i64,
 ) -> Result<bool, StoreError> {
     let res = sqlx::query(
-        "UPDATE account SET enroll_token_hash = ?2, enroll_token_expires = ?3 \
-         WHERE id = ?1 AND totp_enabled = 0",
+        "UPDATE account SET enroll_token_hash = ?2, enroll_token_expires = ?3, \
+         totp_secret_enc = NULL WHERE id = ?1 AND totp_enabled = 0",
     )
     .bind(id)
     .bind(token_hash.as_slice())
@@ -140,6 +148,80 @@ async fn username_of(
             .fetch_optional(&mut *tx)
             .await?,
     )
+}
+
+/// A delayed request cannot revoke sessions after its own authentication was revoked or expired.
+async fn require_revoking_session(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: i64,
+    session_hash: &[u8; 32],
+    now: i64,
+) -> Result<(), StoreError> {
+    let live: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM session s JOIN account a ON a.id = s.account_id \
+         WHERE s.id_hash = ?1 AND s.account_id = ?2 AND s.stage = 'active' \
+         AND s.expires_at > ?3 AND a.disabled_at IS NULL AND a.deleted_at IS NULL",
+    )
+    .bind(session_hash.as_slice())
+    .bind(user_id)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+    live.map(|_| ()).ok_or(StoreError::NotFound)
+}
+
+/// Revalidates the pending session before an enrollment secret or staged recovery write.
+pub(crate) async fn pending_session_is_live(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: i64,
+    hash: &[u8; 32],
+    now: i64,
+) -> Result<bool, StoreError> {
+    let live: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM session s JOIN account a ON a.id = s.account_id \
+         WHERE s.id_hash = ?1 AND s.account_id = ?2 AND s.stage = 'pending_mfa' \
+         AND s.expires_at > ?3 AND a.disabled_at IS NULL AND a.deleted_at IS NULL",
+    )
+    .bind(hash.as_slice())
+    .bind(user_id)
+    .bind(now)
+    .fetch_optional(conn)
+    .await?;
+    Ok(live.is_some())
+}
+
+/// The session and the out-of-band enrollment proof authorize one secret read/write together.
+/// Both rows stay fixed until commit (SQLite writer / Postgres account and session locks).
+async fn pending_secret_authorized(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: i64,
+    session_hash: &[u8; 32],
+    token_hash: Option<&[u8; 32]>,
+    now: i64,
+) -> Result<bool, StoreError> {
+    if !pending_session_is_live(conn, user_id, session_hash, now).await? {
+        return Ok(false);
+    }
+    let row = sqlx::query(
+        "SELECT s.enroll_proven, a.enroll_token_hash, a.enroll_token_expires \
+         FROM session s JOIN account a ON a.id = s.account_id \
+         WHERE s.id_hash = ?1 AND s.account_id = ?2",
+    )
+    .bind(session_hash.as_slice())
+    .bind(user_id)
+    .fetch_optional(conn)
+    .await?;
+    let Some(r) = row else { return Ok(false) };
+    if r.try_get::<i64, _>("enroll_proven")? != 0 {
+        return Ok(true);
+    }
+    let stored: Option<Vec<u8>> = r.try_get("enroll_token_hash")?;
+    let expires: Option<i64> = r.try_get("enroll_token_expires")?;
+    Ok(expires.is_some_and(|e| e > now)
+        && match (stored.as_deref(), token_hash) {
+            (Some(stored), Some(supplied)) => ct_eq32(stored, supplied),
+            _ => false,
+        })
 }
 
 impl SqliteDb {
@@ -201,7 +283,7 @@ impl SqliteDb {
         ip: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let row = sqlx::query(
             "SELECT username, totp_enabled, locked_until, enroll_token_hash, enroll_token_expires \
              FROM account WHERE id = ?1",
@@ -277,7 +359,59 @@ impl SqliteDb {
         sealed: &[u8],
         replace: bool,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        self.store_pending_totp_inner(user_id, sealed, replace, None)
+            .await
+    }
+
+    /// Stores or reads an enrollment secret only for its live pending browser session.
+    /// The current unexpired enrollment token must match, or the stored session must be `enroll_proven`.
+    /// Revocation, expiry, an active session, a disabled/deleted owner or a missing proof returns `None`.
+    /// The same checks apply to reading an existing secret, so rotating a token invalidates an earlier proof.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn store_pending_totp_for_session(
+        &self,
+        user_id: i64,
+        session_hash: &[u8; 32],
+        sealed: &[u8],
+        replace: bool,
+        token_hash: Option<[u8; 32]>,
+        now: i64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.store_pending_totp_inner(
+            user_id,
+            sealed,
+            replace,
+            Some(PendingEnrollment {
+                session_hash,
+                token_hash,
+                now,
+            }),
+        )
+        .await
+    }
+
+    async fn store_pending_totp_inner(
+        &self,
+        user_id: i64,
+        sealed: &[u8],
+        replace: bool,
+        session: Option<PendingEnrollment<'_>>,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut tx = self.begin_immediate().await?;
+        if let Some(access) = session
+            && !pending_secret_authorized(
+                &mut tx,
+                user_id,
+                access.session_hash,
+                access.token_hash.as_ref(),
+                access.now,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         sqlx::query(
             "UPDATE account SET totp_secret_enc = ?2 \
              WHERE id = ?1 AND totp_enabled = 0 AND (totp_secret_enc IS NULL OR ?3 = 1)",
@@ -308,7 +442,7 @@ impl SqliteDb {
     /// # Errors
     /// Database failure.
     pub async fn second_factor_step(&self, a: FactorAttempt<'_>) -> Result<bool, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let row = sqlx::query(
             "SELECT username, totp_enabled, totp_last_step, locked_until FROM account \
              WHERE id = ?1 AND deleted_at IS NULL AND disabled_at IS NULL",
@@ -415,7 +549,7 @@ impl SqliteDb {
         ip: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
         let row = sqlx::query(
             "SELECT username, totp_enabled, totp_secret_enc, locked_until, enroll_token_hash, \
              enroll_token_expires FROM account WHERE id = ?1",
@@ -486,18 +620,23 @@ impl SqliteDb {
         Ok(accepted)
     }
 
-    /// Replaces all recovery codes (old ones, used or not, stop working). Audit-logged.
+    /// Replaces all recovery codes (old ones, used or not, stop working). Audit-logged. Bound to
+    /// the session that re-authenticated, like [`SqliteDb::change_password`].
     ///
     /// # Errors
-    /// Database failure.
+    /// [`StoreError::NotFound`] if the session is gone; database failure.
     pub async fn replace_recovery_codes(
         &self,
         user_id: i64,
+        session_hash: &[u8; 32],
         hashes: &[[u8; 32]],
         ip: Option<&str>,
         now: i64,
     ) -> Result<(), StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
+        if !crate::auth::session_is_live(&mut tx, session_hash, user_id, now).await? {
+            return Err(StoreError::NotFound);
+        }
         sqlx::query("DELETE FROM recovery_code WHERE account_id = ?1")
             .bind(user_id)
             .execute(&mut *tx)
@@ -536,20 +675,38 @@ impl SqliteDb {
         .await?)
     }
 
-    /// Replaces the password hash after an authenticated, re-verified change and revokes EVERY
-    /// session of the user (the caller then mints a fresh one: rotation at password change).
+    /// Replaces the password hash after an authenticated, re-verified change, revokes EVERY
+    /// session of the user and inserts `new_session` in its place (rotation at password change).
     /// API keys are kept (the owner is present and authenticated). Audit-logged.
     ///
+    /// The change is bound to the session that re-authenticated: if `session_hash` is gone (a
+    /// recovery, reset or revocation committed meanwhile), nothing is written, so a concurrent
+    /// change cannot undo it.
+    ///
     /// # Errors
-    /// [`StoreError::NotFound`] if the user vanished.
+    /// [`StoreError::NotFound`] if the user or the session vanished.
     pub async fn change_password(
         &self,
         user_id: i64,
+        session_hash: &[u8; 32],
         password_hash: &str,
+        new_session: &NewSession,
         ip: Option<&str>,
         now: i64,
     ) -> Result<(), StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
+        let own = sqlx::query(
+            "DELETE FROM session WHERE id_hash = ?1 AND account_id = ?2 \
+             AND stage = 'active' AND expires_at > ?3",
+        )
+        .bind(session_hash.as_slice())
+        .bind(user_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if own.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
         let res = sqlx::query(
             "UPDATE account SET password_hash = ?2, password_changed_at = ?3 WHERE id = ?1",
         )
@@ -561,11 +718,16 @@ impl SqliteDb {
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound);
         }
-        let revoked = sqlx::query("DELETE FROM session WHERE account_id = ?1")
+        let others = sqlx::query("DELETE FROM session WHERE account_id = ?1")
             .bind(user_id)
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        let revoked = others.saturating_add(1);
+        let mut s = new_session.clone();
+        s.user_id = user_id;
+        s.stage = SessionStage::Active;
+        crate::auth::insert_in_tx(&mut tx, &s, 5, false).await?;
         let detail = format!("sessions_revoked={revoked}");
         let actor = username_of(&mut tx, user_id).await?;
         audit_tx(
@@ -614,18 +776,21 @@ impl SqliteDb {
             .collect()
     }
 
-    /// Revokes one session, but only if it belongs to `user_id`. Audit-logged when removed.
+    /// Revokes one session owned by `user_id`, while the calling session is still active.
+    /// Audit-logged when removed.
     ///
     /// # Errors
-    /// Database failure.
+    /// [`StoreError::NotFound`] if the calling session is no longer usable; database failure.
     pub async fn revoke_user_session(
         &self,
         user_id: i64,
+        session_hash: &[u8; 32],
         id_hash: &[u8; 32],
         ip: Option<&str>,
         now: i64,
     ) -> Result<bool, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
+        require_revoking_session(&mut tx, user_id, session_hash, now).await?;
         let n = sqlx::query("DELETE FROM session WHERE account_id = ?1 AND id_hash = ?2")
             .bind(user_id)
             .bind(id_hash.as_slice())
@@ -640,10 +805,11 @@ impl SqliteDb {
         Ok(n > 0)
     }
 
-    /// Revokes every session of the user except `keep`. Returns how many were removed.
+    /// Revokes every session of the user except the still-active calling session `keep`.
+    /// Returns how many were removed.
     ///
     /// # Errors
-    /// Database failure.
+    /// [`StoreError::NotFound`] if the calling session is no longer usable; database failure.
     pub async fn revoke_other_sessions(
         &self,
         user_id: i64,
@@ -651,7 +817,8 @@ impl SqliteDb {
         ip: Option<&str>,
         now: i64,
     ) -> Result<u64, StoreError> {
-        let mut tx = self.writer().begin().await?;
+        let mut tx = self.begin_immediate().await?;
+        require_revoking_session(&mut tx, user_id, keep, now).await?;
         let n = sqlx::query("DELETE FROM session WHERE account_id = ?1 AND id_hash <> ?2")
             .bind(user_id)
             .bind(keep.as_slice())

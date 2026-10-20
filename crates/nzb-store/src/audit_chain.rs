@@ -15,11 +15,11 @@
 //! off-host backups hold earlier heads.
 //!
 //! Writes happen inside the transaction of the change they describe, under the single writer connection; when the
-//! caller is not in a transaction the append opens a savepoint whose first statement takes the write lock, so two
+//! caller is not in a transaction the append opens one whose first statement takes the write lock, so two
 //! processes (the server and the CLI) can never both extend the same head.
 
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqliteConnection};
+use sqlx::{Connection, Row, SqliteConnection};
 
 use crate::{SqliteDb, StoreError};
 
@@ -96,8 +96,9 @@ fn arr(v: Vec<u8>) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(v).ok()
 }
 
-/// Appends one chained audit row on `conn`. The row, the state update and the chain link are one unit: any error
-/// rolls the savepoint back, so a half-written link never remains.
+/// Appends one chained audit row on `conn`. The row, the state update and the chain link are one unit: an error
+/// or cancellation rolls the transaction back, so a half-written link never remains. Inside a caller's `SQLx`
+/// transaction this creates a savepoint, preserving the caller's other writes if only this append is cancelled.
 ///
 /// # Errors
 /// Database errors; [`StoreError::AuditChain`] when the state row is missing or was changed concurrently.
@@ -105,24 +106,17 @@ pub(crate) async fn append(
     conn: &mut SqliteConnection,
     c: &AuditContent<'_>,
 ) -> Result<(), StoreError> {
-    sqlx::query("SAVEPOINT nzbd_audit_chain")
-        .execute(&mut *conn)
-        .await?;
-    match append_inner(conn, c).await {
+    // SQLx must own the transaction depth and its rollback guard. Raw SAVEPOINT SQL leaves a pooled connection
+    // in an open transaction when this future is dropped before the matching RELEASE/ROLLBACK is executed.
+    let mut tx = conn.begin().await?;
+    match append_inner(&mut tx, c).await {
         Ok(()) => {
-            sqlx::query("RELEASE nzbd_audit_chain")
-                .execute(&mut *conn)
-                .await?;
+            tx.commit().await?;
             Ok(())
         }
         Err(e) => {
             // Best effort: the original error is what the caller needs.
-            let _ = sqlx::query("ROLLBACK TO nzbd_audit_chain")
-                .execute(&mut *conn)
-                .await;
-            let _ = sqlx::query("RELEASE nzbd_audit_chain")
-                .execute(&mut *conn)
-                .await;
+            let _ = tx.rollback().await;
             Err(e)
         }
     }

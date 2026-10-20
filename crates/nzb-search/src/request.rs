@@ -1,4 +1,4 @@
-//! v3 request and result types (ARCHITECTURE 3.5 item 4). The 2.x [`SearchQuery`] is carried as is;
+//! v3 request and result types (ARCHITECTURE v3 3.5 item 4). The 2.x [`SearchQuery`] is carried as is;
 //! the v3 additions are server-chosen values, never syntax.
 
 use nzb_core::Taxonomy;
@@ -72,6 +72,7 @@ impl Total {
 
 /// One page of a v3 search.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent pagination and expansion metadata, not exclusive states.
 pub struct SearchPage {
     /// Hydrated rows in the sort order; rows that are gone or hidden for the caller were dropped.
     pub items: Vec<ReleaseRow>,
@@ -83,9 +84,14 @@ pub struct SearchPage {
     pub limit: u32,
     /// Matches per category id, ascending id (only with `want_facets`; empty when the count was cut).
     pub facets: Vec<(u32, u64)>,
-    /// A prefix/fuzzy expansion was cut by a budget: the UI shows the fixed "search narrowed" notice.
-    /// The expanded terms themselves are never returned (review I2).
+    /// A prefix/fuzzy expansion was cut by a budget. This diagnostic is not safe to display with
+    /// category exclusions: shared dictionaries and work limits can depend on hidden documents.
+    /// Use the corpus-independent `expansion_bounded` notice in that case instead.
     pub narrowed: bool,
+    /// Prefix/fuzzy expansion is possible for the request/configuration. Independent of dictionary
+    /// contents and actual truncation; lets a filtered UI explain that alternatives are bounded
+    /// without revealing which hidden dictionary caused a limit. False for exact/no-text queries.
+    pub expansion_bounded: bool,
     /// The fuzzy fallback produced this page (the exact query had no hit).
     pub fuzzy_fallback: bool,
     /// Index hits dropped at hydration (gone or now hidden): pages can be shorter than `limit`.

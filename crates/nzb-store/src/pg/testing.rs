@@ -1,4 +1,4 @@
-//! Test harness: one private database per test, copied from a migrated template (ARCHITECTURE section 11).
+//! Test harness: one private database per test, copied from a migrated template (ARCHITECTURE v3 section 11).
 //!
 //! The server is the ephemeral Postgres that `scripts/dev` starts next to the dev container (service `pg` of
 //! `compose.dev.yaml`): no network at all, reached through its Unix socket only, data on a tmpfs, removed after the
@@ -10,6 +10,7 @@
 //! test then gets `CREATE DATABASE ... TEMPLATE` (milliseconds), the database-level part of the superuser bootstrap
 //! ([`DB_PRIVILEGES_SQL`]: privileges on the database object are not copied from a template), and a [`PgDb`] connected as `nzbd_app` with small pools. The database
 //! is dropped when the [`TestDb`] is dropped.
+//! `AssertSqlSafe` is limited to harness DDL containing generated checksum/PID/counter identifiers or numeric clocks.
 #![allow(clippy::missing_panics_doc, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
@@ -160,12 +161,14 @@ async fn build_template(server: Server, tpl: String) {
             .expect("lookup");
     if ready != Some(true) {
         if ready.is_some() {
-            sqlx::query(&format!("DROP DATABASE \"{tpl}\" WITH (FORCE)"))
-                .execute(&mut admin)
-                .await
-                .expect("drop half-built template");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE \"{tpl}\" WITH (FORCE)"
+            )))
+            .execute(&mut admin)
+            .await
+            .expect("drop half-built template");
         }
-        sqlx::query(&format!("CREATE DATABASE \"{tpl}\" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{tpl}\" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'")))
             .execute(&mut admin)
             .await
             .expect("create template");
@@ -196,9 +199,9 @@ async fn build_template(server: Server, tpl: String) {
             Duration::from_secs(120),
         );
         migrate_as_owner(owner).await.expect("migrate template");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER DATABASE \"{tpl}\" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false"
-        ))
+        )))
         .execute(&mut admin)
         .await
         .expect("mark template");
@@ -250,9 +253,9 @@ impl TestDb {
             .connect()
             .await
             .expect("connect superuser");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE DATABASE \"{name}\" TEMPLATE \"{tpl}\" STRATEGY FILE_COPY"
-        ))
+        )))
         .execute(&mut admin)
         .await
         .expect("create test database");
@@ -289,9 +292,9 @@ impl TestDb {
             .connect()
             .await
             .expect("connect superuser");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE DATABASE \"{name}\" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'"
-        ))
+        )))
         .execute(&mut admin)
         .await
         .expect("create test database");
@@ -403,10 +406,10 @@ impl TestDb {
     /// replaces the function body as the owner of this private database.
     pub async fn set_db_clock(&self, secs: i64) {
         let mut c = self.owner_conn().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE OR REPLACE FUNCTION nzbd.db_clock() RETURNS bigint LANGUAGE sql STABLE \
              SET search_path = nzbd, pg_temp AS $$ SELECT {secs}::bigint $$"
-        ))
+        )))
         .execute(&mut c)
         .await
         .expect("set db clock");
@@ -422,10 +425,11 @@ impl Drop for TestDb {
         on_own_runtime(move || {
             block_on(async move {
                 if let Ok(mut admin) = server.superuser_options("postgres").connect().await {
-                    let _ =
-                        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-                            .execute(&mut admin)
-                            .await;
+                    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+                    )))
+                    .execute(&mut admin)
+                    .await;
                     let _ = admin.close().await;
                 }
             });

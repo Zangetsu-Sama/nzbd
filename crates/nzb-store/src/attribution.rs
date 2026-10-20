@@ -8,19 +8,42 @@
 use serde_json::json;
 use sqlx::{Row, SqliteConnection};
 
-use crate::account::{AccountActor, AccountError, AuditActor, Role, require_actor, write_audit};
+use crate::account::{
+    AccountActor, AccountError, AuditActor, Role, require_actor, require_session_actor, write_audit,
+};
 use crate::ingest_log::{IngestLogEntry, insert_log_row};
 use crate::{NewRelease, SqliteDb, StoreError, TrashRow};
 
 /// Who submitted an NZB.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Uploader {
     /// Watch folder, operator CLI or pre-2.0 callers: `added_by` stays NULL.
     Unattributed,
-    /// A signed-in uploader/admin (UI upload); re-validated in the transaction.
+    /// A trusted operator/internal account; re-validated in the transaction.
     Account(i64),
+    /// A UI uploader/admin; both account and browser session are re-validated in the transaction.
+    Session {
+        /// Account captured from the authenticated session.
+        user_id: i64,
+        /// SHA-256 of the browser session id, never the raw cookie.
+        id_hash: [u8; 32],
+    },
     /// An upload API key (by key id); the key and its owner are re-validated in the transaction.
     ApiKey(i64),
+}
+
+impl std::fmt::Debug for Uploader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unattributed => f.write_str("Unattributed"),
+            Self::Account(id) => f.debug_tuple("Account").field(id).finish(),
+            Self::ApiKey(id) => f.debug_tuple("ApiKey").field(id).finish(),
+            Self::Session { user_id, .. } => f
+                .debug_struct("Session")
+                .field("user_id", user_id)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Validates the uploader inside `conn` and returns the account to record (`None` = unattributed).
@@ -31,11 +54,19 @@ pub enum Uploader {
 pub(crate) async fn resolve_uploader(
     conn: &mut SqliteConnection,
     uploader: &Uploader,
+    now: i64,
 ) -> Result<Option<i64>, StoreError> {
     match *uploader {
         Uploader::Unattributed => Ok(None),
         Uploader::Account(id) => {
             let a = require_actor(conn, id, Role::Uploader).await?;
+            Ok(Some(a.id))
+        }
+        Uploader::Session { user_id, id_hash } => {
+            let a = require_actor(conn, user_id, Role::Uploader).await?;
+            if !crate::auth::session_is_live(conn, &id_hash, user_id, now).await? {
+                return Err(AccountError::Forbidden.into());
+            }
             Ok(Some(a.id))
         }
         Uploader::ApiKey(key_id) => {
@@ -144,7 +175,7 @@ impl SqliteDb {
         let mut tx = self.begin_immediate().await?;
         let user = match *uploader {
             Uploader::Unattributed => None,
-            Uploader::Account(id) => Some(id),
+            Uploader::Account(id) | Uploader::Session { user_id: id, .. } => Some(id),
             Uploader::ApiKey(key) => {
                 sqlx::query_scalar::<_, Option<i64>>("SELECT owner_id FROM api_key WHERE id = ?1")
                     .bind(key)
@@ -164,12 +195,14 @@ impl SqliteDb {
     ///
     /// # Errors
     /// [`AccountError::Forbidden`] / [`AccountError::KeyRefused`]; database failure.
-    pub async fn validate_uploader(&self, uploader: &Uploader) -> Result<(), StoreError> {
+    pub async fn validate_uploader(&self, uploader: &Uploader, now: i64) -> Result<(), StoreError> {
         if matches!(uploader, Uploader::Unattributed) {
             return Ok(());
         }
-        let mut conn = self.writer().acquire().await?;
-        resolve_uploader(&mut conn, uploader).await.map(|_| ())
+        let mut tx = self.begin_immediate().await?;
+        resolve_uploader(&mut tx, uploader, now).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Manual category override by an admin (D26 c, D40: any release). Audit `category_override` with
@@ -186,7 +219,7 @@ impl SqliteDb {
         now: i64,
     ) -> Result<u32, StoreError> {
         let mut tx = self.begin_immediate().await?;
-        let a = require_actor(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
         let old: i64 = sqlx::query_scalar("SELECT category_id FROM release WHERE id = ?1")
             .bind(release_id)
             .fetch_optional(&mut *tx)
@@ -201,7 +234,7 @@ impl SqliteDb {
         }
         sqlx::query(
             "UPDATE release SET category_id = ?2, category_overridden = 1, \
-             category_source = 'manual' WHERE id = ?1",
+             category_source = 'manual', flags = flags & ~512 WHERE id = ?1",
         )
         .bind(release_id)
         .bind(i64::from(category_id))
@@ -239,7 +272,7 @@ impl SqliteDb {
     ) -> Result<Option<String>, StoreError> {
         let clean = label.and_then(crate::clean_source_label);
         let mut tx = self.begin_immediate().await?;
-        let a = require_actor(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
         let old: Option<String> =
             sqlx::query_scalar("SELECT source_label FROM release WHERE id = ?1")
                 .bind(release_id)
@@ -280,7 +313,7 @@ impl SqliteDb {
         now: i64,
         ip: Option<&str>,
     ) -> Result<TrashRow, StoreError> {
-        self.trash_release_inner(id, None, now, ip, TrashActor::Account(actor.user_id))
+        self.trash_release_inner(id, None, now, ip, TrashActor::Account(actor))
             .await
     }
 
@@ -298,14 +331,8 @@ impl SqliteDb {
         now: i64,
         ip: Option<&str>,
     ) -> Result<TrashRow, StoreError> {
-        self.trash_release_inner(
-            id,
-            Some(expected),
-            now,
-            ip,
-            TrashActor::Account(actor.user_id),
-        )
-        .await
+        self.trash_release_inner(id, Some(expected), now, ip, TrashActor::Account(actor))
+            .await
     }
 
     /// The uploader of a release as the detail page shows it; `None` when the release does not exist.
@@ -341,6 +368,6 @@ impl SqliteDb {
 pub(crate) enum TrashActor<'a> {
     /// Legacy caller-supplied actor text (1.x `trash_release`); no attribution columns.
     Text(&'a str),
-    /// A re-validated admin account.
-    Account(i64),
+    /// A re-validated admin account and, for browser requests, its current session.
+    Account(&'a AccountActor),
 }

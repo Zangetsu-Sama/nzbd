@@ -826,3 +826,145 @@ fn restrict_permissions(path: &Path) -> Result<(), StoreError> {
 fn restrict_permissions(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
+
+#[cfg(test)]
+mod backup_deadline_regressions {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    // Exercise the real progress handler with a zero budget. This is not a timing claim about
+    // the production 30-second value; every query/backup below uses real SQLite statements.
+    async fn deadline_db(rollback_read_only: bool) -> (tempfile::TempDir, SqliteDb) {
+        let dir = tempfile::tempdir().unwrap();
+        // A filename, not a URL: cloning options must preserve spaces and the literal '#'.
+        let path = dir.path().join("library #1.sqlite");
+        let mut db = SqliteDb::open(&DbConfig { path: path.clone() })
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 20000) \
+             INSERT INTO ingest_log (ts, source, outcome) SELECT 1700000000+x, 'watch', 'ok' FROM n",
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        if rollback_read_only {
+            db.readers().close().await;
+            let mode: String = sqlx::query_scalar("PRAGMA journal_mode = DELETE")
+                .fetch_one(db.writer())
+                .await
+                .unwrap();
+            assert_eq!(mode, "delete");
+            db.close().await;
+            db = SqliteDb::open_read_only(&path).await.unwrap();
+        }
+        let bounded = reader_pool(
+            db.readers().connect_options().as_ref().clone(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let previous = std::mem::replace(&mut db.readers, bounded);
+        previous.close().await;
+        (dir, db)
+    }
+
+    async fn assert_request_deadline(db: &SqliteDb) {
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            sqlx::query_scalar::<_, i64>("SELECT sum(ts) FROM ingest_log").fetch_one(db.readers()),
+        )
+        .await
+        .expect("ordinary reader query remains bounded")
+        .unwrap_err();
+        assert!(
+            matches!(&error, sqlx::Error::Database(e) if e.code().as_deref() == Some("9")),
+            "ordinary reads must still receive SQLITE_INTERRUPT: {error:?}"
+        );
+    }
+
+    async fn assert_backup(key: Option<&crate::BackupKey>, rollback_read_only: bool) {
+        let (dir, db) = deadline_db(rollback_read_only).await;
+        assert_request_deadline(&db).await;
+        let backups = dir.path().join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            db.backup_with(&backups, 1_700_000_000, 2, key),
+        )
+        .await
+        .expect("diagnostic snapshot finishes");
+        assert!(
+            result.is_ok(),
+            "online backup must not inherit the request reader deadline: {result:?}"
+        );
+        let snapshot = result.unwrap();
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
+        assert_request_deadline(&db).await;
+        assert!(
+            !db.readers().is_closed(),
+            "backup must not close request readers"
+        );
+
+        let restored = if let Some(key) = key {
+            assert!(crate::looks_encrypted(&snapshot.path));
+            let path = dir.path().join("decrypted.sqlite");
+            crate::decrypt_file(key, &snapshot.path, &path).unwrap();
+            path
+        } else {
+            assert!(!crate::looks_encrypted(&snapshot.path));
+            snapshot.path
+        };
+        let control = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(restored)
+                    .read_only(true),
+            )
+            .await
+            .unwrap();
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&control)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let copied: (i64, i64, i64) =
+            sqlx::query_as("SELECT count(*), min(ts), max(ts) FROM ingest_log")
+                .fetch_one(&control)
+                .await
+                .unwrap();
+        assert_eq!(copied, (20_000, 1_700_000_001, 1_700_020_000));
+        let pending: i64 = sqlx::query_scalar("SELECT restore_pending FROM db_state WHERE id = 1")
+            .fetch_one(&control)
+            .await
+            .unwrap();
+        assert_eq!(pending, 1);
+        let original: (i64, i64, i64) =
+            sqlx::query_as("SELECT count(*), min(ts), max(ts) FROM ingest_log")
+                .fetch_one(db.writer())
+                .await
+                .unwrap();
+        assert_eq!(original, copied, "backup leaves source data intact");
+        control.close().await;
+        db.close().await;
+        let closed = db
+            .backup_with(&backups, 1_700_000_001, 2, key)
+            .await
+            .unwrap_err();
+        assert!(matches!(closed, StoreError::Db(sqlx::Error::PoolClosed)));
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn plain_backup_does_not_inherit_request_reader_deadline() {
+        assert_backup(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_backup_does_not_inherit_request_reader_deadline() {
+        let key = crate::BackupKey::from_slice(&[11; 32]).unwrap();
+        assert_backup(Some(&key), true).await;
+    }
+}

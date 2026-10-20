@@ -1,4 +1,4 @@
-//! Tantivy schema, index schema version 2 (`docs/DATA_MODEL.md` 5.1).
+//! Tantivy schema, index schema version 3 (`docs/v3/DATA_MODEL.md` 5.1).
 //!
 //! No stored fields and no doc store content: the index holds ids, sort/filter columns and the analyzed
 //! display text that Postgres also holds (sanitized NZB data). Nothing secret, no account data
@@ -14,8 +14,9 @@ use crate::analyzer::SCENE_ANALYZER;
 /// Version of the document layout and analyzer. A binary whose version is newer than an index's
 /// payload `schema` rebuilds it (ARCHITECTURE 3.3); bump it with every change of fields or analysis.
 ///
-/// History: 1 = v3.0 layout; 2 = T131 adds `source_name` (the `.nzb` file name and the release group as text).
-pub const INDEX_SCHEMA_VERSION: u32 = 2;
+/// History: 1 = v3.0 layout; 2 = T131 adds `source_name` (the `.nzb` file name and the release group as text);
+/// 3 = Tantivy 0.27's index format (and its fixed LRU dependency). Existing indexes rebuild automatically.
+pub const INDEX_SCHEMA_VERSION: u32 = 3;
 
 /// Handles of every field.
 #[derive(Debug, Clone, Copy)]

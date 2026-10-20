@@ -1018,7 +1018,7 @@ async fn sec_065_cannot_revoke_foreign_session_handle() {
     // unknown one, and the admin's session is untouched.
     assert!(
         !e.db
-            .revoke_user_session(m, &[1; 32], None, T0 + 1)
+            .revoke_user_session(m, &[2; 32], &[1; 32], None, T0 + 1)
             .await
             .unwrap()
     );
@@ -1034,8 +1034,80 @@ async fn sec_065_cannot_revoke_foreign_session_handle() {
     assert_eq!(mine[0].id_hash, [2; 32]);
     // The owner can revoke their own.
     assert!(
-        e.db.revoke_user_session(a, &[1; 32], None, T0 + 4)
+        e.db.revoke_user_session(a, &[1; 32], &[1; 32], None, T0 + 4)
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn sec_065_session_revocation_cannot_outlive_its_calling_session() {
+    let e = env().await;
+    let _a = e.admin("root").await;
+    let m = e.viewer("mem").await;
+    e.db.insert_session(&sess(m, 10, SessionStage::Active, T0), 5)
+        .await
+        .unwrap();
+    // A revocation request has authenticated as session 10 but is still reading its body.
+    // The owner changes the password and continues in session 11 before that body completes.
+    e.db.change_password(
+        m,
+        &[10; 32],
+        "new-password-hash",
+        &sess(m, 11, SessionStage::Active, T0 + 1),
+        None,
+        T0 + 1,
+    )
+    .await
+    .unwrap();
+    assert!(e.db.get_session(&[10; 32]).await.unwrap().is_none());
+    let revoke_all = e.db.revoke_other_sessions(m, &[10; 32], None, T0 + 2).await;
+    assert!(matches!(revoke_all, Err(StoreError::NotFound)));
+    let revoke_one =
+        e.db.revoke_user_session(m, &[10; 32], &[11; 32], None, T0 + 2)
+            .await;
+    assert!(matches!(revoke_one, Err(StoreError::NotFound)));
+    assert!(e.db.get_session(&[11; 32]).await.unwrap().is_some());
+    assert_eq!(e.audit("session.revoked").await.len(), 0);
+    assert_eq!(e.audit("session.revoked_others").await.len(), 0);
+
+    // The replacement session can still revoke another of its own sessions.
+    e.db.insert_session(&sess(m, 12, SessionStage::Active, T0 + 3), 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        e.db.revoke_other_sessions(m, &[11; 32], None, T0 + 4)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(e.db.get_session(&[11; 32]).await.unwrap().is_some());
+    assert!(e.db.get_session(&[12; 32]).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn sec_065_session_revocation_requires_active_owned_unexpired_session() {
+    let e = env().await;
+    let a = e.admin("root").await;
+    let m = e.viewer("mem").await;
+    for s in [
+        sess(m, 20, SessionStage::Active, T0),
+        sess(a, 21, SessionStage::Active, T0),
+        sess(m, 22, SessionStage::PendingMfa, T0),
+        sess(m, 23, SessionStage::Active, T0 - 4000),
+    ] {
+        e.db.insert_session(&s, 5).await.unwrap();
+    }
+    // A foreign account, pending MFA, expiry, or a missing cookie cannot authorize revocation.
+    for n in [21, 22, 23, 24] {
+        let all = e.db.revoke_other_sessions(m, &[n; 32], None, T0 + 1).await;
+        assert!(matches!(all, Err(StoreError::NotFound)), "cookie {n}");
+        let one =
+            e.db.revoke_user_session(m, &[n; 32], &[20; 32], None, T0 + 1)
+                .await;
+        assert!(matches!(one, Err(StoreError::NotFound)), "cookie {n}");
+        assert!(e.db.get_session(&[20; 32]).await.unwrap().is_some());
+    }
+    assert_eq!(e.audit("session.revoked").await.len(), 0);
+    assert_eq!(e.audit("session.revoked_others").await.len(), 0);
 }

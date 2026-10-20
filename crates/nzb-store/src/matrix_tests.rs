@@ -183,7 +183,7 @@ async fn sec_104_postgres_leg_opened_postgres() {
 
 /// Test code of the web, ingest and nzbd crates that may open a backend directly instead of through
 /// [`TestStore`], each with its reason (review 35 M1 c). Paths are relative to the workspace root.
-const DIRECT_OPEN_ALLOWED: [(&str, &str); 2] = [
+const DIRECT_OPEN_ALLOWED: [(&str, &str); 4] = [
     (
         "crates/nzbd/src/dbcheck.rs",
         "t088_db_check_exit_codes_for_every_mode: `nzbd db check` modes of a SQLite file (quick/full/damaged bytes)",
@@ -191,6 +191,14 @@ const DIRECT_OPEN_ALLOWED: [(&str, &str); 2] = [
     (
         "crates/nzbd/src/library.rs",
         "sec_101_*: the library identity rule needs a SQLite and a Postgres library side by side in one test",
+    ),
+    (
+        "crates/nzbd/src/dbopen.rs",
+        "upkeep_regressions: PostgreSQL-only startup partition routing, tableoid and owner/app permissions require TestDb",
+    ),
+    (
+        "crates/nzbd/src/maintenance.rs",
+        "upkeep_regressions: PostgreSQL-only monthly partition upkeep and permission failure require TestDb; ordinary maintenance tests still use TestStore",
     ),
 ];
 

@@ -90,6 +90,8 @@ pub struct RecoveryReport {
     pub trash_to_duplicates: usize,
     /// Trash files restored into the watch folder (content not indexed).
     pub trash_restored: usize,
+    /// Interrupted NFO sidecar removals (`.nzbd-trash.nfo.*`, T141) moved to `failed/` as `.nfo`.
+    pub nfo_trash_to_failed: usize,
     /// Trash files left alone (unreadable, too large, I/O error).
     pub trash_left: usize,
     /// Sidecars removed because their failed file is gone.
@@ -216,6 +218,53 @@ fn heal_split_links(cfg: &RecoveryConfig) -> usize {
     healed
 }
 
+fn is_nfo_trash(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(fsops::NFO_TRASH_PREFIX))
+}
+
+/// Phase 2 for the sole name of an interrupted NFO sidecar removal (T141, review 54 L2): it is an NFO, never an NZB,
+/// so it goes to `failed/<stamp>-<sha8 of its bytes>.nfo` (move, don't delete), never back into the watch folder.
+async fn recover_nfo_trash(cfg: &RecoveryConfig, now: i64, f: Seen, rep: &mut RecoveryReport) {
+    let failed = cfg.failed_dir.clone();
+    let path = f.path.clone();
+    let moved = tokio::task::spawn_blocking(move || {
+        let cap = u64::try_from(nzb_core::MAX_NFO_BYTES).unwrap_or(u64::MAX);
+        let loaded = fsops::read_source(&path, cap, None, None).ok()?;
+        let stem = format!("{}-{}", utc_stamp(now), loaded.sha.short());
+        let naming = fsops::Naming {
+            ext: "nfo",
+            exact: false,
+        };
+        fsops::move_named(
+            &path,
+            &failed,
+            &stem,
+            naming,
+            loaded.ident.as_ref(),
+            Some(cap),
+        )
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(dest) = moved {
+        tracing::warn!(
+            file = ?dest.file_name().unwrap_or_default(),
+            "moved an interrupted NFO sidecar removal to failed/"
+        );
+        rep.nfo_trash_to_failed = rep.nfo_trash_to_failed.saturating_add(1);
+    } else {
+        tracing::warn!(
+            file = ?f.path.file_name().unwrap_or_default(),
+            "cannot recover a leftover NFO trash file; left in place"
+        );
+        rep.trash_left = rep.trash_left.saturating_add(1);
+    }
+}
+
 /// Phase 2 for one trash file.
 async fn recover_trash<S: BlobMaintenance + ?Sized>(
     cfg: &RecoveryConfig,
@@ -232,6 +281,10 @@ async fn recover_trash<S: BlobMaintenance + ?Sized>(
         } else {
             rep.trash_left = rep.trash_left.saturating_add(1);
         }
+        return;
+    }
+    if is_nfo_trash(&f.path) {
+        recover_nfo_trash(cfg, now, f, rep).await;
         return;
     }
     let path = f.path.clone();

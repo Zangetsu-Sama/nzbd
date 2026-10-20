@@ -1,4 +1,4 @@
-//! v3 store on PostgreSQL (T112, D33; `docs/ARCHITECTURE.md`, `DATA_MODEL.md`, `SECURITY_DELTA.md`).
+//! v3 store on PostgreSQL (T112, D33; `docs/v3/ARCHITECTURE.md`, `DATA_MODEL.md`, `SECURITY_DELTA.md`).
 //!
 //! While the port is in progress the 2.x SQLite store (`crate::SqliteDb`) stays compiled and keeps serving the 2.x binary;
 //! everything in this module is the v3 implementation and is exercised by tests against a real Postgres
@@ -6,7 +6,7 @@
 //! semantics on [`PgDb`]; differences are listed in `DATA_MODEL` v3 section 7.
 //!
 //! Rules that hold for every statement here (SEC-088): static SQL text with `$n` placeholders only, multi-row data bound
-//! as arrays, every multi-row write in one transaction, the global lock order of ARCHITECTURE section 6 (account
+//! as arrays, every multi-row write in one transaction, the global lock order of ARCHITECTURE v3 section 6 (account
 //! domain advisory lock, then release rows in ascending id order, then `category_stats` rows, then the audit chain
 //! state as the last lock before `COMMIT`).
 
@@ -23,6 +23,7 @@ mod ingest_log;
 mod invite;
 mod maintenance;
 mod mfa;
+mod nfo;
 mod pref;
 mod release;
 mod restore_finish;
@@ -59,7 +60,7 @@ use crate::StoreError;
 /// Advisory lock namespace (`'nzbd'` as a 32-bit integer), first half of every two-integer advisory key. Pinned to
 /// `nzbd.lock_namespace()` in the schema by a test.
 pub const LOCK_NAMESPACE: i32 = 0x6E7A_6264;
-/// Advisory key: account-domain mutations (ARCHITECTURE section 6, lock 1). Pinned to `nzbd.account_domain_key()`.
+/// Advisory key: account-domain mutations (ARCHITECTURE v3 section 6, lock 1). Pinned to `nzbd.account_domain_key()`.
 pub const LOCK_ACCOUNT_DOMAIN: i32 = 1;
 /// Advisory key: the single search indexer (session lock on an unpooled connection, T113).
 pub const LOCK_INDEXER: i32 = 2;
@@ -100,7 +101,7 @@ impl PoolKind {
 }
 
 /// Connection options built field by field (never a URL; `SECURITY_DELTA` 2.1): `new_without_pgpass`, every field set
-/// explicitly, TLS disabled (no TLS stack is linked in 3.0), per-connection session settings of ARCHITECTURE
+/// explicitly, TLS disabled (no TLS stack is linked in 3.0), per-connection session settings of ARCHITECTURE v3
 /// section 4. The password is copied into the options (sqlx keeps it as a plain `String`; nzbd never formats or logs
 /// the options: [`PgDb`] has a redacting `Debug`).
 #[must_use]
@@ -142,7 +143,7 @@ fn session_settings(statement_timeout: Duration) -> [(&'static str, String); 7] 
     ]
 }
 
-/// The v3 database handle: three pools (ARCHITECTURE section 4). Cheap to clone.
+/// The v3 database handle: three pools (ARCHITECTURE v3 section 4). Cheap to clone.
 #[derive(Clone)]
 pub struct PgDb {
     web: PgPool,

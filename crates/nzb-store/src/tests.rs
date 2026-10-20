@@ -67,6 +67,35 @@ async fn reopen_is_idempotent_and_reasserts_seed() {
     assert_eq!(name, "Other/Misc");
 }
 
+/// T146: a library seeded with the older taxonomy gets the new categories (and their totals rows) on the next open.
+#[tokio::test]
+async fn t146_old_library_gets_new_categories_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqliteDb::open(&cfg(&dir)).await.unwrap();
+    for q in [
+        "DELETE FROM category_stats WHERE category_id IN (1010, 1020, 1030, 4010, 4020, 4500, 4510, 4520, 7040)",
+        "DELETE FROM category WHERE id IN (1010, 1020, 1030, 4010, 4020, 4500, 4510, 4520, 7040)",
+    ] {
+        sqlx::query(q).execute(db.writer()).await.unwrap();
+    }
+    db.close().await;
+    let db = SqliteDb::open(&cfg(&dir)).await.unwrap();
+    let rows: Vec<(i64, Option<i64>, String)> = sqlx::query_as(
+        "SELECT id, parent_id, name FROM category WHERE id IN (1010, 1020, 1030, 4010, 4020, 4500, 4510, 4520, 7040) ORDER BY id",
+    )
+    .fetch_all(db.readers())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 9);
+    assert_eq!(rows[4], (4020, Some(4000), "PC/Games".to_owned()));
+    assert_eq!(rows[8], (7040, Some(7000), "Books/Mangas".to_owned()));
+    let stats: i64 = sqlx::query_scalar("SELECT count(*) FROM category_stats")
+        .fetch_one(db.readers())
+        .await
+        .unwrap();
+    assert_eq!(usize::try_from(stats).unwrap(), seed_rows().unwrap().len());
+}
+
 #[tokio::test]
 async fn pragmas_are_applied() {
     let dir = tempfile::tempdir().unwrap();

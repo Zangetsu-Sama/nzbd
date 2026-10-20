@@ -9,8 +9,11 @@
     clippy::too_many_lines
 )]
 
-use crate::acct_testkit::{T0, env};
-use crate::{AccountError, AuditActor, CreateKey, GrantableRole, NewApiKey, StoreError, Uploader};
+use crate::acct_testkit::{T0, env, sess};
+use crate::{
+    AccountError, AuditActor, CreateKey, GrantableRole, NewApiKey, SessionStage, StoreError,
+    Uploader,
+};
 
 fn new_key(hash: &[u8; 32], rate: Option<u32>) -> NewApiKey<'_> {
     NewApiKey {
@@ -140,10 +143,15 @@ async fn sec_036_owner_revokes_own_key_and_nobody_else_s() {
     let m2 = e.uploader("mem2").await;
     let (k1, h1) = e.key(m1, 1).await;
     // Another uploader cannot revoke it, and the answer is the same as for a key that does not exist.
-    assert!(!e.db.revoke_api_key_by(m2, k1, None, T0 + 1).await.unwrap());
     assert!(
         !e.db
-            .revoke_api_key_by(m2, 9999, None, T0 + 1)
+            .revoke_api_key_by(&e.actor(m2).await, k1, None, T0 + 1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !e.db
+            .revoke_api_key_by(&e.actor(m2).await, 9999, None, T0 + 1)
             .await
             .unwrap()
     );
@@ -154,7 +162,7 @@ async fn sec_036_owner_revokes_own_key_and_nobody_else_s() {
     );
     // The owner can, and it is audited with the owner as actor.
     assert!(
-        e.db.revoke_api_key_by(m1, k1, Some("10.0.0.1"), T0 + 2)
+        e.db.revoke_api_key_by(&e.actor(m1).await, k1, Some("10.0.0.1"), T0 + 2)
             .await
             .unwrap()
     );
@@ -166,7 +174,49 @@ async fn sec_036_owner_revokes_own_key_and_nobody_else_s() {
     assert_eq!(rows[0].role.as_deref(), Some("uploader"));
     assert_eq!(rows[0].target_id, None, "own key: no foreign target");
     // Revoking twice is "not found", not an error.
-    assert!(!e.db.revoke_api_key_by(m1, k1, None, T0 + 3).await.unwrap());
+    assert!(
+        !e.db
+            .revoke_api_key_by(&e.actor(m1).await, k1, None, T0 + 3)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn sec_036_key_revocation_requires_current_actor_session() {
+    let e = env().await;
+    let a = e.admin("root").await;
+    let m = e.uploader("mem").await;
+    for (actor_id, n) in [(a, 70_u8), (m, 71_u8)] {
+        let (key, hash) = e.key(m, n).await;
+        e.db.insert_session(&sess(actor_id, n, SessionStage::Active, T0), 5)
+            .await
+            .unwrap();
+        let mut actor = e.actor(actor_id).await;
+        actor.session = Some([n; 32]);
+        // A password reset or explicit revocation invalidated the request's calling cookie.
+        assert!(e.db.delete_session(&[n; 32]).await.unwrap());
+        let r = e.db.revoke_api_key_by(&actor, key, None, T0 + 1).await;
+        assert!(matches!(
+            r,
+            Err(StoreError::Account(AccountError::Forbidden))
+        ));
+        assert!(!e.db.find_api_key(&hash).await.unwrap().unwrap().revoked);
+        assert_eq!(e.audit("apikey.revoke").await.len(), usize::from(n - 70));
+
+        // Both an administrator and the key owner can still revoke with a current session.
+        e.db.insert_session(&sess(actor_id, n + 10, SessionStage::Active, T0 + 2), 5)
+            .await
+            .unwrap();
+        actor.session = Some([n + 10; 32]);
+        assert!(
+            e.db.revoke_api_key_by(&actor, key, None, T0 + 3)
+                .await
+                .unwrap()
+        );
+        assert!(e.db.find_api_key(&hash).await.unwrap().unwrap().revoked);
+    }
+    assert_eq!(e.audit("apikey.revoke").await.len(), 2);
 }
 
 #[tokio::test]
@@ -176,7 +226,7 @@ async fn sec_036_admin_revokes_any_key_and_is_named_in_the_audit() {
     let m = e.uploader("mem").await;
     let (k, h) = e.key(m, 1).await;
     assert!(
-        e.db.revoke_api_key_by(a, k, Some("10.0.0.9"), T0 + 5)
+        e.db.revoke_api_key_by(&e.actor(a).await, k, Some("10.0.0.9"), T0 + 5)
             .await
             .unwrap()
     );
@@ -204,7 +254,7 @@ async fn sec_036_viewer_and_disabled_actors_cannot_revoke_or_own() {
     let v = e.viewer("view").await;
     let (k, _) = e.key(m, 1).await;
     let err =
-        e.db.revoke_api_key_by(v, k, None, T0 + 1)
+        e.db.revoke_api_key_by(&e.actor(v).await, k, None, T0 + 1)
             .await
             .unwrap_err();
     assert!(matches!(err, StoreError::Account(AccountError::Forbidden)));
@@ -219,7 +269,7 @@ async fn sec_036_viewer_and_disabled_actors_cannot_revoke_or_own() {
         .await
         .unwrap();
     let err =
-        e.db.revoke_api_key_by(m, k, None, T0 + 3)
+        e.db.revoke_api_key_by(&e.actor(m).await, k, None, T0 + 3)
             .await
             .unwrap_err();
     assert!(matches!(err, StoreError::Account(AccountError::Forbidden)));
@@ -307,7 +357,11 @@ async fn sec_036_key_revoked_by_its_owner_during_body_is_refused() {
     // The gate accepted the key at the start of the request...
     assert!(e.db.find_api_key(&h).await.unwrap().unwrap().may_upload());
     // ...the owner revoked it through the account page while the body streamed...
-    assert!(e.db.revoke_api_key_by(m, key, None, T0 + 1).await.unwrap());
+    assert!(
+        e.db.revoke_api_key_by(&e.actor(m).await, key, None, T0 + 1)
+            .await
+            .unwrap()
+    );
     // ...and the ingest transaction refuses and writes nothing.
     let r = e.release(1, &Uploader::ApiKey(key)).await;
     assert!(matches!(
@@ -426,4 +480,42 @@ async fn sec_036_demotion_to_viewer_revokes_the_owners_keys() {
             .ends_with("keys_revoked=1")
     );
     let _ = k1;
+}
+
+#[tokio::test]
+async fn web_key_creation_is_bound_to_the_reauthenticated_session() {
+    let e = env().await;
+    let _a = e.admin("root").await;
+    let m = e.uploader("mem1").await;
+    // The session that re-authenticated is gone (a recovery, reset or revocation committed
+    // meanwhile): no key is created.
+    let r =
+        e.db.create_api_key_for_session(
+            new_key(&[210; 32], None),
+            m,
+            &[90; 32],
+            10,
+            T0,
+            &AuditActor::cli(),
+            None,
+        )
+        .await;
+    assert!(matches!(r, Err(StoreError::NotFound)));
+    assert_eq!(e.db.count_active_api_keys_of(m).await.unwrap(), 0);
+    e.db.insert_session(&sess(m, 90, SessionStage::Active, T0), 5)
+        .await
+        .unwrap();
+    let ok =
+        e.db.create_api_key_for_session(
+            new_key(&[211; 32], None),
+            m,
+            &[90; 32],
+            10,
+            T0 + 1,
+            &AuditActor::cli(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(ok, CreateKey::Created(_)));
 }

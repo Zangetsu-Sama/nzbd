@@ -18,7 +18,7 @@ backups = "/data/backups"
 state = "/state"                   # serve.lock + restore anchor, on its own volume (set by compose.yaml)
 
 [limits]
-max_file_bytes = 67108864   # keep Caddy request_body max_size >= this
+max_file_bytes = 67108864   # proxy body limits: API 65 MiB; UI batch 321 MiB (includes framing)
 
 [security]
 totp_key_file = "/run/secrets/nzbd_totp_key"

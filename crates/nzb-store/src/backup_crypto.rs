@@ -75,6 +75,7 @@ pub enum BackupCryptoError {
 }
 
 /// The 32-byte backup encryption key. Zeroized on drop, never printed.
+#[derive(Clone)]
 pub struct BackupKey([u8; 32]);
 
 impl BackupKey {
@@ -334,11 +335,13 @@ pub fn encrypt_file(key: &BackupKey, src: &Path, dst: &Path) -> Result<(), Backu
 }
 
 /// Decrypts the encrypted backup `src` into a new file `out` (mode 0600). The output is written to
-/// a hidden temporary file next to `out`, fsynced and renamed into place only after every chunk
-/// authenticated; on any error nothing is left behind. An existing `out` is never replaced.
+/// a hidden temporary file next to `out`, fsynced and published without replacing anything (a hard link) only
+/// after every chunk authenticated; on any error nothing is left behind. An existing `out` is never
+/// replaced, not even one that appears while decrypting.
 ///
 /// # Errors
-/// See [`decrypt_stream`]; `out` must not exist.
+/// See [`decrypt_stream`]; `out` must not exist. Also an error when the temporary file cannot be
+/// removed after publishing (the output is then complete, but a second plaintext copy is left).
 pub fn decrypt_file(key: &BackupKey, src: &Path, out: &Path) -> Result<(), BackupCryptoError> {
     if fs::symlink_metadata(out).is_ok() {
         return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
@@ -361,13 +364,35 @@ pub fn decrypt_file(key: &BackupKey, src: &Path, out: &Path) -> Result<(), Backu
         decrypt_stream(key, &mut r, &mut w).and_then(|()| w.flush().map_err(Into::into))
     }
     .and_then(|()| f.sync_all().map_err(Into::into))
-    .and_then(|()| fs::rename(&tmp, out).map_err(Into::into));
+    .and_then(|()| publish_no_clobber(&tmp, out).map_err(Into::into));
     if res.is_err() {
         let _ = fs::remove_file(&tmp);
         return res;
     }
     File::open(dir)?.sync_all()?;
     Ok(())
+}
+
+/// Publishes the finished `tmp` as `out` without replacing a file that appeared there: a hard link,
+/// which fails when `out` exists (`rename` would silently replace it). On a filesystem without hard
+/// links (vfat, exFAT, some network mounts) it falls back to `rename` after checking `out` again.
+/// `tmp` is gone on success.
+fn publish_no_clobber(tmp: &Path, out: &Path) -> io::Result<()> {
+    match fs::hard_link(tmp, out) {
+        Ok(()) => fs::remove_file(tmp),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS)
+            ) =>
+        {
+            if fs::symlink_metadata(out).is_ok() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            fs::rename(tmp, out)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// True when `path` starts with the encrypted-backup magic.

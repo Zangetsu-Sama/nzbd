@@ -205,6 +205,19 @@ impl Columns {
     }
 }
 
+/// Sorts `winners` and drops all but its `k` smallest (or largest) ranks, when it holds more.
+pub(crate) fn keep_best(winners: &mut Vec<(GlobalRank, i64)>, k: usize, largest: bool) {
+    if winners.len() <= k {
+        return;
+    }
+    winners.sort_by(|a, b| a.0.cmp(&b.0).then(Ordering::Equal));
+    if largest {
+        winners.drain(..winners.len().saturating_sub(k));
+    } else {
+        winners.truncate(k);
+    }
+}
+
 /// Keeps the `k` smallest (or largest) ranks seen.
 struct TopK {
     k: usize,
@@ -331,9 +344,14 @@ pub(crate) fn run(
             }
             doc = scorer.advance();
         }
-        for (r, d, id) in top.into_vec() {
+        for (i, (r, d, id)) in top.into_vec().into_iter().enumerate() {
+            if u64::try_from(i).is_ok_and(|i| i.is_multiple_of(check_every)) {
+                deadline.check()?;
+            }
             winners.push((cols.global(sort, r, d)?, id));
         }
+        // Keep only the global `k` best after each segment: memory stays O(k), not O(segments * k).
+        keep_best(&mut winners, k, largest);
     }
     winners.sort_by(|a, b| a.0.cmp(&b.0).then(Ordering::Equal));
     let n = winners.len();

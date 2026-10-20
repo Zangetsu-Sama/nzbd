@@ -10,7 +10,7 @@
 {% for r in rows %}<tr>
 <th scope="row">{{ r.name }}</th>
 <td class="fit"><span class="badge st-{{ r.status_class }}">{{ r.status }}</span></td>
-<td>{% if let Some(id) = r.release_id %}<a href="/release/{{ id }}">Open release</a>{% else %}{% if !r.code.is_empty() %}<code>{{ r.code }}</code> {% endif %}{{ r.reason }}{% endif %}</td>
+<td>{% if let Some(id) = r.release_id %}<a href="/release/{{ id }}">Open release</a>{% else %}{% if !r.code.is_empty() %}<code>{{ r.code }}</code> {% endif %}{{ r.reason }}{% endif %}{% if !r.nfo.is_empty() %}<br><span class="badge st-{{ r.nfo_class }}">NFO</span> {{ r.nfo }}{% endif %}</td>
 </tr>
 {% endfor %}</tbody>
 </table>

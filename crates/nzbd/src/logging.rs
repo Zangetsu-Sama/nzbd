@@ -1,9 +1,13 @@
 //! Structured JSON logging to stdout with a redacting writer.
 
+use std::fmt;
 use std::io::{self, Write};
 
-use nzb_web::redact::scrub;
+use nzb_web::redact::{REDACTED, is_sensitive_field, scrub};
+use tracing::field::{Field, Visit};
+use tracing_subscriber::field::{RecordFields, VisitOutput};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::format::{DefaultVisitor, FormatFields, Writer};
 
 /// Wraps a writer and scrubs secrets from every event before it is written.
 ///
@@ -31,6 +35,56 @@ impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for ScrubMakeWriter<M> {
 
     fn make_writer(&'a self) -> Self::Writer {
         ScrubWriter(self.0.make_writer())
+    }
+}
+
+/// Redacts event and span values before formatting them or adding ANSI decorations.
+struct ScrubFields;
+
+impl<'writer> FormatFields<'writer> for ScrubFields {
+    fn format_fields<R: RecordFields>(
+        &self,
+        mut writer: Writer<'writer>,
+        fields: R,
+    ) -> fmt::Result {
+        // A fresh writer has ANSI disabled. The surrounding event formatter keeps its colours,
+        // while both initial span fields and later `Span::record` calls use this plain format.
+        let mut plain = String::new();
+        let mut visitor = ScrubVisitor(DefaultVisitor::new(Writer::new(&mut plain), true));
+        fields.record(&mut visitor);
+        visitor.0.finish()?;
+        // Messages and public fields can themselves contain inline credentials.
+        writer.write_str(&scrub(&plain))
+    }
+}
+
+struct ScrubVisitor<'writer>(DefaultVisitor<'writer>);
+
+impl Visit for ScrubVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if is_sensitive_field(field.name()) {
+            self.0.record_str(field, REDACTED);
+        } else {
+            self.0.record_str(field, value);
+        }
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        if is_sensitive_field(field.name()) {
+            self.0.record_str(field, REDACTED);
+        } else {
+            self.0.record_error(field, value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        // Visit's numeric, boolean and byte methods delegate here too. Do not invoke a secret's
+        // Debug/Display formatter: its output may include spaces, lists or arbitrary punctuation.
+        if is_sensitive_field(field.name()) {
+            self.0.record_str(field, REDACTED);
+        } else {
+            self.0.record_debug(field, value);
+        }
     }
 }
 
@@ -84,13 +138,14 @@ where
 }
 
 /// Builds the pretty subscriber: `time LEVEL target message key=value`, coloured when `ansi`.
-/// The same [`ScrubMakeWriter`] sits in front of the output, so redaction is identical.
+/// Fields are redacted without ANSI escapes; [`ScrubMakeWriter`] also scrubs the finished line.
 pub fn pretty_subscriber<M>(writer: M, ansi: bool) -> impl tracing::Subscriber + Send + Sync
 where
     M: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
     tracing_subscriber::fmt()
         .compact()
+        .fmt_fields(ScrubFields)
         .with_target(true)
         .with_ansi(ansi)
         .with_env_filter(env_filter())
@@ -223,5 +278,176 @@ mod tests {
             .unwrap_or_default();
         assert!(!out.contains("hunter2-pw"), "leaked: {out}");
         assert!(out.contains("alice"));
+    }
+
+    #[test]
+    fn pretty_ansi_output_redacts_event_and_span_fields() {
+        let buf = Buf::default();
+        let sub = pretty_subscriber(buf.clone(), true);
+        tracing::subscriber::with_default(sub, || {
+            let span = tracing::info_span!(
+                "login",
+                password = "AUDIT_FAKE_SPAN_PASSWORD",
+                csrf_token = tracing::field::Empty,
+                user = "alice"
+            );
+            let _entered = span.enter();
+            tracing::info!(
+                password = "AUDIT_FAKE_COLORED_PASSWORD",
+                authorization = "Bearer AUDIT_FAKE_AUTHORIZATION",
+                cookie = "__Host-sid=AUDIT_FAKE_COOKIE",
+                x_api_key = "AUDIT_FAKE_API_KEY",
+                totp_code = 987_654,
+                user_password = "AUDIT_FAKE_PREFIXED_PASSWORD",
+                sid = "AUDIT_FAKE_SID",
+                nonce = "AUDIT_FAKE_NONCE",
+                key = "AUDIT_FAKE_KEY",
+                status = 200,
+                "login password=AUDIT_FAKE_INLINE_PASSWORD"
+            );
+            span.record("csrf_token", "AUDIT_FAKE_RECORDED_CSRF");
+            tracing::info!("recorded span fields");
+        });
+        let out = String::from_utf8(buf.0.lock().map(|g| g.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        assert!(out.contains("\x1b["), "the regression requires ANSI output");
+        assert!(!out.contains("AUDIT_FAKE_"), "leaked a secret: {out}");
+        assert!(!out.contains("987654"), "leaked the numeric code: {out}");
+        assert!(out.contains("password=\"[REDACTED]\""), "{out}");
+        assert!(out.contains("csrf_token=\"[REDACTED]\""), "{out}");
+        assert!(out.contains("alice") && out.contains("status=200"), "{out}");
+        assert!(out.contains("recorded span fields"), "{out}");
+    }
+
+    #[test]
+    fn sec_107_pretty_output_redacts_sensitive_values_before_formatting() {
+        struct ObservedSecret(std::cell::Cell<usize>);
+
+        impl std::fmt::Debug for ObservedSecret {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.set(self.0.get() + 1);
+                f.write_str("AUDIT_SECRET_OBSERVED_HEAD AUDIT_SECRET_OBSERVED_TAIL")
+            }
+        }
+
+        impl std::fmt::Display for ObservedSecret {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Debug::fmt(self, f)
+            }
+        }
+
+        for ansi in [false, true] {
+            let buf = Buf::default();
+            let secret = ObservedSecret(std::cell::Cell::new(0));
+            let error = std::io::Error::other("AUDIT_SECRET_ERROR_HEAD AUDIT_SECRET_ERROR_TAIL");
+            let dotted_secret = "AUDIT_SECRET_DOTTED_HEAD AUDIT_SECRET_DOTTED_TAIL";
+            let sub = pretty_subscriber(buf.clone(), ansi);
+            tracing::subscriber::with_default(sub, || {
+                let span = tracing::info_span!(
+                    "sensitive_fields",
+                    password = %"AUDIT_SECRET_SPAN_HEAD AUDIT_SECRET_SPAN_TAIL",
+                    token = ?["AUDIT_SECRET_SPAN_ONE", "AUDIT_SECRET_SPAN_TWO"],
+                    csrf_token = tracing::field::Empty,
+                    session = tracing::field::Empty,
+                    user = "alice"
+                );
+                let _entered = span.enter();
+                tracing::info!(
+                    password = %"AUDIT_SECRET_DISPLAY_HEAD AUDIT_SECRET_DISPLAY_TAIL",
+                    user_password = ?["AUDIT_SECRET_DEBUG_ONE", "AUDIT_SECRET_DEBUG_TWO"],
+                    secret = &error as &(dyn std::error::Error + 'static),
+                    key = %secret,
+                    nonce = ?secret,
+                    request.sid = %dotted_secret,
+                    request.otp = %dotted_secret,
+                    request.key = %dotted_secret,
+                    request.csrf = %dotted_secret,
+                    request.user_password = %dotted_secret,
+                    publicrequest.monkey = %"public monkey words",
+                    request.public_key_id = %"public key identifier",
+                    details = %"public words",
+                    items = ?["public-one", "public-two"],
+                    status = 200,
+                    "login password=AUDIT_SECRET_INLINE user=alice"
+                );
+                span.record(
+                    "csrf_token",
+                    tracing::field::debug([
+                        "AUDIT_SECRET_RECORDED_ONE",
+                        "AUDIT_SECRET_RECORDED_TWO",
+                    ]),
+                );
+                span.record(
+                    "session",
+                    tracing::field::display(
+                        "AUDIT_SECRET_RECORDED_HEAD AUDIT_SECRET_RECORDED_TAIL",
+                    ),
+                );
+                tracing::info!("recorded complex fields");
+            });
+            let out = String::from_utf8(buf.0.lock().map(|g| g.clone()).unwrap_or_default())
+                .unwrap_or_default();
+            assert_eq!(secret.0.get(), 0, "secret formatter must never run");
+            assert_eq!(out.contains("\x1b["), ansi, "{out}");
+            assert!(!out.contains("AUDIT_SECRET_"), "leaked a secret: {out}");
+            assert!(out.contains("csrf_token=\"[REDACTED]\""), "{out}");
+            assert!(out.contains("session=\"[REDACTED]\""), "{out}");
+            assert!(out.contains("alice") && out.contains("status=200"), "{out}");
+            assert!(out.contains("public words"), "{out}");
+            assert!(out.contains("public monkey words"), "{out}");
+            assert!(out.contains("public key identifier"), "{out}");
+            for name in ["sid", "otp", "key", "csrf", "user_password"] {
+                assert!(
+                    out.contains(&format!("request.{name}=\"[REDACTED]\"")),
+                    "{out}"
+                );
+            }
+            assert!(
+                out.contains("public-one") && out.contains("public-two"),
+                "{out}"
+            );
+            assert!(out.contains("recorded complex fields"), "{out}");
+        }
+    }
+
+    #[test]
+    fn sec_107_json_output_redacts_dotted_sensitive_fields() {
+        let buf = Buf::default();
+        let sub = subscriber(buf.clone());
+        tracing::subscriber::with_default(sub, || {
+            let secret = "AUDIT_JSON_SECRET_HEAD AUDIT_JSON_SECRET_TAIL";
+            tracing::info!(
+                request.sid = %secret,
+                request.otp = ?["AUDIT_JSON_SECRET_ONE", "AUDIT_JSON_SECRET_TWO"],
+                request.key = %secret,
+                request.csrf = %secret,
+                request.user_password = %secret,
+                "request.r#key" = %secret,
+                "r#key" = %secret,
+                publicrequest.monkey = %"public monkey words",
+                request.public_key_id = %"public key identifier",
+                "public message"
+            );
+        });
+        let out = String::from_utf8(buf.0.lock().map(|g| g.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            !out.contains("AUDIT_JSON_SECRET_"),
+            "leaked a secret: {out}"
+        );
+        for name in [
+            "request.sid",
+            "request.otp",
+            "request.key",
+            "request.csrf",
+            "request.user_password",
+            "request.r#key",
+            "r#key",
+        ] {
+            assert!(out.contains(&format!(r#""{name}":"[REDACTED]""#)), "{out}");
+        }
+        assert!(out.contains("public monkey words"), "{out}");
+        assert!(out.contains("public key identifier"), "{out}");
+        assert!(out.contains("public message"), "{out}");
     }
 }

@@ -16,7 +16,7 @@ use crate::invite::{
 use crate::pg::PgDb;
 use crate::pg::account::{
     confusable_display_name_in_use, count_live, display_name_in_use, insert_account_with,
-    load_live, login_name_in_use, open_invite_for_name, require_actor, write_audit,
+    load_live, login_name_in_use, open_invite_for_name, require_session_actor, write_audit,
     write_audit_throttled,
 };
 use crate::pg::auth::insert_in_tx;
@@ -142,7 +142,7 @@ impl PgDb {
         now: i64,
     ) -> Result<i64, StoreError> {
         let mut tx = self.begin_account().await?;
-        let a = require_actor(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
         let id = create_invite_in(
             &mut tx,
             Some(a.id),
@@ -197,7 +197,7 @@ impl PgDb {
         now: i64,
     ) -> Result<(), StoreError> {
         let mut tx = self.begin_account().await?;
-        let a = require_actor(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
         revoke_invite_in(
             &mut tx,
             &AuditActor::account(a.id, a.role, &a.username),
@@ -284,7 +284,7 @@ impl PgDb {
         now: i64,
     ) -> Result<i64, StoreError> {
         let mut tx = self.begin_account().await?;
-        let a = require_actor(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
         if a.id == new.target_id {
             return Err(AccountError::SelfTarget.into());
         }
@@ -344,6 +344,9 @@ impl PgDb {
     ///   `credential_staging` bound to the new pending session and changes nothing about the account; audit
     ///   `recover_redeem` naming the issuer in the detail (`issued_by=<id>`).
     ///
+    /// On either success, the presented session (`Redemption::replacing`) is revoked before
+    /// committing. A revoke failure rolls back the redemption; refusals never revoke it.
+    ///
     /// # Errors
     /// [`AccountError::InvalidCode`], [`AccountError::InvalidDisplayName`], [`AccountError::InvalidEmail`],
     /// [`AccountError::DisplayNameUnavailable`]; database failure.
@@ -370,6 +373,12 @@ impl PgDb {
         // An `Err` here drops `tx` uncommitted: a shape refusal of the profile changes nothing.
         match redeem_in(&mut tx, r, profile, policy, ip, now).await? {
             Outcome::Done(done) => {
+                if let Some(old) = r.replacing {
+                    sqlx::query("DELETE FROM session WHERE id_hash = $1")
+                        .bind(old.as_slice())
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 tx.commit().await?;
                 return Ok(done);
             }
@@ -442,6 +451,9 @@ impl PgDb {
         now: i64,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let mut tx = self.begin_account().await?;
+        if !crate::pg::mfa::pending_session_is_live(&mut tx, user_id, session_hash, now).await? {
+            return Ok(None);
+        }
         sqlx::query(
             "UPDATE credential_staging SET totp_secret_enc = $3 \
              WHERE account_id = $1 AND session_hash = $2 AND expires_at > $4 AND totp_secret_enc IS NULL",
@@ -483,6 +495,10 @@ impl PgDb {
         now: i64,
     ) -> Result<(), StoreError> {
         let mut tx = self.begin_account().await?;
+        if !crate::pg::mfa::pending_session_is_live(&mut tx, c.user_id, c.session_hash, now).await?
+        {
+            return Err(AccountError::StagingInvalid.into());
+        }
         let staged = sqlx::query(
             "SELECT invite_id, issued_by, password_hash, totp_secret_enc FROM credential_staging \
              WHERE account_id = $1 AND session_hash = $2 AND expires_at > $3",
@@ -600,7 +616,7 @@ impl PgDb {
         now: i64,
     ) -> Result<(), StoreError> {
         let mut tx = self.begin_account().await?;
-        let a = require_actor(&mut tx, actor.user_id, Role::Admin).await?;
+        let a = require_session_actor(&mut tx, actor, Role::Admin, now).await?;
         let target = load_live(&mut tx, target_id)
             .await?
             .ok_or(AccountError::TargetNotFound)?;
